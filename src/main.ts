@@ -1,0 +1,943 @@
+import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+type LintDiagnostic = {
+  start: number;
+  end: number;
+  message: string;
+  suggestions: string[];
+  severity?: string;
+  rule_id?: string;
+};
+
+// New backend shape is `{diags, truncated}`; older backends return a bare array.
+type LintResult = LintDiagnostic[] | { diags: LintDiagnostic[]; truncated: boolean };
+
+type Deck = {
+  id: string;
+  name: string;
+};
+
+type CardItem = {
+  id: string;
+  deck_id: string;
+  front: string;
+  back: string;
+};
+
+type ReviewStats = {
+  distinct_cards: number;
+  total_reviews: number;
+  min_histories: number;
+};
+
+type ModelStatus = {
+  asr_model: boolean;
+  asr_vocab: boolean;
+  tts_voice: boolean;
+};
+
+type VoiceInfo = {
+  id: string;
+  label: string;
+};
+
+type DueCard = {
+  id: string;
+  front: string;
+  back: string;
+  stability: number;
+  difficulty: number;
+  days_elapsed: number;
+  intervals: Record<string, number>;
+};
+
+type RecentReview = {
+  id: string;
+  card_id: string;
+  rating: number;
+  delta_t: number;
+  reviewed_at: number;
+  front?: string;
+};
+
+const TRANSCRIPT_PLACEHOLDER = "Press record, speak, then stop.";
+const TTS_MAX_CHARS = 1440; // == backend AUDIOSTREAM_MAX_CHARS (8 chunks × 180)
+
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+let mediaStream: MediaStream | null = null;
+let audioCtx: AudioContext | null = null;
+let processor: ScriptProcessorNode | null = null;
+let workletNode: AudioWorkletNode | null = null;
+let audioSink: GainNode | null = null;
+let pcmChunks: Float32Array[] = [];
+let currentCard: DueCard | null = null;
+let revealed = false;
+let grading = false;
+let transcribing = false;
+let hasTranscript = false;
+let lastTtsUrl: string | null = null;
+let autoStopTimer: ReturnType<typeof setTimeout> | null = null;
+// Monotonic request id so a slow loadDue/seed response can't overwrite newer card state.
+let cardReq = 0;
+
+// ---- In-flight guard: disable button while async work runs ----
+async function withBusy(btn: HTMLButtonElement, fn: () => Promise<void>) {
+  btn.disabled = true;
+  try {
+    await fn();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function setStatus(id: string, msg: string, isError = false) {
+  const el = $(id);
+  el.textContent = msg;
+  el.classList.toggle("error", isError);
+}
+
+// ---- Grammar byte offsets: backend sends UTF-8 byte indices, not JS char indices ----
+function byteSlice(text: string, start: number, end: number): string {
+  try {
+    const bytes = new TextEncoder().encode(text);
+    const s = Math.max(0, Math.min(start, bytes.length));
+    const e = Math.max(s, Math.min(end, bytes.length));
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes.slice(s, e));
+  } catch {
+    return text.slice(start, end);
+  }
+}
+
+function friendlyAsrError(e: unknown): string {
+  const s = String(e);
+  if (s.includes("ASR_SILENCE:")) return "no speech detected — move closer to the mic and try again";
+  if (s.includes("ASR_SHAPE:")) return "audio shape error — please re-record";
+  if (s.includes("ASR_NO_VOCAB:")) return "ASR model vocabulary missing — reinstall the voice model";
+  if (s.includes("ASR_NO_MODEL:")) return "ASR model not installed — run scripts/download-models.sh first";
+  return `ASR unavailable: ${s}`;
+}
+
+// ---- Recording robustness: accept native rate, resample to 16 kHz ----
+async function ensure16k(): Promise<AudioContext> {
+  // Do NOT hard-throw when the device runs at 44.1/48 kHz; resampling happens later.
+  return new AudioContext();
+}
+
+async function resampleTo16k(mono: Float32Array, fromRate: number): Promise<Float32Array> {
+  if (fromRate === 16000 || mono.length === 0) return mono;
+  const frames = Math.max(1, Math.round((mono.length / fromRate) * 16000));
+  const offline = new OfflineAudioContext(1, frames, 16000);
+  const buf = offline.createBuffer(1, mono.length, fromRate);
+  buf.getChannelData(0).set(mono);
+  const src = offline.createBufferSource();
+  src.buffer = buf;
+  src.connect(offline.destination);
+  src.start(0);
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0).slice();
+}
+
+function teardownAudio() {
+  if (autoStopTimer !== null) {
+    clearTimeout(autoStopTimer);
+    autoStopTimer = null;
+  }
+  try {
+    processor?.disconnect();
+  } catch {
+    /* ignore */
+  }
+  processor = null;
+  try {
+    workletNode?.disconnect();
+  } catch {
+    /* ignore */
+  }
+  workletNode = null;
+  try {
+    audioSink?.disconnect();
+  } catch {
+    /* ignore */
+  }
+  audioSink = null;
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+  }
+  audioCtx = null;
+  pcmChunks = [];
+}
+
+// ---- ASR streaming via tauri::ipc::Channel (raw PCM, no JSON base64) ----
+async function startRecording() {
+  if (transcribing) return;
+  if (mediaStream || audioCtx) return;
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: { ideal: 16000 }, channelCount: { ideal: 1 }, echoCancellation: true } });
+  } catch (e) {
+    setStatus("asr-status", `mic denied/blocked: ${String(e)}`, true);
+    throw e;
+  }
+  let ctx: AudioContext;
+  try {
+    ctx = await ensure16k();
+  } catch (e) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+    throw e;
+  }
+  audioCtx = ctx;
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+  // zero-gain sink: audible feedback suppressed, keeps the capture node
+  // running, no mic echo.
+  const sink = audioCtx.createGain();
+  sink.gain.value = 0;
+  sink.connect(audioCtx.destination);
+  audioSink = sink;
+  pcmChunks = [];
+  // Prefer AudioWorklet over the deprecated ScriptProcessor; fall back for
+  // old WebViews that lack AudioWorklet support.
+  let workletReady = false;
+  try {
+    const workletSrc =
+      "class Capture extends AudioWorkletProcessor{process(inputs){const ch=inputs[0]&&inputs[0][0];if(ch)this.port.postMessage(ch.slice(0));return true;}}registerProcessor('capture',Capture);";
+    const modUrl = URL.createObjectURL(
+      new Blob([workletSrc], { type: "application/javascript" })
+    );
+    try {
+      await audioCtx.audioWorklet.addModule(modUrl);
+      const node = new AudioWorkletNode(audioCtx, "capture");
+      node.port.onmessage = (e: MessageEvent) => {
+        pcmChunks.push(new Float32Array(e.data as Float32Array));
+      };
+      src.connect(node);
+      node.connect(sink);
+      workletNode = node;
+      workletReady = true;
+    } finally {
+      URL.revokeObjectURL(modUrl);
+    }
+  } catch {
+    workletReady = false;
+  }
+  if (!workletReady) {
+    // 4096-frame chunks at the native rate; resampled to 16 kHz at transcribe time.
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    src.connect(processor);
+    processor.connect(sink);
+  }
+  ($("btn-record") as HTMLButtonElement).disabled = true;
+  ($("btn-stop") as HTMLButtonElement).disabled = false;
+  setStatus("asr-status", `recording ${(audioCtx.sampleRate / 1000).toFixed(1)}kHz mono… (resamples to 16k)`);
+  // auto-stop at 60s (backend rejects audio > 120s; stay well under)
+  autoStopTimer = setTimeout(() => {
+    void stopAndTranscribe();
+  }, 60000);
+}
+
+async function stopAndTranscribe() {
+  if (transcribing) return;
+  if (!mediaStream && !audioCtx && pcmChunks.length === 0) return;
+  // Clear the auto-stop timer first so a manual stop can't double-fire with the timer.
+  if (autoStopTimer !== null) {
+    clearTimeout(autoStopTimer);
+    autoStopTimer = null;
+  }
+  transcribing = true;
+  ($("btn-record") as HTMLButtonElement).disabled = true;
+  ($("btn-stop") as HTMLButtonElement).disabled = true;
+  const capturedRate = audioCtx?.sampleRate ?? 16000;
+  try {
+    try {
+      processor?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    await audioCtx?.close().catch(() => {});
+    mediaStream?.getTracks().forEach((t) => t.stop());
+
+    const total = pcmChunks.reduce((n, c) => n + c.length, 0);
+    const mono = new Float32Array(total);
+    let off = 0;
+    for (const c of pcmChunks) mono.set(c, (off += c.length) - c.length);
+
+    let pcm16 = mono;
+    try {
+      pcm16 = await resampleTo16k(mono, capturedRate);
+    } catch (e) {
+      setStatus("asr-status", `resample failed: ${String(e)}`, true);
+      return;
+    }
+    const usedRate = 16000;
+
+    setStatus("asr-status", `sending ${(pcm16.length / usedRate).toFixed(1)}s PCM via Channel…`);
+
+    // High-throughput binary path: Channel<ArrayBuffer>, NOT invoke JSON.
+    const onChunk = new Channel<string>();
+    onChunk.onmessage = (partial) => {
+      $("transcript").textContent = partial;
+    };
+    try {
+      const text = await invoke<string>("transcribe_pcm_channel", {
+        channel: onChunk,
+        // Tauri Channel transports Uint8Array efficiently; send raw bytes view.
+        pcmBytes: new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength),
+        sampleRate: usedRate,
+      });
+      $("transcript").textContent = text;
+      ($("tts-input") as HTMLInputElement).value = text;
+      hasTranscript = text.trim().length > 0;
+      setStatus("asr-status", "done (local Wav2Vec2)");
+    } catch (e) {
+      setStatus("asr-status", friendlyAsrError(e), true);
+    }
+  } finally {
+    teardownAudio();
+    transcribing = false;
+    ($("btn-record") as HTMLButtonElement).disabled = false;
+    ($("btn-stop") as HTMLButtonElement).disabled = true;
+  }
+}
+
+// ---- Grammar (harper-core, zero-network) ----
+async function lintTranscript() {
+  const text = $("transcript").textContent ?? "";
+  if (!hasTranscript || !text.trim() || text.trim() === TRANSCRIPT_PLACEHOLDER) {
+    setStatus("lint-status", "record something first — nothing to lint", true);
+    return;
+  }
+  setStatus("lint-status", "linting locally…");
+  try {
+    // Omit `dialect` when it is the default ("american") — the backend
+    // treats a missing dialect as the default.
+    const dialect = ($("dialect-select") as HTMLSelectElement).value;
+    const args =
+      dialect && dialect !== "american" ? { text, dialect } : { text };
+    const res = await invoke<LintResult>("lint_text", args);
+    const diags = Array.isArray(res) ? res : res.diags;
+    const truncated = !Array.isArray(res) && res.truncated === true;
+    setStatus(
+      "lint-status",
+      `${diags.length} issue(s)${truncated ? " (truncated)" : ""}`
+    );
+    renderDiags(text, diags, truncated);
+  } catch (e) {
+    setStatus("lint-status", `lint failed: ${String(e)}`, true);
+  }
+}
+
+function renderDiags(text: string, diags: LintDiagnostic[], truncated = false) {
+  const box = $("lint-output");
+  box.innerHTML = "";
+  if (truncated) {
+    const note = document.createElement("p");
+    note.className = "lint-truncated";
+    note.textContent = "Results truncated — showing the first diagnostics only.";
+    box.appendChild(note);
+  }
+  if (diags.length === 0) {
+    box.append("Clean — no issues found.");
+    return;
+  }
+  const list = document.createElement("ul");
+  for (const d of diags) {
+    const li = document.createElement("li");
+    const sev = (d.severity ?? "warning").toLowerCase();
+    const span = document.createElement("span");
+    span.className = `lint-err lint-sev-${sev}`;
+    span.textContent = byteSlice(text, d.start, d.end) || "(span)";
+    li.append(span, ` [${sev}] — ${d.message}`);
+    if (d.rule_id) {
+      const rule = document.createElement("code");
+      rule.className = "lint-rule";
+      rule.textContent = ` (${d.rule_id})`;
+      li.appendChild(rule);
+    }
+    if (d.suggestions.length > 0) {
+      li.append(document.createElement("br"), `suggest: ${d.suggestions.slice(0, 3).join(", ")}`);
+    }
+    list.appendChild(li);
+  }
+  box.appendChild(list);
+}
+
+// ---- TTS (Piper, streamed back via Channel / async URI protocol) ----
+async function synthesize() {
+  let text = ($("tts-input") as HTMLInputElement).value.trim();
+  if (!text) return;
+  if (text.length > TTS_MAX_CHARS) {
+    text = text.slice(0, TTS_MAX_CHARS);
+    ($("tts-input") as HTMLInputElement).value = text;
+    setStatus("tts-status", `text over ${TTS_MAX_CHARS} chars — trimmed`, true);
+  }
+  const audio = $("tts-audio") as HTMLAudioElement;
+  // Rust sends one ArrayBuffer per sentence -> accumulate ALL then Blob.
+  const onAudio = new Channel<ArrayBuffer>();
+  const chunks: BlobPart[] = [];
+  onAudio.onmessage = (buf) => chunks.push(new Uint8Array(buf));
+  try {
+    const sampleRate = await invoke<number>("synthesize_speech", { text, channel: onAudio });
+    // Piper emits WAV; keep WAV MIME and surface the backend-reported rate.
+    const blob = new Blob(chunks, { type: "audio/wav" });
+    const prevUrl = lastTtsUrl;
+    const newUrl = URL.createObjectURL(blob);
+    lastTtsUrl = newUrl;
+    audio.src = newUrl;
+    setStatus("tts-status", `ready ${sampleRate}Hz (${chunks.length} chunk(s))`);
+    if (prevUrl) {
+      const onCanplay = () => {
+        try {
+          URL.revokeObjectURL(prevUrl);
+        } catch {
+          /* ignore */
+        }
+        audio.removeEventListener("canplay", onCanplay);
+      };
+      audio.addEventListener("canplay", onCanplay);
+    }
+    await audio.play().catch((e) => {
+      setStatus("tts-status", `playback failed: ${String(e)}`, true);
+    });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("TTS_BUSY:")) {
+      setStatus("tts-status", "engine busy, retry in a moment", true);
+      return;
+    }
+    // Fallback: async custom protocol (no disk serialization)
+    console.warn("channel TTS failed, trying protocol URL", e);
+    const prevUrl = lastTtsUrl;
+    audio.src = `audiostream://localhost/tts?text=${encodeURIComponent(text)}`;
+    if (prevUrl) {
+      const onCanplay = () => {
+        try {
+          URL.revokeObjectURL(prevUrl);
+        } catch {
+          /* ignore */
+        }
+        if (lastTtsUrl === prevUrl) lastTtsUrl = null;
+        audio.removeEventListener("canplay", onCanplay);
+      };
+      audio.addEventListener("canplay", onCanplay);
+    }
+    await audio.play().catch(() => {
+      setStatus("tts-status", "TTS playback failed (503 = no voice model?)", true);
+    });
+  }
+}
+
+// ---- FSRS review (2-step: front -> reveal -> grade) ----
+function renderIntervals(c: DueCard) {
+  $("intervals").textContent =
+    `predicted intervals (days) — Again ${c.intervals["1"] ?? "—"} / Hard ${c.intervals["2"] ?? "—"} / Good ${c.intervals["3"] ?? "—"} / Easy ${c.intervals["4"] ?? "—"}`;
+}
+
+function renderMemoryState(c: DueCard) {
+  $("memory-state").textContent =
+    `memory (S/D/R) — stability ${c.stability.toFixed(2)} / difficulty ${c.difficulty.toFixed(2)} / ${c.days_elapsed}d elapsed`;
+}
+
+function showFront(c: DueCard) {
+  currentCard = c;
+  revealed = false;
+  $("review-card").textContent = `FRONT: ${c.front}`;
+  ($("btn-reveal") as HTMLButtonElement).hidden = false;
+  ($("grade-row") as HTMLDivElement).hidden = true;
+  renderMemoryState(c);
+  renderIntervals(c);
+  // A11y: move focus to Reveal so keyboard users can continue without a mouse.
+  ($("btn-reveal") as HTMLButtonElement).focus();
+}
+
+function reveal() {
+  if (!currentCard) return;
+  revealed = true;
+  $("review-card").textContent = `FRONT: ${currentCard.front}\nBACK: ${currentCard.back}`;
+  ($("btn-reveal") as HTMLButtonElement).hidden = true;
+  ($("grade-row") as HTMLDivElement).hidden = false;
+  document.querySelector<HTMLButtonElement>("#grade-row button")?.focus();
+}
+
+function clearCardView(msg: string) {
+  currentCard = null;
+  revealed = false;
+  $("review-card").textContent = msg;
+  ($("btn-reveal") as HTMLButtonElement).hidden = true;
+  ($("grade-row") as HTMLDivElement).hidden = true;
+  $("memory-state").textContent = "";
+  $("intervals").textContent = "";
+}
+
+async function loadDue() {
+  const my = ++cardReq;
+  try {
+    // Deck filter: omit `deckId` (not empty string) when "All decks" is selected.
+    const deckSel = document.getElementById("deck-select") as HTMLSelectElement | null;
+    const deckId = deckSel?.value || undefined;
+    const cards = await invoke<DueCard[]>(
+      "due_cards",
+      deckId ? { limit: 1, deckId } : { limit: 1 }
+    );
+    if (my !== cardReq) return;
+    if (cards.length === 0) {
+      clearCardView("Nothing due. Seed demo deck or add cards.");
+      setStatus("review-status", "0 due");
+      return;
+    }
+    showFront(cards[0]);
+    setStatus("review-status", `${cards.length} due`);
+  } catch (e) {
+    if (my !== cardReq) return;
+    setStatus("review-status", `review failed: ${String(e)}`, true);
+  }
+}
+
+async function grade(g: number) {
+  if (!currentCard || !revealed) return;
+  if (grading) return;
+  grading = true;
+  const my = ++cardReq;
+  const gradedId = currentCard.id;
+  const btns = Array.from(document.querySelectorAll<HTMLButtonElement>("#grade-row button"));
+  btns.forEach((b) => {
+    b.disabled = true;
+  });
+  try {
+    const next = await invoke<DueCard | null>("grade_card", { cardId: gradedId, rating: g });
+    if (my !== cardReq) return;
+    if (currentCard?.id !== gradedId) return;
+    if (next) {
+      showFront(next);
+      setStatus("review-status", "graded — next card");
+    } else {
+      clearCardView("Done — nothing else due.");
+      setStatus("review-status", "done");
+    }
+    void refreshOptimizeGate();
+  } catch (e) {
+    if (my !== cardReq) return;
+    setStatus("review-status", `grade failed: ${String(e)}`, true);
+  } finally {
+    grading = false;
+    btns.forEach((b) => {
+      b.disabled = false;
+    });
+  }
+}
+
+async function seed() {
+  try {
+    const n = await invoke<number>("seed_demo_deck");
+    setStatus("review-status", n === 0 ? "already seeded" : `seeded ${n}`);
+    await loadDecks();
+    await loadDeckCards();
+    await loadDue();
+  } catch (e) {
+    setStatus("review-status", `seed failed: ${String(e)}`, true);
+  }
+}
+
+// Optimizer needs >= 8 histories; gate the button via review_stats{}.
+const OPTIMIZE_GATE = 8;
+
+async function refreshOptimizeGate() {
+  const btn = $("btn-optimize") as HTMLButtonElement;
+  try {
+    const stats = await invoke<ReviewStats>("review_stats", {});
+    const n = stats.min_histories ?? 0;
+    if (n < OPTIMIZE_GATE) {
+      btn.disabled = true;
+      setStatus(
+        "optimize-status",
+        `need ${n}/${OPTIMIZE_GATE} reviews before optimizing ` +
+          `(cards: ${stats.distinct_cards}, reviews: ${stats.total_reviews})`
+      );
+    } else {
+      btn.disabled = false;
+      setStatus(
+        "optimize-status",
+        `ready (${stats.total_reviews} reviews, min histories ${n})`
+      );
+    }
+  } catch (e) {
+    // Parallel-wave backend may not have review_stats yet: leave the button
+    // enabled and say why there is no pre-check.
+    btn.disabled = false;
+    setStatus("optimize-status", `optimizer pre-check unavailable: ${String(e)}`, true);
+  }
+}
+
+async function loadModelStatus() {
+  const el = $("model-status");
+  let asr = "unknown";
+  let vocab = "unknown";
+  let tts = "unknown";
+  try {
+    const s = await invoke<ModelStatus>("model_status", {});
+    asr = s.asr_model ? "available" : "missing";
+    vocab = s.asr_vocab ? "available" : "missing";
+    tts = s.tts_voice ? "available" : "missing";
+  } catch (e) {
+    el.textContent = `Models: status unavailable (${String(e)})`;
+  }
+  // No voice <select> in this wave (backend takes no voice param):
+  // surface the voice count in the model-status line instead.
+  let voices = "unknown";
+  try {
+    const v = await invoke<VoiceInfo[]>("list_voices", {});
+    voices = String(v.length);
+  } catch {
+    voices = "unknown";
+  }
+  el.textContent = `Models — ASR: ${asr} · vocab: ${vocab} · TTS: ${tts} · voices: ${voices}`;
+}
+
+async function optimize() {
+  setStatus("optimize-status", "optimizing…");
+  try {
+    const params = await invoke<number[]>("optimize_parameters");
+    setStatus("optimize-status", `optimized: [${params.map((p) => p.toFixed(3)).join(", ")}]`);
+  } catch (e) {
+    setStatus("optimize-status", `optimize failed: ${String(e)}`, true);
+  }
+}
+
+async function loadRetention() {
+  try {
+    const v = await invoke<number>("get_retention");
+    ($("retention") as HTMLInputElement).value = String(v);
+  } catch (e) {
+    setStatus("retention-status", `retention load failed: ${String(e)}`, true);
+  }
+}
+
+async function saveRetention() {
+  const input = $("retention") as HTMLInputElement;
+  const raw = input.value.trim();
+  const retention = Number(raw);
+  if (!raw || Number.isNaN(retention) || retention < 0.7 || retention > 0.98) {
+    setStatus("retention-status", "retention must be a number in 0.70–0.98", true);
+    return;
+  }
+  try {
+    const updated = await invoke<number>("set_retention", { retention });
+    input.value = String(updated);
+    setStatus("retention-status", `retention ${updated}`);
+  } catch (e) {
+    setStatus("retention-status", `retention failed: ${String(e)}`, true);
+  }
+}
+
+async function addCard() {
+  const front = ($("card-front") as HTMLInputElement).value.trim();
+  const back = ($("card-back") as HTMLInputElement).value.trim();
+  if (!front || !back) {
+    setStatus("review-status", "front/back required", true);
+    return;
+  }
+  // Deck comes from the deck <select>; fall back to "default" when
+  // "All decks" is selected (add_card needs a concrete deck).
+  const deckId = ($("deck-select") as HTMLSelectElement).value || "default";
+  try {
+    const id = await invoke<string>("add_card", { deckId, front, back });
+    ($("card-front") as HTMLInputElement).value = "";
+    ($("card-back") as HTMLInputElement).value = "";
+    setStatus("review-status", `added ${id}`);
+    await loadDecks();
+    await loadDeckCards();
+    await loadDue();
+  } catch (e) {
+    setStatus("review-status", `add failed: ${String(e)}`, true);
+  }
+}
+
+async function loadDecks() {
+  try {
+    const decks = await invoke<Deck[]>("list_decks", {});
+    const sel = $("deck-select") as HTMLSelectElement;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All decks";
+    sel.appendChild(all);
+    for (const d of decks) {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = d.name;
+      sel.appendChild(opt);
+    }
+    if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+    setStatus("deck-status", `${decks.length} deck(s)`);
+  } catch (e) {
+    setStatus("deck-status", `decks unavailable: ${String(e)}`, true);
+  }
+}
+
+async function loadDeckCards() {
+  const box = $("deck-cards");
+  try {
+    const deckId = ($("deck-select") as HTMLSelectElement).value || undefined;
+    const cards = await invoke<CardItem[]>(
+      "list_cards",
+      deckId ? { deckId } : {}
+    );
+    box.innerHTML = "";
+    if (cards.length === 0) {
+      box.textContent = "No cards in this deck yet.";
+      return;
+    }
+    const list = document.createElement("ul");
+    for (const c of cards.slice(0, 50)) {
+      const li = document.createElement("li");
+      li.textContent = `${c.front} — ${c.back} `;
+      const del = document.createElement("button");
+      del.textContent = "Delete";
+      del.setAttribute("aria-label", `Delete card ${c.front}`);
+      del.addEventListener("click", () => void deleteCardById(c.id, c.front));
+      li.appendChild(del);
+      list.appendChild(li);
+    }
+    box.appendChild(list);
+    if (cards.length > 50) {
+      const more = document.createElement("p");
+      more.className = "muted";
+      more.textContent = `…and ${cards.length - 50} more`;
+      box.appendChild(more);
+    }
+  } catch (e) {
+    box.textContent = `cards unavailable: ${String(e)}`;
+  }
+}
+
+async function deleteCardById(cardId: string, front?: string) {
+  if (!window.confirm(`Delete this card${front ? ` "${front}"` : ""}? This cannot be undone.`)) {
+    return;
+  }
+  try {
+    await invoke<void>("delete_card", { cardId });
+    setStatus("review-status", "card deleted");
+    await loadDecks();
+    await loadDeckCards();
+    await loadDue();
+  } catch (e) {
+    setStatus("review-status", `delete failed: ${String(e)}`, true);
+  }
+}
+
+async function deleteCurrentCard() {
+  if (!currentCard) {
+    setStatus("review-status", "no card loaded", true);
+    return;
+  }
+  await deleteCardById(currentCard.id, currentCard.front);
+}
+
+async function loadHistory() {
+  try {
+    const rows = await invoke<RecentReview[]>("recent_reviews", { limit: 20 });
+    const box = $("history-output");
+    box.innerHTML = "";
+    if (rows.length === 0) {
+      box.textContent = "No reviews yet.";
+      return;
+    }
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    for (const h of ["card", "rating", "date"]) {
+      const th = document.createElement("th");
+      th.textContent = h;
+      head.appendChild(th);
+    }
+    table.appendChild(head);
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const tdFront = document.createElement("td");
+      // `front` snippet replaces the raw card UUID.
+      tdFront.textContent = r.front ?? r.card_id;
+      const tdRating = document.createElement("td");
+      tdRating.textContent = String(r.rating);
+      const tdDate = document.createElement("td");
+      const ts = r.reviewed_at < 1_000_000_000_000 ? r.reviewed_at * 1000 : r.reviewed_at;
+      const parsed = new Date(ts);
+      tdDate.textContent = Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleString();
+      tr.append(tdFront, tdRating, tdDate);
+      table.appendChild(tr);
+    }
+    box.appendChild(table);
+  } catch (e) {
+    setStatus("review-status", `history failed: ${String(e)}`, true);
+  }
+}
+
+async function loadEpReport() {
+  try {
+    const report = await invoke<string>("ep_report");
+    $("ep-output").textContent = report;
+  } catch (e) {
+    $("ep-output").textContent = `providers unavailable: ${String(e)}`;
+  }
+}
+
+function bind() {
+  const btnRecord = $("btn-record") as HTMLButtonElement;
+  const btnStop = $("btn-stop") as HTMLButtonElement;
+  const btnLint = $("btn-lint") as HTMLButtonElement;
+  const btnSpeak = $("btn-speak") as HTMLButtonElement;
+  const btnDue = $("btn-due") as HTMLButtonElement;
+  const btnSeed = $("btn-seed") as HTMLButtonElement;
+  const btnOptimize = $("btn-optimize") as HTMLButtonElement;
+  const btnRetention = $("btn-retention") as HTMLButtonElement;
+  const btnAdd = $("btn-add-card") as HTMLButtonElement;
+  const btnDelete = $("btn-delete-card") as HTMLButtonElement;
+  const btnHistory = $("btn-history") as HTMLButtonElement;
+  const btnEp = $("btn-ep") as HTMLButtonElement;
+  const deckSelect = $("deck-select") as HTMLSelectElement;
+  const ttsAudio = $("tts-audio") as HTMLAudioElement;
+
+  // TTS object-URL lifetime: revoke only after replacement can play, or when playback ends.
+  ttsAudio.addEventListener("canplay", () => {
+    // Replacement is playable; per-request cleanup of older URLs happens in synthesize().
+  });
+  ttsAudio.addEventListener("ended", () => {
+    if (lastTtsUrl && ttsAudio.src.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(lastTtsUrl);
+      } catch {
+        /* ignore */
+      }
+      lastTtsUrl = null;
+    }
+  });
+  ttsAudio.addEventListener("error", () => {
+    const detail = ttsAudio.error?.message ? ` — ${ttsAudio.error.message}` : "";
+    setStatus("tts-status", `TTS playback failed (503 = no voice model?)${detail}`, true);
+  });
+
+  // Record/stop use withBusy plus end-state fix-up (withBusy re-enables;
+  // recording/stopped states must persist after setup/teardown).
+  btnRecord.addEventListener("click", () =>
+    void (async () => {
+      try {
+        await withBusy(btnRecord, startRecording);
+      } catch {
+        /* status already set in startRecording/ensure16k */
+      } finally {
+        if (transcribing) {
+          btnRecord.disabled = true;
+          btnStop.disabled = true;
+        } else if (mediaStream) {
+          btnRecord.disabled = true;
+          btnStop.disabled = false;
+        }
+      }
+    })()
+  );
+  btnStop.addEventListener("click", () =>
+    void (async () => {
+      try {
+        await withBusy(btnStop, stopAndTranscribe);
+      } catch {
+        /* status already set */
+      } finally {
+        if (transcribing) {
+          btnRecord.disabled = true;
+          btnStop.disabled = true;
+        } else {
+          btnRecord.disabled = false;
+          btnStop.disabled = true;
+        }
+      }
+    })()
+  );
+  btnLint.addEventListener("click", () => void withBusy(btnLint, lintTranscript));
+  btnSpeak.addEventListener("click", () => void withBusy(btnSpeak, synthesize));
+  btnDue.addEventListener("click", () => void withBusy(btnDue, loadDue));
+  btnSeed.addEventListener("click", () => void withBusy(btnSeed, seed));
+  // Optimize owns its disabled state (the pre-check gate disables it);
+  // withBusy would unconditionally re-enable, so guard + re-gate manually.
+  btnOptimize.addEventListener("click", () =>
+    void (async () => {
+      if (btnOptimize.disabled) return;
+      btnOptimize.disabled = true;
+      try {
+        await optimize();
+      } finally {
+        await refreshOptimizeGate();
+      }
+    })()
+  );
+  btnRetention.addEventListener("click", () => void withBusy(btnRetention, saveRetention));
+  btnAdd.addEventListener("click", () => void withBusy(btnAdd, addCard));
+  btnDelete.addEventListener("click", () => void withBusy(btnDelete, deleteCurrentCard));
+  btnHistory.addEventListener("click", () => void withBusy(btnHistory, loadHistory));
+  btnEp.addEventListener("click", () => void withBusy(btnEp, loadEpReport));
+  deckSelect.addEventListener("change", () => {
+    void loadDeckCards();
+    void loadDue();
+  });
+  $("btn-reveal").addEventListener("click", () => reveal());
+  document.querySelectorAll<HTMLButtonElement>("#grade-row button").forEach((b) =>
+    b.addEventListener("click", () => void grade(Number(b.dataset.grade)))
+  );
+  // Keyboard: 1–4 grades the revealed card; Space/Enter reveals a hidden one.
+  // Never hijack typing or native button activation.
+  document.addEventListener("keydown", (e) => {
+    const t = e.target as HTMLElement | null;
+    const tag = t?.tagName ?? "";
+    if (
+      tag === "INPUT" ||
+      tag === "SELECT" ||
+      tag === "TEXTAREA" ||
+      tag === "BUTTON" ||
+      tag === "AUDIO"
+    ) {
+      return;
+    }
+    const gradeRowHidden = ($("grade-row") as HTMLDivElement).hidden;
+    if (e.key >= "1" && e.key <= "4" && revealed && currentCard && !gradeRowHidden) {
+      e.preventDefault();
+      void grade(Number(e.key));
+    } else if (
+      (e.key === " " || e.key === "Enter") &&
+      currentCard &&
+      !revealed &&
+      !($("btn-reveal") as HTMLButtonElement).hidden
+    ) {
+      e.preventDefault();
+      reveal();
+    }
+  });
+  // Backend → frontend async status broadcasts (Tauri events, not polling).
+  // Never clobber in-progress transcribe state in #asr-status.
+  void listen<string>("system-status", (e) => {
+    const payload = e.payload ?? "";
+    if (transcribing || mediaStream || payload.includes("transcription-complete")) {
+      const toast = document.getElementById("system-toast");
+      if (toast) {
+        toast.textContent = payload;
+        return;
+      }
+    }
+    $("asr-status").textContent = payload;
+  });
+}
+
+async function boot() {
+  await loadRetention();
+  await loadEpReport();
+  await loadDecks();
+  await loadDeckCards();
+  await loadModelStatus();
+  await refreshOptimizeGate();
+}
+
+bind();
+void boot();

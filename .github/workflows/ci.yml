@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vite build
+      # Non-blocking: surface known prod-dependency vulnerabilities without failing CI.
+      - run: npm audit --omit=dev
+        continue-on-error: true
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version triple check (package.json, tauri.conf.json, Cargo.toml)
+        run: |
+          PKG_VER=$(jq -r .version package.json)
+          TAURI_VER=$(jq -r .version src-tauri/tauri.conf.json)
+          CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
+          echo "package.json: $PKG_VER"
+          echo "tauri.conf.json: $TAURI_VER"
+          echo "Cargo.toml: $CARGO_VER"
+          if [ "$PKG_VER" != "$TAURI_VER" ] || [ "$PKG_VER" != "$CARGO_VER" ]; then
+            echo "::error::Version mismatch: package.json ($PKG_VER) vs tauri.conf.json ($TAURI_VER) vs Cargo.toml ($CARGO_VER). Keep all three in sync."
+            exit 1
+          fi
+
+  icon-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Icon presence check (.icns/.ico)
+        run: |
+          MISSING=0
+          if ! ls src-tauri/icons/*.icns >/dev/null 2>&1; then
+            echo "missing: src-tauri/icons/*.icns"
+            MISSING=1
+          fi
+          if ! ls src-tauri/icons/*.ico >/dev/null 2>&1; then
+            echo "missing: src-tauri/icons/*.ico"
+            MISSING=1
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Missing release icon set: src-tauri/icons/*.icns and/or *.ico not found (only a 32px placeholder exists). Generate the full set with: npx tauri icon <1024px-master>.png -o src-tauri/icons"
+            exit 1
+          fi
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # espeak (pulled in by the TTS backend) needs cmake at build time.
+      # ubuntu-latest runners ship cmake; this is a sanity check only (no apt install).
+      - run: cmake --version
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.77"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Offline Language Practice</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <h1>Offline Language Practice</h1>
+      <p class="muted">100% on-device: ASR · TTS · FSRS · grammar · SQLite</p>
+
+      <section class="card">
+        <h2>1. Speak</h2>
+        <div class="row">
+          <button id="btn-record">Start recording</button>
+          <button id="btn-stop" disabled>Stop &amp; transcribe</button>
+          <span id="asr-status" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <pre id="transcript" class="output">Press record, speak, then stop.</pre>
+        <div class="row">
+          <button id="btn-ep">Providers</button>
+        </div>
+        <pre id="ep-output" class="output">Loading providers…</pre>
+        <div id="system-toast" class="muted" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="card">
+        <h2>2. Check grammar (harper-core, local)</h2>
+        <div class="row">
+          <label for="dialect-select">Dialect</label>
+          <select id="dialect-select">
+            <option value="american" selected>American</option>
+            <option value="british">British</option>
+            <option value="canadian">Canadian</option>
+            <option value="australian">Australian</option>
+          </select>
+          <button id="btn-lint">Lint transcript</button>
+          <span id="lint-status" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <div id="lint-output" class="output">No diagnostics yet.</div>
+      </section>
+
+      <section class="card">
+        <h2>3. Listen (Piper TTS, local)</h2>
+        <div class="row">
+          <label for="tts-input">Text</label>
+          <input id="tts-input" type="text" placeholder="Type or use transcript…" />
+          <button id="btn-speak">Synthesize</button>
+          <span id="tts-status" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <audio id="tts-audio" controls></audio>
+      </section>
+
+      <section class="card">
+        <h2>4. Review (FSRS-6)</h2>
+        <div class="row">
+          <label for="deck-select">Deck</label>
+          <select id="deck-select">
+            <option value="">All decks</option>
+          </select>
+          <button id="btn-due">Load due cards</button>
+          <button id="btn-seed">Seed demo deck</button>
+          <button id="btn-optimize">Optimize parameters</button>
+          <span id="review-status" class="muted" role="status" aria-live="polite"></span>
+          <span id="optimize-status" class="muted" role="status" aria-live="polite"></span>
+          <span id="deck-status" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <div id="model-status" class="muted" role="status" aria-live="polite">Models: checking…</div>
+        <div id="review-card" class="output" aria-live="polite">No card loaded.</div>
+        <button id="btn-reveal" hidden>Show answer</button>
+        <div class="row" id="grade-row" hidden>
+          <button data-grade="1" aria-label="Grade Again (1)">Again</button>
+          <button data-grade="2" aria-label="Grade Hard (2)">Hard</button>
+          <button data-grade="3" aria-label="Grade Good (3)">Good</button>
+          <button data-grade="4" aria-label="Grade Easy (4)">Easy</button>
+        </div>
+        <div id="memory-state" class="muted" aria-live="polite"></div>
+        <div id="intervals" class="muted"></div>
+        <div class="row">
+          <label for="retention">Retention</label>
+          <input id="retention" type="number" min="0.7" max="0.98" step="0.01" />
+          <button id="btn-retention">Set retention</button>
+          <span id="retention-status" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <div class="row">
+          <label for="card-front">Front</label>
+          <input id="card-front" type="text" placeholder="Front" />
+          <label for="card-back">Back</label>
+          <input id="card-back" type="text" placeholder="Back" />
+          <button id="btn-add-card">Add card</button>
+          <button id="btn-delete-card">Delete current card</button>
+        </div>
+        <div class="row">
+          <button id="btn-history">History</button>
+        </div>
+        <div id="history-output" class="output">No history yet.</div>
+        <h3>Cards in deck</h3>
+        <div id="deck-cards" class="output">No deck loaded yet.</div>
+      </section>
+    </main>
+  </body>
+</html>

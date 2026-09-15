@@ -1,0 +1,31 @@
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color-scheme: light dark;
+}
+body { margin: 0; }
+.container { max-width: 760px; margin: 0 auto; padding: 24px; }
+.card { border: 1px solid #8884; border-radius: 12px; padding: 16px; margin: 16px 0; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.output { white-space: pre-wrap; background: #8881; padding: 12px; border-radius: 8px; min-height: 48px; }
+.muted { opacity: 0.7; font-size: 0.9em; }
+#tts-input { flex: 1; min-width: 200px; padding: 8px; }
+#card-front, #card-back { flex: 1; min-width: 140px; padding: 8px; }
+#retention { width: 90px; padding: 8px; }
+button { padding: 8px 12px; cursor: pointer; }
+button:disabled { opacity: .5; cursor: wait; }
+[hidden] { display: none !important; }
+.error { color: #b3261e; }
+.lint-err { text-decoration: underline wavy red; }
+.lint-sev-error { text-decoration-color: #b3261e; font-weight: 600; }
+.lint-sev-warning { text-decoration-color: #b26a00; }
+.lint-sev-suggestion { text-decoration-color: #1a73e8; text-decoration-style: dotted; }
+.lint-rule { font-size: 0.85em; opacity: 0.7; }
+.lint-truncated { font-weight: 600; }
+label { font-size: 0.9em; }
+#deck-select, #dialect-select { padding: 8px; }
+#memory-state { margin: 4px 0; }
+#history-output table { border-collapse: collapse; width: 100%; }
+#history-output th, #history-output td { border: 1px solid #8884; padding: 4px 8px; font-size: 0.9em; text-align: left; }
+#btn-reveal { margin: 8px 0; }
+#system-toast { min-height: 1.2em; }
+#tts-status, #retention-status { overflow-wrap: anywhere; }

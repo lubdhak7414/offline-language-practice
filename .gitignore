@@ -1,0 +1,33 @@
+# Models (large binaries, fetched via scripts/download-models.sh)
+models/
+src-tauri/models/
+*.onnx
+*.onnx.json
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.db
+*.db-*
+app.db*
+
+# Frontend
+node_modules/
+dist/
+.vite/
+coverage/
+playwright-report/
+
+# Env / OS
+.env
+.env.*
+.DS_Store
+
+*.key
+*.pubkey
+*.pem
+*.part
+
+*.md
+!README.md
