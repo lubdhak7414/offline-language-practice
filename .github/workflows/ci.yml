@@ -59,6 +59,11 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    env:
+      # espeak-ng's vendored data compiler truncates paths through a small
+      # fixed-size buffer; GitHub's default workspace path (which repeats
+      # the repo name) is long enough to overflow it. Keep the build dir short.
+      CARGO_TARGET_DIR: /tmp/cargo-target
     steps:
       - uses: actions/checkout@v4
       # espeak (pulled in by the TTS backend) needs cmake at build time.
@@ -80,13 +85,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "src-tauri -> target"
-      - name: Build espeak-rs-sys (its data Makefile races under parallel submakes; retry)
-        run: |
-          for i in 1 2 3; do
-            cargo build --manifest-path src-tauri/Cargo.toml --locked -p espeak-rs-sys && break
-            echo "attempt $i failed, retrying..."
-          done
+          workspaces: "src-tauri"
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
