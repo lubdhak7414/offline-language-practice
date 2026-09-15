@@ -81,6 +81,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+      - name: Build espeak-rs-sys (its data Makefile races under parallel submakes; retry)
+        run: |
+          for i in 1 2 3; do
+            cargo build --manifest-path src-tauri/Cargo.toml --locked -p espeak-rs-sys && break
+            echo "attempt $i failed, retrying..."
+          done
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
