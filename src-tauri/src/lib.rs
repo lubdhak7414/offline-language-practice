@@ -21,10 +21,12 @@ mod error;
 mod grammar;
 mod inference;
 mod paths;
+mod practice;
+mod prompts_seed;
+mod pronounce;
 mod scheduler;
 mod tts;
 
-use std::collections::HashSet;
 use std::sync::RwLock;
 
 use fsrs::{FSRS, FSRS6_DEFAULT_DECAY};
@@ -36,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::asr::AsrEngine;
 use crate::db::{
     DB_URL, MIGRATION_1_SQL, MIGRATION_2_SQL, MIGRATION_3_SQL, MIGRATION_4_SQL, MIGRATION_5_SQL,
+    MIGRATION_6_SQL,
 };
 use crate::grammar::LintOutput;
 use crate::scheduler::{CardRow, DeckRow, DueCardView, ReviewRow, ReviewStats};
@@ -239,23 +242,7 @@ async fn transcribe_pcm_channel(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let rate = crate::asr::ASR_SAMPLE_RATE;
-    if sample_rate != rate {
-        return Err(format!("expected 16kHz mono, got {sample_rate}Hz"));
-    }
-    let mut pcm = crate::asr::AsrEngine::bytes_to_f32_mono(&pcm_bytes);
-    let max_samples = rate as usize * ASR_MAX_SECONDS;
-    if pcm.len() > max_samples {
-        return Err(format!(
-            "audio too long ({} samples); max is {max_samples} samples ({ASR_MAX_SECONDS}s at 16kHz)",
-            pcm.len(),
-        ));
-    }
-    for x in pcm.iter_mut() {
-        if !x.is_finite() {
-            *x = 0.0;
-        }
-    }
+    let pcm = decode_pcm(&pcm_bytes, sample_rate)?;
 
     let (tx, rx) = oneshot::channel();
     state
@@ -344,12 +331,195 @@ async fn synthesize_speech(
     Ok(final_rate)
 }
 
+/// Decode PCM bytes the same way [`transcribe_pcm_channel`] does.
+///
+/// Shared so the validation rules — sample rate, length cap, non-finite
+/// samples — cannot drift between the two entry points.
+fn decode_pcm(pcm_bytes: &[u8], sample_rate: u32) -> Result<Vec<f32>, String> {
+    let rate = crate::asr::ASR_SAMPLE_RATE;
+    if sample_rate != rate {
+        return Err(format!("expected 16kHz mono, got {sample_rate}Hz"));
+    }
+    let mut pcm = crate::asr::AsrEngine::bytes_to_f32_mono(pcm_bytes);
+    let max_samples = rate as usize * ASR_MAX_SECONDS;
+    if pcm.len() > max_samples {
+        return Err(format!(
+            "audio too long ({} samples); max is {max_samples} samples ({ASR_MAX_SECONDS}s at 16kHz)",
+            pcm.len(),
+        ));
+    }
+    for x in pcm.iter_mut() {
+        if !x.is_finite() {
+            *x = 0.0;
+        }
+    }
+    Ok(pcm)
+}
+
+/// Install the built-in prompt corpus. Idempotent; returns rows added.
+#[tauri::command]
+async fn seed_prompts(db: State<'_, DbInstances>) -> Result<usize, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::seed_prompts(&pool)
+        .await
+        .map_err(String::from)
+}
+
+/// Open a practice session and return its id.
+#[tauri::command]
+async fn start_session(kind: String, db: State<'_, DbInstances>) -> Result<String, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    // Seeding here rather than at startup keeps `run()` free of DB work and
+    // means a database that predates the corpus picks it up on first use.
+    crate::practice::seed_prompts(&pool)
+        .await
+        .map_err(String::from)?;
+    crate::practice::start_session(&pool, &kind)
+        .await
+        .map_err(String::from)
+}
+
+#[tauri::command]
+async fn end_session(session_id: String, db: State<'_, DbInstances>) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::end_session(&pool, &session_id)
+        .await
+        .map_err(String::from)
+}
+
+/// Next prompt for a session, skipping ones it already covered.
+#[tauri::command]
+async fn next_prompt(
+    session_id: Option<String>,
+    category: Option<String>,
+    level: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Option<crate::practice::PromptView>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::seed_prompts(&pool)
+        .await
+        .map_err(String::from)?;
+    crate::practice::next_prompt(&pool, session_id.as_deref(), category.as_deref(), level)
+        .await
+        .map_err(String::from)
+}
+
+#[tauri::command]
+async fn list_attempts(
+    session_id: Option<String>,
+    limit: i64,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<crate::practice::AttemptRow>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::list_attempts(&pool, session_id.as_deref(), limit)
+        .await
+        .map_err(String::from)
+}
+
+/// Transcribe a recording, score it, and store the attempt.
+///
+/// The centrepiece of the practice loop. Pronunciation is only scored when
+/// `target_text` is present — free speaking gets grammar feedback and an
+/// explicit "not scored" rather than an invented number.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn score_attempt(
+    pcm_bytes: Vec<u8>,
+    sample_rate: u32,
+    session_id: Option<String>,
+    prompt_id: Option<String>,
+    target_text: Option<String>,
+    dialect: Option<String>,
+    db: State<'_, DbInstances>,
+    state: State<'_, AppState>,
+) -> Result<crate::practice::AttemptReport, String> {
+    let pcm = decode_pcm(&pcm_bytes, sample_rate)?;
+    let duration_ms =
+        (pcm.len() as f64 * 1000.0 / crate::asr::ASR_SAMPLE_RATE as f64).round() as i64;
+
+    let (tx, rx) = oneshot::channel();
+    state
+        .asr_tx
+        .try_send(NeuralReq::Transcribe { pcm, reply: tx })
+        .map_err(busy_message)?;
+    let transcript = rx
+        .await
+        .map_err(|_| "ASR engine unavailable".to_string())??;
+
+    // Grammar runs after ASR rather than in parallel: it needs the
+    // transcript, and harper's types are !Send so it has to stay inside its
+    // own `spawn_blocking`.
+    let lint = crate::grammar::lint_text_async(transcript.clone(), dialect).await?;
+
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::record_attempt(
+        &pool,
+        session_id.as_deref(),
+        prompt_id.as_deref(),
+        target_text.as_deref(),
+        &transcript,
+        duration_ms,
+        lint,
+    )
+    .await
+    .map_err(String::from)
+}
+
+/// Create a deck. The id is generated; `name` is what the user sees.
+#[tauri::command]
+async fn create_deck(name: String, db: State<'_, DbInstances>) -> Result<String, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::create_deck(&pool, &name)
+        .await
+        .map_err(String::from)
+}
+
+#[tauri::command]
+async fn rename_deck(
+    deck_id: String,
+    name: String,
+    db: State<'_, DbInstances>,
+) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::rename_deck(&pool, &deck_id, &name)
+        .await
+        .map_err(String::from)
+}
+
+/// Delete a deck. `mode` is `"move"` (cards go to the default deck) or
+/// `"delete"`. Returns how many cards were affected.
+#[tauri::command]
+async fn delete_deck(
+    deck_id: String,
+    mode: String,
+    db: State<'_, DbInstances>,
+) -> Result<usize, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let mode = crate::scheduler::DeckDeleteMode::parse(&mode).map_err(String::from)?;
+    crate::scheduler::delete_deck(&pool, &deck_id, mode)
+        .await
+        .map_err(String::from)
+}
+
+/// Edit a card's text, keeping its scheduling history.
+#[tauri::command]
+async fn update_card(
+    card_id: String,
+    front: String,
+    back: String,
+    db: State<'_, DbInstances>,
+) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::update_card(&pool, &card_id, &front, &back)
+        .await
+        .map_err(String::from)
+}
+
 /// Fetch due cards for review.
 ///
 /// `deck_id` (`deckId` in JS) optionally restricts to one deck; `None`
-/// preserves the all-decks behavior. Filtering happens here: over-fetch,
-/// keep cards in the deck, then truncate back to `limit` so a filtered
-/// result still fills the page.
+/// means every deck. The filter is applied in SQL — see
+/// [`crate::scheduler::DueOpts`].
 #[tauri::command]
 async fn due_cards(
     limit: u32,
@@ -365,27 +535,19 @@ async fn due_cards(
         .read()
         .map_err(|e| format!("fsrs lock poisoned: {e}"))?
         .clone();
-    let fetch_limit: i64 = match &deck_id {
-        None => limit as i64,
-        // Filtered path: fetch everything due, filter, then truncate so
-        // the deck still fills `limit` (unfiltered path is unchanged).
-        Some(_) => i64::MAX,
-    };
-    let mut due = crate::scheduler::fetch_due_cards(&pool, &fsrs, retention, decay, fetch_limit)
-        .await
-        .map_err(String::from)?;
-    if let Some(deck) = deck_id.as_deref() {
-        let rows: Vec<String> =
-            sqlx::query_scalar::<_, String>("SELECT id FROM cards WHERE deck_id = ?")
-                .bind(deck)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        let ids: HashSet<String> = rows.into_iter().collect();
-        due.retain(|card| ids.contains(card.id.as_str()));
-        due.truncate(limit as usize);
-    }
-    Ok(due)
+    crate::scheduler::fetch_due_cards(
+        &pool,
+        &fsrs,
+        retention,
+        decay,
+        crate::scheduler::DueOpts {
+            limit: limit as i64,
+            deck_id: deck_id.as_deref(),
+            exclude_card_id: None,
+        },
+    )
+    .await
+    .map_err(String::from)
 }
 
 /// Grade a card, returning the next due view (if any).
@@ -664,6 +826,12 @@ pub fn run() {
             sql: MIGRATION_5_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 6,
+            description: "prompts-sessions-attempts-scores",
+            sql: MIGRATION_6_SQL,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -886,6 +1054,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             transcribe_pcm_channel,
+            score_attempt,
+            seed_prompts,
+            start_session,
+            end_session,
+            next_prompt,
+            list_attempts,
+            create_deck,
+            rename_deck,
+            delete_deck,
+            update_card,
             lint_text,
             synthesize_speech,
             due_cards,

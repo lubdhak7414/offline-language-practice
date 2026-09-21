@@ -1,7 +1,7 @@
 //! Subsystem 5: embedded SQLite via tauri-plugin-sql.
 //!
 //! - WAL mode for concurrent reads during review-log writes (enabled once).
-//! - Declarative migrations at startup (1..=5; see `MIGRATION_N_SQL` below).
+//! - Declarative migrations at startup (1..=6; see `MIGRATION_N_SQL` below).
 //! - All access inside async DB worker tasks (never the webview thread).
 
 use tauri::State;
@@ -111,6 +111,80 @@ UPDATE card_memory_states SET last_review_date = 0, next_due_date = 0
 DELETE FROM review_logs
   WHERE delta_t > 3650 AND delta_t >= (reviewed_at / 86400) - 1;";
 
+/// Migration 6: the practice loop — prompts, sessions, attempts, scores.
+///
+/// A *session* is one sitting. An *attempt* is one recording inside it, and
+/// carries the transcript plus, in `attempt_scores` / `attempt_word_scores`,
+/// whatever could be measured about it. Scores live in sidecar tables rather
+/// than columns on `attempts` because the acoustic scorer is not shipped yet:
+/// rows that only ever had text-level scoring stay valid, and the
+/// `pron_method` column records which one produced a given number so a chart
+/// never silently mixes the two.
+///
+/// `attempt_cards` links an attempt to any card it created, so "save this
+/// phrase to review" leads somewhere traceable.
+pub const MIGRATION_6_SQL: &str = "
+CREATE TABLE IF NOT EXISTS prompts(
+  id TEXT PRIMARY KEY NOT NULL,
+  category TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  prompt_text TEXT NOT NULL,
+  target_text TEXT,
+  level INTEGER NOT NULL DEFAULT 1,
+  builtin INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompts_cat ON prompts(category, level);
+CREATE TABLE IF NOT EXISTS practice_sessions(
+  id TEXT PRIMARY KEY NOT NULL,
+  kind TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS attempts(
+  id TEXT PRIMARY KEY NOT NULL,
+  session_id TEXT,
+  prompt_id TEXT,
+  target_text TEXT,
+  transcript TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts(session_id, created_at);
+CREATE TABLE IF NOT EXISTS attempt_scores(
+  attempt_id TEXT PRIMARY KEY NOT NULL,
+  pron_overall INTEGER,
+  pron_method TEXT,
+  target_logprob REAL,
+  free_logprob REAL,
+  normalized_conf REAL,
+  wpm REAL,
+  articulation_wpm REAL,
+  longest_pause_ms INTEGER,
+  pause_count INTEGER,
+  filler_count INTEGER,
+  lint_error_count INTEGER,
+  lint_suggestion_count INTEGER,
+  overall INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attempt_word_scores(
+  attempt_id TEXT NOT NULL,
+  word_index INTEGER NOT NULL,
+  word TEXT NOT NULL,
+  start_ms INTEGER,
+  end_ms INTEGER,
+  gop REAL,
+  score INTEGER,
+  verdict TEXT,
+  PRIMARY KEY(attempt_id, word_index)
+);
+CREATE TABLE IF NOT EXISTS attempt_cards(
+  attempt_id TEXT NOT NULL,
+  card_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  PRIMARY KEY(attempt_id, card_id)
+);";
+
 /// WAL is idempotent but only needs to run once per process.
 static WAL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
@@ -202,6 +276,7 @@ pub mod testing {
             (3, super::MIGRATION_3_SQL),
             (4, super::MIGRATION_4_SQL),
             (5, super::MIGRATION_5_SQL),
+            (6, super::MIGRATION_6_SQL),
         ] {
             if !versions.contains(&version) {
                 continue;
@@ -215,7 +290,7 @@ pub mod testing {
 
     /// The full, current schema — what every non-migration test wants.
     pub async fn test_pool() -> sqlx::SqlitePool {
-        migrated_pool(5).await
+        migrated_pool(6).await
     }
 }
 

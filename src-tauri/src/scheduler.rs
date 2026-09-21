@@ -21,6 +21,9 @@ pub struct DueCardView {
     pub id: String,
     pub front: String,
     pub back: String,
+    pub deck_id: String,
+    /// `None` only for a card whose deck row is missing (no FK enforcement).
+    pub deck_name: Option<String>,
     pub stability: f32,
     pub difficulty: f32,
     pub days_elapsed: u32,
@@ -68,6 +71,13 @@ pub struct ReviewStats {
     pub min_train_items: u64,
     pub min_trainable_cards: u64,
 }
+
+/// Retrievability assigned to a never-reviewed card.
+///
+/// New cards already sort after reviews in SQL; this only affects the
+/// tie-break within the fetched window. `1.0` means "perfectly remembered",
+/// so a new card never displaces a review that is actually fading.
+pub const NEW_CARD_R: f32 = 1.0;
 
 /// Desired retention used when nothing is persisted yet.
 pub const DEFAULT_RETENTION: f32 = 0.9;
@@ -162,14 +172,52 @@ pub fn intervals_of(
     Ok(m)
 }
 
-/// Fetch due cards, lowest retrievability first.
+/// What to pull into a review session.
+#[derive(Debug, Clone, Default)]
+pub struct DueOpts<'a> {
+    /// Maximum cards to return. Zero or less returns nothing.
+    pub limit: i64,
+    /// Restrict to one deck. `None` means every deck.
+    pub deck_id: Option<&'a str>,
+    /// Skip this card. Used straight after grading so the card just
+    /// answered is not immediately presented again.
+    pub exclude_card_id: Option<&'a str>,
+}
+
+impl DueOpts<'_> {
+    /// Every deck, no exclusion — the common case.
+    #[cfg(test)]
+    pub fn limit(limit: i64) -> Self {
+        Self {
+            limit,
+            ..Default::default()
+        }
+    }
+}
+
+/// How many rows to read before the retrievability sort.
 ///
-/// SQL-filtered (no full-table PAGE scan): a row is due when it has no
-/// memory row (never reviewed) or `next_due_date <= now` (`NULL` counts
-/// as due for pre-migration rows). Requires the
-/// `idx_memory_next_due` index on `card_memory_states(next_due_date)`
-/// (created in migration 4). Collected due rows are sorted by `R`
-/// ascending and truncated to `limit`.
+/// The sort has to see more rows than it returns or it is a no-op: sorting
+/// the first `limit` rows by `R` and then keeping all of them changes
+/// nothing. Over-fetching a few multiples gives the tie-break something to
+/// work with while staying bounded.
+fn fetch_window(limit: i64) -> i64 {
+    limit.saturating_mul(4).max(64)
+}
+
+/// Fetch due cards, most overdue first.
+///
+/// A row is due when it has no memory row (never reviewed) or
+/// `next_due_date <= now` (`NULL` counts as due for pre-migration rows).
+/// Uses `idx_memory_next_due`, and the deck filter and exclusion are pushed
+/// into SQL — the previous filtered path fetched *every* due card
+/// (`LIMIT i64::MAX`), ran FSRS over all of them, then issued a second query
+/// and filtered in Rust through a `HashSet`.
+///
+/// Ordering is: reviews before new cards, then by due date, in SQL; then a
+/// retrievability tie-break in Rust over the over-fetched window. New cards
+/// are no longer pinned to `R = 0.0`, which used to make them outrank every
+/// genuinely overdue review.
 ///
 /// `days_elapsed = max(0, (now - last_review) / 86400)`. Rows with no
 /// memory state get `stability = 0.0, difficulty = 0.0, elapsed = 0,
@@ -179,23 +227,35 @@ pub async fn fetch_due_cards(
     fsrs: &FSRS,
     retention: f32,
     decay: f32,
-    limit: i64,
+    opts: DueOpts<'_>,
 ) -> Result<Vec<DueCardView>, AppError> {
-    if limit <= 0 {
+    if opts.limit <= 0 {
         return Ok(Vec::new());
     }
     let now = now_unix();
     let rows = sqlx::query(
         "SELECT c.id AS id, c.content_front AS front, c.content_back AS back, \
+         c.deck_id AS deck_id, d.name AS deck_name, \
          m.stability AS stability, m.difficulty AS difficulty, \
          m.last_review_date AS last_review_date \
-         FROM cards c LEFT JOIN card_memory_states m ON m.card_id = c.id \
-         WHERE m.card_id IS NULL OR m.next_due_date IS NULL OR m.next_due_date <= ? \
-         ORDER BY COALESCE(m.next_due_date, 0) ASC, COALESCE(m.last_review_date, 0) ASC \
-         LIMIT ?",
+         FROM cards c \
+         LEFT JOIN card_memory_states m ON m.card_id = c.id \
+         LEFT JOIN decks d ON d.id = c.deck_id \
+         LEFT JOIN card_flags f ON f.card_id = c.id \
+         WHERE (m.card_id IS NULL OR m.next_due_date IS NULL OR m.next_due_date <= ?1) \
+           AND (?2 IS NULL OR c.deck_id = ?2) \
+           AND (?3 IS NULL OR c.id <> ?3) \
+           AND COALESCE(f.suspended, 0) = 0 \
+           AND COALESCE(f.buried_until, 0) <= ?1 \
+         ORDER BY CASE WHEN m.card_id IS NULL THEN 1 ELSE 0 END ASC, \
+                  COALESCE(m.next_due_date, 0) ASC, \
+                  COALESCE(m.last_review_date, 0) ASC \
+         LIMIT ?4",
     )
     .bind(now)
-    .bind(limit)
+    .bind(opts.deck_id)
+    .bind(opts.exclude_card_id)
+    .bind(fetch_window(opts.limit))
     .fetch_all(pool)
     .await?;
 
@@ -204,6 +264,8 @@ pub async fn fetch_due_cards(
         let id: String = row.get("id");
         let front: String = row.get("front");
         let back: String = row.get("back");
+        let deck_id: String = row.get("deck_id");
+        let deck_name: Option<String> = row.get("deck_name");
         let stability_opt: Option<f64> = row.get("stability");
         let difficulty_opt: Option<f64> = row.get("difficulty");
         let last_review_opt: Option<i64> = row.get("last_review_date");
@@ -223,8 +285,11 @@ pub async fn fetch_due_cards(
                 _ => (0.0_f32, 0.0_f32, 0_u32, None),
             };
 
+        // A never-reviewed card has no retrievability to compute. It sorts
+        // after reviews in SQL, so give it a neutral value here rather than
+        // 0.0, which would drag it back to the front of the R sort.
         let r = match mem {
-            None => 0.0,
+            None => NEW_CARD_R,
             Some(_) => retrievability(stability, elapsed, decay),
         };
 
@@ -235,6 +300,8 @@ pub async fn fetch_due_cards(
                 id,
                 front,
                 back,
+                deck_id,
+                deck_name,
                 stability,
                 difficulty,
                 days_elapsed: elapsed,
@@ -243,7 +310,7 @@ pub async fn fetch_due_cards(
         ));
     }
     collected.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    collected.truncate(limit as usize);
+    collected.truncate(opts.limit as usize);
     Ok(collected.into_iter().map(|(_, view)| view).collect())
 }
 
@@ -261,10 +328,8 @@ pub async fn fetch_due_cards(
 ///    `review_logs` row (uuid v4, `delta_t = elapsed`,
 ///    `reviewed_at = now`). Commit before re-fetch so either both rows
 ///    land or neither does (atomicity).
-/// 5. Return the next due card (`fetch_due_cards` limit 1): `None` if
-///    nothing else is due. The just-graded card is excluded — if the
-///    single top-due row is the card just graded, `None` is returned
-///    instead of immediately re-presenting it.
+/// 5. Return the next due card (`fetch_due_cards` limit 1, excluding the
+///    card just graded): `None` only when nothing else is actually due.
 pub async fn grade_card_db(
     pool: &sqlx::SqlitePool,
     fsrs: &FSRS,
@@ -354,12 +419,22 @@ pub async fn grade_card_db(
     .await?;
     tx.commit().await?;
 
-    let mut due = fetch_due_cards(pool, fsrs, retention, decay, 1).await?;
-    let first = due.pop();
-    match first {
-        Some(card) if card.id == card_id => Ok(None),
-        other => Ok(other),
-    }
+    // Exclude in SQL rather than fetching one row and discarding it when it
+    // happens to be the card just graded — that ended sessions early, and
+    // reported "nothing due" with other cards still waiting.
+    let mut due = fetch_due_cards(
+        pool,
+        fsrs,
+        retention,
+        decay,
+        DueOpts {
+            limit: 1,
+            deck_id: None,
+            exclude_card_id: Some(card_id),
+        },
+    )
+    .await?;
+    Ok(due.pop())
 }
 
 /// Seed 3 demo EN/ES cards so first-run review is non-empty.
@@ -426,6 +501,9 @@ pub async fn add_card(
         .bind(now)
         .execute(pool)
         .await?;
+    // NOTE: the fallback above names the deck after its id. That is only
+    // reachable for a deck id the caller invented; `create_deck` is the
+    // supported path and keeps the two separate.
     sqlx::query(
         "INSERT INTO cards (id, deck_id, content_front, content_back, created_at) \
          VALUES (?, ?, ?, ?, ?)",
@@ -438,6 +516,177 @@ pub async fn add_card(
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// The deck every card falls back to. Cannot be renamed away or deleted.
+pub const DEFAULT_DECK_ID: &str = "default";
+
+/// Create a deck with a generated id.
+///
+/// The id is a uuid rather than the name, so renaming a deck does not
+/// orphan its cards — `add_card` used to register `deck_id` as both id and
+/// name, which made the two indistinguishable.
+pub async fn create_deck(pool: &sqlx::SqlitePool, name: &str) -> Result<String, AppError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadInput(
+            "deck name must not be empty".to_string(),
+        ));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO decks(id, name, created_at) VALUES(?, ?, ?)")
+        .bind(&id)
+        .bind(name)
+        .bind(now_unix())
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+pub async fn rename_deck(
+    pool: &sqlx::SqlitePool,
+    deck_id: &str,
+    name: &str,
+) -> Result<(), AppError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadInput(
+            "deck name must not be empty".to_string(),
+        ));
+    }
+    let res = sqlx::query("UPDATE decks SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(deck_id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::BadInput(format!("deck not found: {deck_id}")));
+    }
+    Ok(())
+}
+
+/// What to do with the cards in a deck being deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckDeleteMode {
+    /// Move them to the default deck.
+    Move,
+    /// Delete them, and everything that references them.
+    Delete,
+}
+
+impl DeckDeleteMode {
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw {
+            "move" => Ok(Self::Move),
+            "delete" => Ok(Self::Delete),
+            other => Err(AppError::BadInput(format!(
+                "unknown delete mode {other:?}: expected \"move\" or \"delete\""
+            ))),
+        }
+    }
+}
+
+/// Delete a deck, either rehoming or destroying its cards.
+///
+/// One transaction, children first — `ON DELETE CASCADE` is not reliable
+/// here because the plugin owns the pool and `PRAGMA foreign_keys` is
+/// per-connection.
+pub async fn delete_deck(
+    pool: &sqlx::SqlitePool,
+    deck_id: &str,
+    mode: DeckDeleteMode,
+) -> Result<usize, AppError> {
+    if deck_id == DEFAULT_DECK_ID {
+        return Err(AppError::BadInput(
+            "the default deck cannot be deleted".to_string(),
+        ));
+    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM decks WHERE id = ?")
+        .bind(deck_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::BadInput(format!("deck not found: {deck_id}")));
+    }
+
+    let mut tx = pool.begin().await?;
+    let affected = match mode {
+        DeckDeleteMode::Move => sqlx::query("UPDATE cards SET deck_id = ? WHERE deck_id = ?")
+            .bind(DEFAULT_DECK_ID)
+            .bind(deck_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected(),
+        DeckDeleteMode::Delete => {
+            let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM cards WHERE deck_id = ?")
+                .bind(deck_id)
+                .fetch_all(&mut *tx)
+                .await?;
+            for id in &ids {
+                delete_card_children(&mut tx, id).await?;
+            }
+            sqlx::query("DELETE FROM cards WHERE deck_id = ?")
+                .bind(deck_id)
+                .execute(&mut *tx)
+                .await?;
+            ids.len() as u64
+        }
+    };
+    sqlx::query("DELETE FROM deck_config WHERE deck_id = ?")
+        .bind(deck_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM decks WHERE id = ?")
+        .bind(deck_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(affected as usize)
+}
+
+/// Edit a card's text in place, keeping its scheduling history.
+pub async fn update_card(
+    pool: &sqlx::SqlitePool,
+    card_id: &str,
+    front: &str,
+    back: &str,
+) -> Result<(), AppError> {
+    let front = front.trim();
+    let back = back.trim();
+    if front.is_empty() || back.is_empty() {
+        return Err(AppError::BadInput(
+            "front and back must not be empty".to_string(),
+        ));
+    }
+    let res = sqlx::query("UPDATE cards SET content_front = ?, content_back = ? WHERE id = ?")
+        .bind(front)
+        .bind(back)
+        .bind(card_id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::BadInput(format!("card not found: {card_id}")));
+    }
+    Ok(())
+}
+
+/// Remove every row that references a card, inside a caller's transaction.
+///
+/// Kept in one place so a new child table is wired into every delete path at
+/// once rather than being forgotten in one of them.
+async fn delete_card_children(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    card_id: &str,
+) -> Result<(), AppError> {
+    for sql in [
+        "DELETE FROM attempt_cards WHERE card_id = ?",
+        "DELETE FROM card_flags WHERE card_id = ?",
+        "DELETE FROM review_logs WHERE card_id = ?",
+        "DELETE FROM card_memory_states WHERE card_id = ?",
+    ] {
+        sqlx::query(sql).bind(card_id).execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 /// List all decks ordered by name.
@@ -514,14 +763,7 @@ pub async fn delete_card(pool: &sqlx::SqlitePool, card_id: &str) -> Result<(), A
         return Err(AppError::BadInput(format!("card not found: {card_id}")));
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM review_logs WHERE card_id = ?")
-        .bind(card_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM card_memory_states WHERE card_id = ?")
-        .bind(card_id)
-        .execute(&mut *tx)
-        .await?;
+    delete_card_children(&mut tx, card_id).await?;
     sqlx::query("DELETE FROM cards WHERE id = ?")
         .bind(card_id)
         .execute(&mut *tx)
@@ -947,7 +1189,7 @@ mod tests {
             .bind(now)
             .bind(now + 86_400 * 10)
             .execute(&pool).await.unwrap();
-        let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, 10)
+        let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, DueOpts::limit(10))
             .await
             .unwrap();
         let ids: Vec<&str> = due.iter().map(|c| c.id.as_str()).collect();
@@ -983,7 +1225,7 @@ mod tests {
         // Reload simulation: fetch_due must NOT return it immediately when
         // the step is still in the future (intraday scheduling works).
         if delta > 5 {
-            let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, 10)
+            let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, DueOpts::limit(10))
                 .await
                 .unwrap();
             assert!(
@@ -1337,5 +1579,285 @@ mod tests {
         // A database that stopped between migrations 4 and 5 still reports
         // the user's choice rather than snapping back to the default.
         assert_eq!(load_retention(&pool).await, 0.8);
+    }
+
+    async fn card(pool: &sqlx::SqlitePool, id: &str, deck: &str) {
+        sqlx::query("INSERT OR IGNORE INTO decks(id, name, created_at) VALUES(?, ?, 0)")
+            .bind(deck)
+            .bind(deck)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO cards (id, deck_id, content_front, content_back, created_at) \
+             VALUES (?, ?, 'F', 'B', 0)",
+        )
+        .bind(id)
+        .bind(deck)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn reviewed(pool: &sqlx::SqlitePool, id: &str, stability: f64, days_ago: i64) {
+        let now = crate::db::now_unix();
+        sqlx::query(
+            "INSERT INTO card_memory_states \
+             (card_id, stability, difficulty, last_review_date, next_due_date) \
+             VALUES (?, ?, 5.0, ?, ?)",
+        )
+        .bind(id)
+        .bind(stability)
+        .bind(now - days_ago * 86_400)
+        .bind(now - 60)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn due_cards_filters_by_deck_in_sql() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "a1", "alpha").await;
+        card(&pool, "a2", "alpha").await;
+        card(&pool, "b1", "beta").await;
+        let due = fetch_due_cards(
+            &pool,
+            &fsrs,
+            0.9,
+            FSRS6_DEFAULT_DECAY,
+            DueOpts {
+                limit: 10,
+                deck_id: Some("alpha"),
+                exclude_card_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<&str> = due.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a1", "a2"]);
+        assert!(due.iter().all(|c| c.deck_id == "alpha"));
+        assert_eq!(due[0].deck_name.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn due_cards_can_exclude_one_card() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "keep", "default").await;
+        card(&pool, "skip", "default").await;
+        let due = fetch_due_cards(
+            &pool,
+            &fsrs,
+            0.9,
+            FSRS6_DEFAULT_DECAY,
+            DueOpts {
+                limit: 10,
+                deck_id: None,
+                exclude_card_id: Some("skip"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            due.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_end_a_session_that_still_has_cards() {
+        // The old code fetched the single top-due row and returned None when
+        // it was the card just graded, which ended sessions early.
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "first", "default").await;
+        card(&pool, "second", "default").await;
+        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "first", 3)
+            .await
+            .unwrap();
+        let next = next.expect("another card is still due");
+        assert_eq!(next.id, "second");
+    }
+
+    #[tokio::test]
+    async fn grading_the_last_card_reports_done() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "only", "default").await;
+        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "only", 3)
+            .await
+            .unwrap();
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn overdue_reviews_come_before_new_cards() {
+        // New cards used to be pinned to R = 0.0, which made them outrank
+        // every review no matter how overdue it was.
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "brand-new", "default").await;
+        card(&pool, "badly-overdue", "default").await;
+        reviewed(&pool, "badly-overdue", 2.0, 400).await;
+        let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, DueOpts::limit(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            due[0].id,
+            "badly-overdue",
+            "got {:?}",
+            due.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_and_buried_cards_are_not_due() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "normal", "default").await;
+        card(&pool, "suspended", "default").await;
+        card(&pool, "buried", "default").await;
+        let later = crate::db::now_unix() + 86_400;
+        sqlx::query("INSERT INTO card_flags(card_id, suspended, buried_until, updated_at) VALUES ('suspended',1,0,0), ('buried',0,?,0)")
+            .bind(later)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, DueOpts::limit(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            due.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["normal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_rename_keep_id_and_name_separate() {
+        let pool = mem_pool().await;
+        let id = create_deck(&pool, "Spanish Verbs").await.unwrap();
+        assert_ne!(id, "Spanish Verbs", "the id must not be the name");
+        rename_deck(&pool, &id, "Verbs").await.unwrap();
+        let decks = list_decks(&pool).await.unwrap();
+        let found = decks.iter().find(|d| d.id == id).expect("deck");
+        assert_eq!(found.name, "Verbs");
+        assert!(create_deck(&pool, "   ").await.is_err());
+        assert!(rename_deck(&pool, "nope", "X").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_deck_moves_cards_to_default() {
+        let pool = mem_pool().await;
+        let id = create_deck(&pool, "Temp").await.unwrap();
+        card(&pool, "c1", &id).await;
+        let moved = delete_deck(&pool, &id, DeckDeleteMode::Move).await.unwrap();
+        assert_eq!(moved, 1);
+        let deck: String = sqlx::query_scalar("SELECT deck_id FROM cards WHERE id='c1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deck, DEFAULT_DECK_ID);
+    }
+
+    #[tokio::test]
+    async fn delete_deck_with_cards_clears_every_child_table() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        let id = create_deck(&pool, "Doomed").await.unwrap();
+        card(&pool, "c1", &id).await;
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO card_flags(card_id, suspended, buried_until, updated_at) VALUES ('c1',1,0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            delete_deck(&pool, &id, DeckDeleteMode::Delete)
+                .await
+                .unwrap(),
+            1
+        );
+        // Cascade is unreliable on this pool, so every child must be cleared
+        // explicitly — a leftover row would resurrect as an orphan.
+        for table in [
+            "cards",
+            "review_logs",
+            "card_memory_states",
+            "card_flags",
+            "attempt_cards",
+        ] {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE {} = 'c1'",
+                if table == "cards" { "id" } else { "card_id" }
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 0, "{table} still references the deleted card");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_deck_cannot_be_deleted() {
+        let pool = mem_pool().await;
+        // Deleting it would leave "move" with nowhere to move cards to.
+        assert!(delete_deck(&pool, DEFAULT_DECK_ID, DeckDeleteMode::Move)
+            .await
+            .is_err());
+        assert!(delete_deck(&pool, "missing", DeckDeleteMode::Move)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn update_card_keeps_scheduling_history() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "c1", "default").await;
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3)
+            .await
+            .unwrap();
+        update_card(&pool, "c1", "new front", "new back")
+            .await
+            .unwrap();
+        let (front, back) = sqlx::query_as::<_, (String, String)>(
+            "SELECT content_front, content_back FROM cards WHERE id='c1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((front.as_str(), back.as_str()), ("new front", "new back"));
+        let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_logs WHERE card_id='c1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(logs, 1, "editing text must not reset scheduling");
+        assert!(update_card(&pool, "c1", "", "x").await.is_err());
+        assert!(update_card(&pool, "missing", "a", "b").await.is_err());
+    }
+
+    #[test]
+    fn deck_delete_mode_rejects_anything_else() {
+        assert_eq!(DeckDeleteMode::parse("move").unwrap(), DeckDeleteMode::Move);
+        assert_eq!(
+            DeckDeleteMode::parse("delete").unwrap(),
+            DeckDeleteMode::Delete
+        );
+        assert!(DeckDeleteMode::parse("destroy").is_err());
+    }
+
+    #[test]
+    fn fetch_window_always_exceeds_the_limit() {
+        // If the window equalled the limit the R sort would be a no-op:
+        // sorting exactly the rows you return changes nothing.
+        for limit in [1_i64, 5, 20, 100, 10_000] {
+            assert!(fetch_window(limit) > limit, "window too small for {limit}");
+        }
+        assert_eq!(fetch_window(i64::MAX), i64::MAX, "must not overflow");
     }
 }
