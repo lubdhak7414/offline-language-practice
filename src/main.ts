@@ -28,7 +28,12 @@ type CardItem = {
 type ReviewStats = {
   distinct_cards: number;
   total_reviews: number;
-  min_histories: number;
+  /** Cards with >= 2 reviews; only these can contribute training data. */
+  trainable_cards: number;
+  /** Prefix items the optimizer will actually train on. */
+  train_items: number;
+  min_train_items: number;
+  min_trainable_cards: number;
 };
 
 type ModelStatus = {
@@ -63,6 +68,7 @@ type RecentReview = {
 
 const TRANSCRIPT_PLACEHOLDER = "Press record, speak, then stop.";
 const TTS_MAX_CHARS = 1440; // == backend AUDIOSTREAM_MAX_CHARS (8 chunks × 180)
+const SYSTEM_TOAST_MS = 4000;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -79,6 +85,7 @@ let transcribing = false;
 let hasTranscript = false;
 let lastTtsUrl: string | null = null;
 let autoStopTimer: ReturnType<typeof setTimeout> | null = null;
+let systemToastTimer: ReturnType<typeof setTimeout> | undefined;
 // Monotonic request id so a slow loadDue/seed response can't overwrite newer card state.
 let cardReq = 0;
 
@@ -542,26 +549,31 @@ async function seed() {
   }
 }
 
-// Optimizer needs >= 8 histories; gate the button via review_stats{}.
-const OPTIMIZE_GATE = 8;
-
+// Gate the optimizer button via review_stats{}; the backend owns the minimums.
 async function refreshOptimizeGate() {
   const btn = $("btn-optimize") as HTMLButtonElement;
   try {
     const stats = await invoke<ReviewStats>("review_stats", {});
-    const n = stats.min_histories ?? 0;
-    if (n < OPTIMIZE_GATE) {
+    // Gate on the same two numbers the backend checks. Each card with n
+    // reviews contributes n-1 training items, so reviews spread thinly
+    // across many cards train less than the raw review count suggests.
+    const items = stats.train_items ?? 0;
+    const cards = stats.trainable_cards ?? 0;
+    const needItems = stats.min_train_items;
+    const needCards = stats.min_trainable_cards;
+    if (items < needItems || cards < needCards) {
       btn.disabled = true;
       setStatus(
         "optimize-status",
-        `need ${n}/${OPTIMIZE_GATE} reviews before optimizing ` +
-          `(cards: ${stats.distinct_cards}, reviews: ${stats.total_reviews})`
+        `need ${items}/${needItems} review histories across ` +
+          `${cards}/${needCards} cards before optimizing ` +
+          `(each card needs a 2nd review to count)`
       );
     } else {
       btn.disabled = false;
       setStatus(
         "optimize-status",
-        `ready (${stats.total_reviews} reviews, min histories ${n})`
+        `ready (${items} histories across ${cards} cards)`
       );
     }
   } catch (e) {
@@ -574,27 +586,28 @@ async function refreshOptimizeGate() {
 
 async function loadModelStatus() {
   const el = $("model-status");
-  let asr = "unknown";
-  let vocab = "unknown";
-  let tts = "unknown";
+  // Build the whole line first and write once: an earlier version wrote the
+  // failure into `el` from the catch and then unconditionally overwrote it.
+  let line: string;
   try {
     const s = await invoke<ModelStatus>("model_status", {});
-    asr = s.asr_model ? "available" : "missing";
-    vocab = s.asr_vocab ? "available" : "missing";
-    tts = s.tts_voice ? "available" : "missing";
+    const asr = s.asr_model ? "available" : "missing";
+    const vocab = s.asr_vocab ? "available" : "missing";
+    const tts = s.tts_voice ? "available" : "missing";
+    // No voice <select> in this wave (backend takes no voice param):
+    // surface the voice count in the model-status line instead.
+    let voices = "unknown";
+    try {
+      const v = await invoke<VoiceInfo[]>("list_voices", {});
+      voices = String(v.length);
+    } catch {
+      voices = "unknown";
+    }
+    line = `Models — ASR: ${asr} · vocab: ${vocab} · TTS: ${tts} · voices: ${voices}`;
   } catch (e) {
-    el.textContent = `Models: status unavailable (${String(e)})`;
+    line = `Models: status unavailable (${String(e)})`;
   }
-  // No voice <select> in this wave (backend takes no voice param):
-  // surface the voice count in the model-status line instead.
-  let voices = "unknown";
-  try {
-    const v = await invoke<VoiceInfo[]>("list_voices", {});
-    voices = String(v.length);
-  } catch {
-    voices = "unknown";
-  }
-  el.textContent = `Models — ASR: ${asr} · vocab: ${vocab} · TTS: ${tts} · voices: ${voices}`;
+  el.textContent = line;
 }
 
 async function optimize() {
@@ -892,12 +905,16 @@ function bind() {
   document.addEventListener("keydown", (e) => {
     const t = e.target as HTMLElement | null;
     const tag = t?.tagName ?? "";
+    // Never hijack typing, IME composition, or native media controls.
+    // BUTTON is deliberately NOT excluded: revealing focuses a grade button,
+    // so excluding it disabled 1-4 in exactly the state they exist for.
     if (
       tag === "INPUT" ||
       tag === "SELECT" ||
       tag === "TEXTAREA" ||
-      tag === "BUTTON" ||
-      tag === "AUDIO"
+      tag === "AUDIO" ||
+      t?.isContentEditable ||
+      e.isComposing
     ) {
       return;
     }
@@ -909,24 +926,26 @@ function bind() {
       (e.key === " " || e.key === "Enter") &&
       currentCard &&
       !revealed &&
-      !($("btn-reveal") as HTMLButtonElement).hidden
+      !($("btn-reveal") as HTMLButtonElement).hidden &&
+      // A focused button already activates on Space/Enter; don't double-fire.
+      tag !== "BUTTON"
     ) {
       e.preventDefault();
       reveal();
     }
   });
   // Backend → frontend async status broadcasts (Tauri events, not polling).
-  // Never clobber in-progress transcribe state in #asr-status.
+  // These always go to the toast, never to #asr-status, so they cannot
+  // clobber in-progress transcribe state.
   void listen<string>("system-status", (e) => {
     const payload = e.payload ?? "";
-    if (transcribing || mediaStream || payload.includes("transcription-complete")) {
-      const toast = document.getElementById("system-toast");
-      if (toast) {
-        toast.textContent = payload;
-        return;
-      }
-    }
-    $("asr-status").textContent = payload;
+    const toast = document.getElementById("system-toast");
+    if (!payload || !toast) return;
+    toast.textContent = payload;
+    window.clearTimeout(systemToastTimer);
+    systemToastTimer = window.setTimeout(() => {
+      toast.textContent = "";
+    }, SYSTEM_TOAST_MS);
   });
 }
 

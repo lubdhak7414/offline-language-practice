@@ -537,8 +537,8 @@ async fn delete_card(card_id: String, db: State<'_, DbInstances>) -> Result<(), 
         .map_err(String::from)
 }
 
-/// Aggregate review stats for optimizer gating
-/// (`distinct_cards` / `total_reviews` / `min_histories`).
+/// Aggregate review stats for optimizer gating (`distinct_cards` /
+/// `total_reviews` / `trainable_cards` / `train_items` + the two minimums).
 #[tauri::command]
 async fn review_stats(db: State<'_, DbInstances>) -> Result<ReviewStats, String> {
     let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;

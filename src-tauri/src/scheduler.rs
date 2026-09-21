@@ -52,13 +52,48 @@ pub struct CardRow {
 
 /// Aggregate review-history counts for the optimizer gate.
 ///
+/// `train_items` is what the optimizer actually consumes: each card with
+/// `n >= 2` reviews contributes `n - 1` prefix items (see
+/// [`build_train_set`]), so it is the only count that predicts whether
+/// training can run. `trainable_cards` counts cards reaching `n >= 2`.
+///
 /// Wired as Tauri commands by the lib.rs owner; allow dead code until then.
 #[allow(dead_code)]
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ReviewStats {
     pub distinct_cards: u64,
     pub total_reviews: u64,
-    pub min_histories: u64,
+    pub trainable_cards: u64,
+    pub train_items: u64,
+    pub min_train_items: u64,
+    pub min_trainable_cards: u64,
+}
+
+/// Minimum prefix items required before `optimize_parameters` will run.
+pub const MIN_TRAIN_ITEMS: u64 = 32;
+/// Minimum cards with >= 2 reviews required before optimizing.
+pub const MIN_TRAINABLE_CARDS: u64 = 8;
+/// Upper bound (days) on any elapsed interval, ~100 years.
+///
+/// A coarse sanity bound against corrupt input (a delta stored in the wrong
+/// unit, a far-future clock). Note it does NOT catch epoch-relative deltas:
+/// the epoch is under 20,000 days ago, so those pass this bound — the
+/// `last <= 0` guard in [`elapsed_days`] is what stops them.
+pub const MAX_DELTA_T: i64 = 36_500;
+
+/// Whole days between `last` and `now`, clamped to `0..=MAX_DELTA_T`.
+///
+/// A non-positive `last` means "never reviewed" rather than "reviewed at the
+/// epoch". Without that distinction a `last_review_date` of 0 produced an
+/// elapsed time of ~20,000 days, which was then persisted as the review's
+/// `delta_t` and fed to the optimizer.
+fn elapsed_days(now: i64, last: i64) -> u32 {
+    if last <= 0 {
+        return 0;
+    }
+    now.saturating_sub(last)
+        .div_euclid(86_400)
+        .clamp(0, MAX_DELTA_T) as u32
 }
 
 /// One review-log row, serialized snake_case for the frontend
@@ -169,7 +204,7 @@ pub async fn fetch_due_cards(
         let (stability, difficulty, elapsed, mem) =
             match (stability_opt, difficulty_opt, last_review_opt) {
                 (Some(s), Some(d), Some(last)) => {
-                    let elapsed = now.saturating_sub(last).div_euclid(86_400).max(0) as u32;
+                    let elapsed = elapsed_days(now, last);
                     let stability = s as f32;
                     let difficulty = d as f32;
                     let mem = Some(MemoryState {
@@ -251,7 +286,7 @@ pub async fn grade_card_db(
             let s: f64 = row.get("stability");
             let d: f64 = row.get("difficulty");
             let last: i64 = row.get("last_review_date");
-            let elapsed = now.saturating_sub(last).div_euclid(86_400).max(0) as u32;
+            let elapsed = elapsed_days(now, last);
             let mem = Some(MemoryState {
                 stability: s as f32,
                 difficulty: d as f32,
@@ -323,9 +358,10 @@ pub async fn grade_card_db(
 /// Seed 3 demo EN/ES cards so first-run review is non-empty.
 ///
 /// Cards (`INSERT OR IGNORE`): ids `demo-1..3`, `deck_id = "default"`,
-/// `created_at = now`. Memory rows (`INSERT OR IGNORE`) default to
-/// `stability 1.0, difficulty 5.0, last_review 0, next_due_date 0` so the
-/// due filter treats them as due and they sort oldest-first.
+/// `created_at = now`. No `card_memory_states` row is written, so demo cards
+/// are genuinely new exactly like `add_card` output. Seeding one previously
+/// set `last_review_date = 0`, which made the first grade compute an elapsed
+/// time of ~20,000 days and persist it as the review's `delta_t`.
 ///
 /// Returns the number of card rows actually inserted (0..3).
 pub async fn seed_demo_deck(pool: &sqlx::SqlitePool) -> Result<usize, AppError> {
@@ -349,15 +385,6 @@ pub async fn seed_demo_deck(pool: &sqlx::SqlitePool) -> Result<usize, AppError> 
         .execute(pool)
         .await?;
         inserted += r.rows_affected() as usize;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO card_memory_states \
-             (card_id, stability, difficulty, last_review_date, next_due_date) \
-             VALUES (?, 1.0, 5.0, 0, 0)",
-        )
-        .bind(id)
-        .execute(pool)
-        .await?;
     }
     Ok(inserted)
 }
@@ -498,25 +525,34 @@ pub async fn delete_card(pool: &sqlx::SqlitePool, card_id: &str) -> Result<(), A
 
 /// Aggregate review-history counts plus the optimizer gate.
 ///
-/// `distinct_cards` = `COUNT(DISTINCT card_id)`, `total_reviews` =
-/// `COUNT(*)` from `review_logs`; `min_histories` = 8 (minimum histories
-/// `optimize_parameters` requires).
+/// `train_items` mirrors what [`build_train_set`] produces — each card with
+/// `n >= 2` reviews yields `n - 1` prefix items — so the frontend can gate the
+/// optimizer on the same number the optimizer itself checks.
 ///
 /// Wired as a Tauri command by the lib.rs owner; allow dead code until then.
 #[allow(dead_code)]
 pub async fn review_stats(pool: &sqlx::SqlitePool) -> Result<ReviewStats, AppError> {
     let row = sqlx::query(
-        "SELECT COUNT(DISTINCT card_id) AS distinct_cards, COUNT(*) AS total_reviews \
-         FROM review_logs",
+        "SELECT COUNT(*) AS distinct_cards, \
+         COALESCE(SUM(cnt), 0) AS total_reviews, \
+         COALESCE(SUM(CASE WHEN cnt >= 2 THEN 1 ELSE 0 END), 0) AS trainable_cards, \
+         COALESCE(SUM(CASE WHEN cnt >= 2 THEN cnt - 1 ELSE 0 END), 0) AS train_items \
+         FROM (SELECT card_id, COUNT(*) AS cnt FROM review_logs \
+               WHERE rating BETWEEN 1 AND 4 GROUP BY card_id)",
     )
     .fetch_one(pool)
     .await?;
     let distinct: i64 = row.get("distinct_cards");
     let total: i64 = row.get("total_reviews");
+    let trainable: i64 = row.get("trainable_cards");
+    let items: i64 = row.get("train_items");
     Ok(ReviewStats {
         distinct_cards: distinct.max(0) as u64,
         total_reviews: total.max(0) as u64,
-        min_histories: 8,
+        trainable_cards: trainable.max(0) as u64,
+        train_items: items.max(0) as u64,
+        min_train_items: MIN_TRAIN_ITEMS,
+        min_trainable_cards: MIN_TRAINABLE_CARDS,
     })
 }
 
@@ -555,12 +591,66 @@ pub async fn recent_reviews(
     Ok(out)
 }
 
+/// Build the FSRS training set from ordered `(card_id, rating, delta_t)` rows.
+///
+/// `fsrs` expects one [`FSRSItem`] per review, each carrying that card's
+/// preceding reviews as a prefix — "Each `FSRSItem` corresponds to a single
+/// review, but contains the previous reviews of the card as well"
+/// (`fsrs::dataset`). So a card with `n` valid reviews contributes `n - 1`
+/// items of lengths `2..=n`, and a card with fewer than two contributes none.
+///
+/// The returned `card_ids` are index-aligned with the returned items and
+/// densely numbered from 0, as `ComputeParametersInput::card_ids` requires.
+///
+/// `rows` must already be ordered by `(card_id, reviewed_at, rowid)`.
+fn build_train_set(rows: &[(String, i64, i64)]) -> (Vec<FSRSItem>, Vec<i64>) {
+    let mut groups: HashMap<&str, Vec<FSRSReview>> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for (card_id, rating, delta_t) in rows {
+        if !(1..=4).contains(rating) {
+            continue;
+        }
+        groups
+            .entry(card_id.as_str())
+            .or_insert_with(|| {
+                order.push(card_id.as_str());
+                Vec::new()
+            })
+            .push(FSRSReview {
+                rating: *rating as u32,
+                delta_t: (*delta_t).clamp(0, MAX_DELTA_T) as u32,
+            });
+    }
+
+    let mut items: Vec<FSRSItem> = Vec::new();
+    let mut card_ids: Vec<i64> = Vec::new();
+    let mut next_dense: i64 = 0;
+    for card_id in &order {
+        let Some(reviews) = groups.get_mut(card_id) else {
+            continue;
+        };
+        if reviews.len() < 2 {
+            continue;
+        }
+        // The first review introduces the card, so it has no elapsed time.
+        reviews[0].delta_t = 0;
+        for k in 2..=reviews.len() {
+            items.push(FSRSItem {
+                reviews: reviews[..k].to_vec(),
+            });
+            card_ids.push(next_dense);
+        }
+        next_dense += 1;
+    }
+    (items, card_ids)
+}
+
 /// Optimize FSRS parameters from review history.
 ///
-/// Loads all `review_logs` grouped by `card_id` ordered by
-/// `reviewed_at` (plus `rowid` tie-break for same-timestamp rows) into
-/// `Vec<FSRSItem { reviews: Vec<FSRSReview { rating, delta_t }> }>`.
-/// Requires at least 8 items; fewer keeps the current parameters.
+/// Loads all `review_logs` ordered by `card_id`, then `reviewed_at` (with a
+/// `rowid` tie-break for same-timestamp rows) and expands them into prefix
+/// items via [`build_train_set`]. Requires [`MIN_TRAIN_ITEMS`] items across
+/// [`MIN_TRAINABLE_CARDS`] cards; less keeps the current parameters.
 ///
 /// The blocking `compute_parameters` call runs in
 /// `tokio::task::spawn_blocking` so the async runtime stays
@@ -575,42 +665,18 @@ pub async fn optimize_parameters(pool: &sqlx::SqlitePool) -> Result<Vec<f32>, Ap
     )
     .fetch_all(pool)
     .await?;
+    let rows: Vec<(String, i64, i64)> = rows
+        .into_iter()
+        .map(|row| (row.get("card_id"), row.get("rating"), row.get("delta_t")))
+        .collect();
 
-    use std::collections::HashMap as Map;
-    let mut groups: Map<String, Vec<FSRSReview>> = Map::new();
-    let mut order: Vec<String> = Vec::new();
-    for row in rows {
-        let card_id: String = row.get("card_id");
-        let rating_i: i64 = row.get("rating");
-        let delta_i: i64 = row.get("delta_t");
-        if !(1..=4).contains(&rating_i) {
-            continue;
-        }
-        let review = FSRSReview {
-            rating: rating_i as u32,
-            delta_t: delta_i.max(0) as u32,
-        };
-        groups
-            .entry(card_id.clone())
-            .or_insert_with(|| {
-                order.push(card_id);
-                Vec::new()
-            })
-            .push(review);
-    }
-
-    let mut items: Vec<FSRSItem> = Vec::with_capacity(groups.len());
-    for card_id in &order {
-        if let Some(reviews) = groups.remove(card_id) {
-            if !reviews.is_empty() {
-                items.push(FSRSItem { reviews });
-            }
-        }
-    }
-
-    if items.len() < 8 {
+    let (items, card_ids) = build_train_set(&rows);
+    // Dense ids are contiguous from 0, so the last one sizes the set.
+    let trainable = card_ids.last().map_or(0, |&last| last as u64 + 1);
+    if (items.len() as u64) < MIN_TRAIN_ITEMS || trainable < MIN_TRAINABLE_CARDS {
         return Err(AppError::Scheduler(format!(
-            "need at least 8 review histories to optimize (found {}); keeping current parameters",
+            "need at least {MIN_TRAIN_ITEMS} review histories across {MIN_TRAINABLE_CARDS} cards \
+             to optimize (found {} across {trainable}); keeping current parameters",
             items.len()
         )));
     }
@@ -618,6 +684,7 @@ pub async fn optimize_parameters(pool: &sqlx::SqlitePool) -> Result<Vec<f32>, Ap
     let params = tokio::task::spawn_blocking(move || {
         compute_parameters(ComputeParametersInput {
             train_set: items,
+            card_ids: Some(card_ids),
             ..Default::default()
         })
     })
@@ -1038,10 +1105,13 @@ mod tests {
             (
                 empty.distinct_cards,
                 empty.total_reviews,
-                empty.min_histories
+                empty.trainable_cards,
+                empty.train_items
             ),
-            (0, 0, 8)
+            (0, 0, 0, 0)
         );
+        assert_eq!(empty.min_train_items, MIN_TRAIN_ITEMS);
+        assert_eq!(empty.min_trainable_cards, MIN_TRAINABLE_CARDS);
         for (id, deck) in [("s1", "default"), ("s2", "default")] {
             sqlx::query(
                 "INSERT INTO cards (id, deck_id, content_front, content_back, created_at) \
@@ -1058,7 +1128,128 @@ mod tests {
         let stats = review_stats(&pool).await.unwrap();
         assert_eq!(stats.distinct_cards, 2);
         assert_eq!(stats.total_reviews, 3);
-        assert_eq!(stats.min_histories, 8);
+        // s1 has 2 reviews (1 prefix item), s2 has 1 (none): only s1 trains.
+        assert_eq!(stats.trainable_cards, 1);
+        assert_eq!(stats.train_items, 1);
+    }
+
+    /// `(card_id, rating, delta_t)` rows in the order the optimizer query returns.
+    fn rows(spec: &[(&str, i64, i64)]) -> Vec<(String, i64, i64)> {
+        spec.iter()
+            .map(|(c, r, d)| ((*c).to_string(), *r, *d))
+            .collect()
+    }
+
+    #[test]
+    fn train_set_expands_one_item_per_review_with_prefix() {
+        // The crate wants one FSRSItem per review carrying the prior reviews,
+        // so 5 reviews must yield 4 items of lengths 2..=5 — not 1 item of 5.
+        let input = rows(&[
+            ("c1", 3, 0),
+            ("c1", 3, 1),
+            ("c1", 4, 3),
+            ("c1", 2, 7),
+            ("c1", 3, 15),
+        ]);
+        let (items, card_ids) = build_train_set(&input);
+        let lengths: Vec<usize> = items.iter().map(|i| i.reviews.len()).collect();
+        assert_eq!(lengths, vec![2, 3, 4, 5]);
+        assert_eq!(card_ids, vec![0, 0, 0, 0]);
+        // Every item is a prefix of the full history, in order.
+        for item in &items {
+            assert_eq!(item.reviews[1].rating, 3);
+            assert_eq!(item.reviews[1].delta_t, 1);
+        }
+    }
+
+    #[test]
+    fn train_set_zeroes_first_delta_t_in_every_item() {
+        let input = rows(&[("c1", 3, 99), ("c1", 3, 5), ("c1", 3, 9)]);
+        let (items, _) = build_train_set(&input);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(
+                item.reviews[0].delta_t, 0,
+                "the introducing review has no elapsed time"
+            );
+        }
+    }
+
+    #[test]
+    fn train_set_skips_cards_with_fewer_than_two_reviews() {
+        let (items, card_ids) = build_train_set(&rows(&[("only", 3, 0)]));
+        assert!(items.is_empty());
+        assert!(card_ids.is_empty());
+        assert!(build_train_set(&[]).0.is_empty());
+    }
+
+    #[test]
+    fn train_set_separates_interleaved_cards_and_numbers_them_densely() {
+        // "a" contributes 2 items, "b" 1, "solo" none — and the dense ids must
+        // stay contiguous so `card_ids.last() + 1` counts trainable cards.
+        let input = rows(&[
+            ("a", 3, 0),
+            ("a", 3, 2),
+            ("a", 4, 5),
+            ("solo", 3, 0),
+            ("b", 1, 0),
+            ("b", 3, 4),
+        ]);
+        let (items, card_ids) = build_train_set(&input);
+        assert_eq!(items.len(), 3);
+        assert_eq!(card_ids, vec![0, 0, 1]);
+        assert_eq!(card_ids.len(), items.len());
+        assert_eq!(card_ids.last().map_or(0, |&l| l as u64 + 1), 2);
+        // The "b" item must carry b's reviews, not a's.
+        assert_eq!(items[2].reviews[0].rating, 1);
+        assert_eq!(items[2].reviews[1].delta_t, 4);
+    }
+
+    #[test]
+    fn train_set_drops_invalid_ratings() {
+        // A card whose only surviving review is one row contributes nothing.
+        let input = rows(&[("c1", 0, 0), ("c1", 3, 1), ("c2", 3, 0), ("c2", 9, 2)]);
+        let (items, card_ids) = build_train_set(&input);
+        assert!(
+            items.is_empty(),
+            "both cards drop to a single valid review, got {items:?}"
+        );
+        assert!(card_ids.is_empty());
+    }
+
+    #[test]
+    fn train_set_clamps_out_of_range_delta_t() {
+        let input = rows(&[("c1", 3, 0), ("c1", 3, 99_999), ("c1", 3, -5)]);
+        let (items, _) = build_train_set(&input);
+        let last = items.last().expect("two items expected");
+        assert_eq!(last.reviews[1].delta_t, MAX_DELTA_T as u32);
+        assert_eq!(last.reviews[2].delta_t, 0, "negative deltas clamp to 0");
+    }
+
+    #[test]
+    fn train_set_survives_epoch_poisoned_delta_t() {
+        // The pre-fix demo seed wrote last_review_date = 0, so the first grade
+        // persisted delta_t ~= days since the epoch. That value is under
+        // MAX_DELTA_T, so it passes the clamp — it must at least not panic and
+        // must still expand into well-formed prefix items.
+        let input = rows(&[("c1", 3, 20_400), ("c1", 3, 1), ("c1", 3, 3)]);
+        let (items, _) = build_train_set(&input);
+        assert_eq!(items.len(), 2);
+        // Zeroing the introducing review is what actually neutralizes it here.
+        assert!(items.iter().all(|i| i.reviews[0].delta_t == 0));
+    }
+
+    #[test]
+    fn elapsed_days_treats_unreviewed_as_zero() {
+        let now = 1_700_000_000;
+        assert_eq!(elapsed_days(now, 0), 0, "epoch means never reviewed");
+        assert_eq!(elapsed_days(now, -1), 0);
+        assert_eq!(elapsed_days(now, now), 0);
+        assert_eq!(elapsed_days(now, now - 86_400 * 3), 3);
+        // Clock rollback (last in the future) floors at 0.
+        assert_eq!(elapsed_days(now, now + 86_400 * 5), 0);
+        // Absurd clock skew saturates rather than overflowing.
+        assert_eq!(elapsed_days(i64::MAX, 1), MAX_DELTA_T as u32);
     }
 
     #[tokio::test]
