@@ -34,7 +34,9 @@ use tauri_plugin_sql::{Builder as SqlBuilder, DbInstances, Migration, MigrationK
 use tokio::sync::{mpsc, oneshot};
 
 use crate::asr::AsrEngine;
-use crate::db::{DB_URL, MIGRATION_1_SQL, MIGRATION_2_SQL, MIGRATION_3_SQL, MIGRATION_4_SQL};
+use crate::db::{
+    DB_URL, MIGRATION_1_SQL, MIGRATION_2_SQL, MIGRATION_3_SQL, MIGRATION_4_SQL, MIGRATION_5_SQL,
+};
 use crate::grammar::LintOutput;
 use crate::scheduler::{CardRow, DeckRow, DueCardView, ReviewRow, ReviewStats};
 use crate::tts::TtsEngine;
@@ -177,7 +179,7 @@ fn tts_busy_message<T>(e: tokio::sync::mpsc::error::TrySendError<T>) -> String {
     }
 }
 
-/// Best-effort retention refresh: reload from `settings`, update the cache,
+/// Best-effort retention refresh: reload from `app_settings`, update the cache,
 /// and return the fresh value.
 async fn refresh_retention(pool: &sqlx::SqlitePool, state: &AppState) -> f32 {
     let retention = crate::scheduler::load_retention(pool).await;
@@ -447,7 +449,7 @@ async fn optimize_parameters(
     Ok(params)
 }
 
-/// Current desired retention (reloaded from `settings`, cached in state).
+/// Current desired retention (reloaded from `app_settings`, cached in state).
 #[tauri::command]
 async fn get_retention(
     db: State<'_, DbInstances>,
@@ -464,20 +466,10 @@ async fn set_retention(
     db: State<'_, DbInstances>,
     state: State<'_, AppState>,
 ) -> Result<f32, String> {
-    if !(0.70..=0.98).contains(&retention) {
-        return Err(format!(
-            "retention {retention} out of range: expected 0.70..=0.98"
-        ));
-    }
     let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
-    sqlx::query(
-        "INSERT INTO settings(key, value) VALUES('retention', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(retention as f64)
-    .execute(&pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    crate::scheduler::save_retention(&pool, retention)
+        .await
+        .map_err(String::from)?;
     if let Ok(mut guard) = state.retention.write() {
         *guard = retention;
     }
@@ -662,6 +654,12 @@ pub fn run() {
             sql: MIGRATION_4_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 5,
+            description: "app-settings-deck-config-card-flags-repair",
+            sql: MIGRATION_5_SQL,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -670,7 +668,7 @@ pub fn run() {
             tts_tx,
             fsrs: RwLock::new(FSRS::default()),
             params: RwLock::new(Vec::new()),
-            retention: RwLock::new(0.9),
+            retention: RwLock::new(crate::scheduler::DEFAULT_RETENTION),
         })
         .plugin(
             SqlBuilder::default()

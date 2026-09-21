@@ -69,6 +69,13 @@ pub struct ReviewStats {
     pub min_trainable_cards: u64,
 }
 
+/// Desired retention used when nothing is persisted yet.
+pub const DEFAULT_RETENTION: f32 = 0.9;
+/// Lowest desired retention the scheduler will accept.
+pub const RETENTION_MIN: f32 = 0.70;
+/// Highest desired retention the scheduler will accept.
+pub const RETENTION_MAX: f32 = 0.98;
+
 /// Minimum prefix items required before `optimize_parameters` will run.
 pub const MIN_TRAIN_ITEMS: u64 = 32;
 /// Minimum cards with >= 2 reviews required before optimizing.
@@ -745,14 +752,49 @@ pub async fn load_fsrs_params(pool: &sqlx::SqlitePool) -> Result<Option<Vec<f32>
 /// when the row (or table) is missing or unreadable. Best-effort: never
 /// fails; out-of-range stored values are clamped to `0.70..=0.98`.
 pub async fn load_retention(pool: &sqlx::SqlitePool) -> f32 {
-    sqlx::query("SELECT value FROM settings WHERE key = 'retention'")
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| row.try_get::<f64, _>("value").ok())
-        .map(|v| (v as f32).clamp(0.70, 0.98))
-        .unwrap_or(0.9)
+    // `app_settings` (migration 5) is authoritative; the REAL-valued
+    // `settings` table stays readable for one release so a database that
+    // stopped between migrations 4 and 5 still reports the user's real
+    // choice instead of silently snapping back to the default.
+    for sql in [
+        "SELECT CAST(value AS REAL) FROM app_settings WHERE key = 'retention'",
+        "SELECT value FROM settings WHERE key = 'retention'",
+    ] {
+        let value = sqlx::query_scalar::<_, f64>(sql)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            // SQLite CASTs unparseable TEXT to 0.0 rather than NULL, so a
+            // junk value must fall through to the next source — clamping it
+            // would silently pin retention to the bottom of the range.
+            .filter(|v| v.is_finite() && *v > 0.0);
+        if let Some(v) = value {
+            return (v as f32).clamp(RETENTION_MIN, RETENTION_MAX);
+        }
+    }
+    DEFAULT_RETENTION
+}
+
+/// Persist desired retention to `app_settings`.
+///
+/// The legacy `settings` table is deliberately not written: from migration 5
+/// on it is read-only history, and keeping both in sync would just create two
+/// sources of truth that can disagree.
+pub async fn save_retention(pool: &sqlx::SqlitePool, retention: f32) -> Result<(), AppError> {
+    if !(RETENTION_MIN..=RETENTION_MAX).contains(&retention) {
+        return Err(AppError::BadInput(format!(
+            "retention {retention} out of range: expected {RETENTION_MIN:.2}..={RETENTION_MAX:.2}"
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO app_settings(key, value) VALUES('retention', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(retention.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -797,30 +839,11 @@ mod tests {
         assert!(!is_due(100.0, 0, 0.9, decay));
     }
 
+    /// Every DB test runs against the real migration chain (see
+    /// `db::testing`) rather than a hand-written schema, so the tests cannot
+    /// silently drift from what ships.
     async fn mem_pool() -> sqlx::SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory pool");
-        sqlx::query("PRAGMA foreign_keys=ON;")
-            .execute(&pool)
-            .await
-            .unwrap();
-        for stmt in [
-            "CREATE TABLE cards (id TEXT PRIMARY KEY NOT NULL, deck_id TEXT NOT NULL, content_front TEXT NOT NULL, content_back TEXT NOT NULL, created_at INTEGER NOT NULL)",
-            "CREATE TABLE card_memory_states (card_id TEXT PRIMARY KEY NOT NULL, stability REAL NOT NULL, difficulty REAL NOT NULL, last_review_date INTEGER NOT NULL, next_due_date INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE)",
-            "CREATE TABLE review_logs (id TEXT PRIMARY KEY NOT NULL, card_id TEXT NOT NULL, rating INTEGER NOT NULL, delta_t INTEGER NOT NULL, reviewed_at INTEGER NOT NULL, FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE)",
-            "CREATE INDEX IF NOT EXISTS idx_review_logs_card ON review_logs(card_id)",
-            "CREATE INDEX IF NOT EXISTS idx_memory_next_due ON card_memory_states(next_due_date)",
-            "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY NOT NULL, value REAL NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS fsrs_params(params_json TEXT NOT NULL, updated_at INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS decks(id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL)",
-        ] {
-            sqlx::query(stmt).execute(&pool).await.unwrap();
-        }
-        pool
+        crate::db::testing::test_pool().await
     }
 
     #[tokio::test]
@@ -1026,9 +1049,10 @@ mod tests {
         .await
         .unwrap();
         let decks = list_decks(&pool).await.unwrap();
-        assert_eq!(decks.len(), 2);
-        assert_eq!(decks[0].name, "Alpha");
-        assert_eq!(decks[1].name, "Beta");
+        // Migration 4 seeds 'default'/'Default', which every real database
+        // has, so the expected list is the two inserted decks plus it.
+        let names: Vec<&str> = decks.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Beta", "Default"]);
     }
 
     #[tokio::test]
@@ -1266,5 +1290,52 @@ mod tests {
         assert_eq!(rows[0].front.len(), 80);
         assert_eq!(rows[0].front, "x".repeat(80));
         assert_eq!(rows[0].reviewed_at, 1_700_000_001_000);
+    }
+
+    #[tokio::test]
+    async fn retention_round_trips_through_app_settings() {
+        let pool = mem_pool().await;
+        assert_eq!(load_retention(&pool).await, 0.90);
+        save_retention(&pool, 0.85).await.expect("save");
+        assert_eq!(load_retention(&pool).await, 0.85);
+        // The legacy REAL table is read-only from migration 5 on.
+        let legacy =
+            sqlx::query_scalar::<_, f64>("SELECT value FROM settings WHERE key='retention'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy, 0.90, "settings must not be written any more");
+    }
+
+    #[tokio::test]
+    async fn save_retention_rejects_out_of_range() {
+        let pool = mem_pool().await;
+        assert!(save_retention(&pool, 0.5).await.is_err());
+        assert!(save_retention(&pool, 1.5).await.is_err());
+        assert_eq!(load_retention(&pool).await, 0.90, "rejects must not write");
+    }
+
+    #[tokio::test]
+    async fn load_retention_ignores_unparseable_text() {
+        let pool = mem_pool().await;
+        // CAST('lots' AS REAL) is 0.0, not NULL. Clamping that would pin
+        // retention to 0.70; falling through to `settings` is correct.
+        sqlx::query("UPDATE app_settings SET value='lots' WHERE key='retention'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(load_retention(&pool).await, 0.90);
+    }
+
+    #[tokio::test]
+    async fn load_retention_falls_back_to_legacy_settings() {
+        let pool = crate::db::testing::migrated_pool(4).await;
+        sqlx::query("UPDATE settings SET value = 0.8 WHERE key = 'retention'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A database that stopped between migrations 4 and 5 still reports
+        // the user's choice rather than snapping back to the default.
+        assert_eq!(load_retention(&pool).await, 0.8);
     }
 }
