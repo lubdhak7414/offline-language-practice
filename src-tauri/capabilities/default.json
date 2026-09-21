@@ -2,9 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "sql:default",
-    "sql:allow-execute"
-  ]
+  "description": "Frontend needs core APIs plus event listening. It never calls the SQL plugin directly: every database access goes through the app's own Rust commands, so sql:* is deliberately not granted.",
+  "permissions": ["core:default"]
 }
