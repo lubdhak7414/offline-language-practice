@@ -24,7 +24,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npx tsc --noEmit
+      # `npm test` is tsc --noEmit + vitest run.
+      - run: npm test
       - run: npx vite build
       # Non-blocking: surface known prod-dependency vulnerabilities without failing CI.
       - run: npm audit --omit=dev

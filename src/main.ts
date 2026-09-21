@@ -1,74 +1,17 @@
-import { invoke, Channel } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-
-type LintDiagnostic = {
-  start: number;
-  end: number;
-  message: string;
-  suggestions: string[];
-  severity?: string;
-  rule_id?: string;
-};
-
-// New backend shape is `{diags, truncated}`; older backends return a bare array.
-type LintResult = LintDiagnostic[] | { diags: LintDiagnostic[]; truncated: boolean };
-
-type Deck = {
-  id: string;
-  name: string;
-};
-
-type CardItem = {
-  id: string;
-  deck_id: string;
-  front: string;
-  back: string;
-};
-
-type ReviewStats = {
-  distinct_cards: number;
-  total_reviews: number;
-  /** Cards with >= 2 reviews; only these can contribute training data. */
-  trainable_cards: number;
-  /** Prefix items the optimizer will actually train on. */
-  train_items: number;
-  min_train_items: number;
-  min_trainable_cards: number;
-};
-
-type ModelStatus = {
-  asr_model: boolean;
-  asr_vocab: boolean;
-  tts_voice: boolean;
-};
-
-type VoiceInfo = {
-  id: string;
-  label: string;
-};
-
-type DueCard = {
-  id: string;
-  front: string;
-  back: string;
-  stability: number;
-  difficulty: number;
-  days_elapsed: number;
-  intervals: Record<string, number>;
-};
-
-type RecentReview = {
-  id: string;
-  card_id: string;
-  rating: number;
-  delta_t: number;
-  reviewed_at: number;
-  front?: string;
-};
+import { ipc } from "./ipc/commands";
+import { events } from "./ipc/events";
+import type { DueCard, LintDiagnostic, Rating } from "./ipc/types";
+import { concatChunks, resampleTo16k, TARGET_SAMPLE_RATE } from "./lib/audio/resample";
+import { friendlyAsrError } from "./lib/errors";
+import { reviewKeyAction } from "./lib/keyboard";
+import { parseRating } from "./lib/rating";
+import { byteSlice } from "./lib/text/byteSlice";
 
 const TRANSCRIPT_PLACEHOLDER = "Press record, speak, then stop.";
 const TTS_MAX_CHARS = 1440; // == backend AUDIOSTREAM_MAX_CHARS (8 chunks × 180)
 const SYSTEM_TOAST_MS = 4000;
+/** Cards fetched per review session. */
+const REVIEW_QUEUE_SIZE = 20;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -79,6 +22,10 @@ let workletNode: AudioWorkletNode | null = null;
 let audioSink: GainNode | null = null;
 let pcmChunks: Float32Array[] = [];
 let currentCard: DueCard | null = null;
+// The whole due queue, not one card at a time: the backend can compute a
+// session in one round trip, and "3 of 12" is only possible if we hold it.
+let queue: DueCard[] = [];
+let sessionTotal = 0;
 let revealed = false;
 let grading = false;
 let transcribing = false;
@@ -105,45 +52,10 @@ function setStatus(id: string, msg: string, isError = false) {
   el.classList.toggle("error", isError);
 }
 
-// ---- Grammar byte offsets: backend sends UTF-8 byte indices, not JS char indices ----
-function byteSlice(text: string, start: number, end: number): string {
-  try {
-    const bytes = new TextEncoder().encode(text);
-    const s = Math.max(0, Math.min(start, bytes.length));
-    const e = Math.max(s, Math.min(end, bytes.length));
-    return new TextDecoder("utf-8", { fatal: false }).decode(bytes.slice(s, e));
-  } catch {
-    return text.slice(start, end);
-  }
-}
-
-function friendlyAsrError(e: unknown): string {
-  const s = String(e);
-  if (s.includes("ASR_SILENCE:")) return "no speech detected — move closer to the mic and try again";
-  if (s.includes("ASR_SHAPE:")) return "audio shape error — please re-record";
-  if (s.includes("ASR_NO_VOCAB:")) return "ASR model vocabulary missing — reinstall the voice model";
-  if (s.includes("ASR_NO_MODEL:")) return "ASR model not installed — run scripts/download-models.sh first";
-  return `ASR unavailable: ${s}`;
-}
-
 // ---- Recording robustness: accept native rate, resample to 16 kHz ----
 async function ensure16k(): Promise<AudioContext> {
   // Do NOT hard-throw when the device runs at 44.1/48 kHz; resampling happens later.
   return new AudioContext();
-}
-
-async function resampleTo16k(mono: Float32Array, fromRate: number): Promise<Float32Array> {
-  if (fromRate === 16000 || mono.length === 0) return mono;
-  const frames = Math.max(1, Math.round((mono.length / fromRate) * 16000));
-  const offline = new OfflineAudioContext(1, frames, 16000);
-  const buf = offline.createBuffer(1, mono.length, fromRate);
-  buf.getChannelData(0).set(mono);
-  const src = offline.createBufferSource();
-  src.buffer = buf;
-  src.connect(offline.destination);
-  src.start(0);
-  const rendered = await offline.startRendering();
-  return rendered.getChannelData(0).slice();
 }
 
 function teardownAudio() {
@@ -268,10 +180,7 @@ async function stopAndTranscribe() {
     await audioCtx?.close().catch(() => {});
     mediaStream?.getTracks().forEach((t) => t.stop());
 
-    const total = pcmChunks.reduce((n, c) => n + c.length, 0);
-    const mono = new Float32Array(total);
-    let off = 0;
-    for (const c of pcmChunks) mono.set(c, (off += c.length) - c.length);
+    const mono = concatChunks(pcmChunks);
 
     let pcm16 = mono;
     try {
@@ -280,22 +189,18 @@ async function stopAndTranscribe() {
       setStatus("asr-status", `resample failed: ${String(e)}`, true);
       return;
     }
-    const usedRate = 16000;
+    const usedRate = TARGET_SAMPLE_RATE;
 
     setStatus("asr-status", `sending ${(pcm16.length / usedRate).toFixed(1)}s PCM via Channel…`);
 
-    // High-throughput binary path: Channel<ArrayBuffer>, NOT invoke JSON.
-    const onChunk = new Channel<string>();
-    onChunk.onmessage = (partial) => {
-      $("transcript").textContent = partial;
-    };
     try {
-      const text = await invoke<string>("transcribe_pcm_channel", {
-        channel: onChunk,
-        // Tauri Channel transports Uint8Array efficiently; send raw bytes view.
-        pcmBytes: new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength),
-        sampleRate: usedRate,
-      });
+      const text = await ipc().transcribePcm(
+        new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength),
+        usedRate,
+        (partial) => {
+          $("transcript").textContent = partial;
+        },
+      );
       $("transcript").textContent = text;
       ($("tts-input") as HTMLInputElement).value = text;
       hasTranscript = text.trim().length > 0;
@@ -323,11 +228,7 @@ async function lintTranscript() {
     // Omit `dialect` when it is the default ("american") — the backend
     // treats a missing dialect as the default.
     const dialect = ($("dialect-select") as HTMLSelectElement).value;
-    const args =
-      dialect && dialect !== "american" ? { text, dialect } : { text };
-    const res = await invoke<LintResult>("lint_text", args);
-    const diags = Array.isArray(res) ? res : res.diags;
-    const truncated = !Array.isArray(res) && res.truncated === true;
+    const { diags, truncated } = await ipc().lintText(text, dialect);
     setStatus(
       "lint-status",
       `${diags.length} issue(s)${truncated ? " (truncated)" : ""}`
@@ -384,11 +285,11 @@ async function synthesize() {
   }
   const audio = $("tts-audio") as HTMLAudioElement;
   // Rust sends one ArrayBuffer per sentence -> accumulate ALL then Blob.
-  const onAudio = new Channel<ArrayBuffer>();
   const chunks: BlobPart[] = [];
-  onAudio.onmessage = (buf) => chunks.push(new Uint8Array(buf));
   try {
-    const sampleRate = await invoke<number>("synthesize_speech", { text, channel: onAudio });
+    const sampleRate = await ipc().synthesizeSpeech(text, (buf) =>
+      chunks.push(new Uint8Array(buf)),
+    );
     // Piper emits WAV; keep WAV MIME and surface the backend-reported rate.
     const blob = new Blob(chunks, { type: "audio/wav" });
     const prevUrl = lastTtsUrl;
@@ -449,6 +350,12 @@ function renderMemoryState(c: DueCard) {
     `memory (S/D/R) — stability ${c.stability.toFixed(2)} / difficulty ${c.difficulty.toFixed(2)} / ${c.days_elapsed}d elapsed`;
 }
 
+function reviewProgress(): string {
+  if (sessionTotal === 0) return "0 due";
+  const position = sessionTotal - queue.length;
+  return `${position} of ${sessionTotal}`;
+}
+
 function showFront(c: DueCard) {
   currentCard = c;
   revealed = false;
@@ -472,6 +379,7 @@ function reveal() {
 
 function clearCardView(msg: string) {
   currentCard = null;
+  queue = [];
   revealed = false;
   $("review-card").textContent = msg;
   ($("btn-reveal") as HTMLButtonElement).hidden = true;
@@ -486,25 +394,28 @@ async function loadDue() {
     // Deck filter: omit `deckId` (not empty string) when "All decks" is selected.
     const deckSel = document.getElementById("deck-select") as HTMLSelectElement | null;
     const deckId = deckSel?.value || undefined;
-    const cards = await invoke<DueCard[]>(
-      "due_cards",
-      deckId ? { limit: 1, deckId } : { limit: 1 }
+    const cards = await ipc().dueCards(
+      deckId ? { limit: REVIEW_QUEUE_SIZE, deckId } : { limit: REVIEW_QUEUE_SIZE },
     );
     if (my !== cardReq) return;
-    if (cards.length === 0) {
+    queue = [...cards];
+    sessionTotal = cards.length;
+    const first = queue.shift();
+    if (!first) {
       clearCardView("Nothing due. Seed demo deck or add cards.");
+      sessionTotal = 0;
       setStatus("review-status", "0 due");
       return;
     }
-    showFront(cards[0]);
-    setStatus("review-status", `${cards.length} due`);
+    showFront(first);
+    setStatus("review-status", reviewProgress());
   } catch (e) {
     if (my !== cardReq) return;
     setStatus("review-status", `review failed: ${String(e)}`, true);
   }
 }
 
-async function grade(g: number) {
+async function grade(g: Rating) {
   if (!currentCard || !revealed) return;
   if (grading) return;
   grading = true;
@@ -515,14 +426,19 @@ async function grade(g: number) {
     b.disabled = true;
   });
   try {
-    const next = await invoke<DueCard | null>("grade_card", { cardId: gradedId, rating: g });
+    const next = await ipc().gradeCard(gradedId, g);
     if (my !== cardReq) return;
     if (currentCard?.id !== gradedId) return;
-    if (next) {
-      showFront(next);
-      setStatus("review-status", "graded — next card");
+    // Prefer the local queue so the session length stays stable; the
+    // backend's suggestion is the fallback for a queue that ran dry.
+    const following = queue.shift() ?? next ?? null;
+    if (following) {
+      if (following === next) sessionTotal += 1;
+      showFront(following);
+      setStatus("review-status", reviewProgress());
     } else {
-      clearCardView("Done — nothing else due.");
+      clearCardView(`Done — ${sessionTotal} card(s) reviewed.`);
+      sessionTotal = 0;
       setStatus("review-status", "done");
     }
     void refreshOptimizeGate();
@@ -539,7 +455,7 @@ async function grade(g: number) {
 
 async function seed() {
   try {
-    const n = await invoke<number>("seed_demo_deck");
+    const n = await ipc().seedDemoDeck();
     setStatus("review-status", n === 0 ? "already seeded" : `seeded ${n}`);
     await loadDecks();
     await loadDeckCards();
@@ -553,7 +469,7 @@ async function seed() {
 async function refreshOptimizeGate() {
   const btn = $("btn-optimize") as HTMLButtonElement;
   try {
-    const stats = await invoke<ReviewStats>("review_stats", {});
+    const stats = await ipc().reviewStats();
     // Gate on the same two numbers the backend checks. Each card with n
     // reviews contributes n-1 training items, so reviews spread thinly
     // across many cards train less than the raw review count suggests.
@@ -590,7 +506,7 @@ async function loadModelStatus() {
   // failure into `el` from the catch and then unconditionally overwrote it.
   let line: string;
   try {
-    const s = await invoke<ModelStatus>("model_status", {});
+    const s = await ipc().modelStatus();
     const asr = s.asr_model ? "available" : "missing";
     const vocab = s.asr_vocab ? "available" : "missing";
     const tts = s.tts_voice ? "available" : "missing";
@@ -598,22 +514,48 @@ async function loadModelStatus() {
     // surface the voice count in the model-status line instead.
     let voices = "unknown";
     try {
-      const v = await invoke<VoiceInfo[]>("list_voices", {});
+      const v = await ipc().listVoices();
       voices = String(v.length);
     } catch {
       voices = "unknown";
     }
     line = `Models — ASR: ${asr} · vocab: ${vocab} · TTS: ${tts} · voices: ${voices}`;
+    applyModelGate(s.asr_model && s.asr_vocab, s.tts_voice);
   } catch (e) {
     line = `Models: status unavailable (${String(e)})`;
+    // Status unknown: leave the controls enabled rather than locking someone
+    // out of a working install because one probe failed.
+    applyModelGate(true, true);
   }
   el.textContent = line;
+}
+
+/**
+ * Enable or disable the controls that need a model on disk.
+ *
+ * Without this, recording for sixty seconds and *then* being told the model
+ * is missing was a perfectly reachable path.
+ */
+function applyModelGate(asrReady: boolean, ttsReady: boolean) {
+  const record = $("btn-record") as HTMLButtonElement;
+  record.disabled = !asrReady;
+  record.title = asrReady ? "" : "Speech model not installed yet";
+  const speak = document.getElementById("btn-speak") as HTMLButtonElement | null;
+  if (speak) {
+    speak.disabled = !ttsReady;
+    speak.title = ttsReady ? "" : "No voice installed yet";
+  }
+  // Only write on the blocking case: `asr-status` also carries live
+  // transcription progress, and clearing it here would stomp on that.
+  if (!asrReady) {
+    setStatus("asr-status", "Speech model not installed — install it, then reload.", true);
+  }
 }
 
 async function optimize() {
   setStatus("optimize-status", "optimizing…");
   try {
-    const params = await invoke<number[]>("optimize_parameters");
+    const params = await ipc().optimizeParameters();
     setStatus("optimize-status", `optimized: [${params.map((p) => p.toFixed(3)).join(", ")}]`);
   } catch (e) {
     setStatus("optimize-status", `optimize failed: ${String(e)}`, true);
@@ -622,7 +564,7 @@ async function optimize() {
 
 async function loadRetention() {
   try {
-    const v = await invoke<number>("get_retention");
+    const v = await ipc().getRetention();
     ($("retention") as HTMLInputElement).value = String(v);
   } catch (e) {
     setStatus("retention-status", `retention load failed: ${String(e)}`, true);
@@ -638,7 +580,7 @@ async function saveRetention() {
     return;
   }
   try {
-    const updated = await invoke<number>("set_retention", { retention });
+    const updated = await ipc().setRetention(retention);
     input.value = String(updated);
     setStatus("retention-status", `retention ${updated}`);
   } catch (e) {
@@ -653,11 +595,16 @@ async function addCard() {
     setStatus("review-status", "front/back required", true);
     return;
   }
-  // Deck comes from the deck <select>; fall back to "default" when
-  // "All decks" is selected (add_card needs a concrete deck).
-  const deckId = ($("deck-select") as HTMLSelectElement).value || "default";
+  // "All decks" is not a destination. Silently filing the card into
+  // "default" meant a card could vanish from the deck the user was looking
+  // at, so say so instead.
+  const deckId = ($("deck-select") as HTMLSelectElement).value;
+  if (!deckId) {
+    setStatus("review-status", "choose a deck first — \u201cAll decks\u201d is not a destination", true);
+    return;
+  }
   try {
-    const id = await invoke<string>("add_card", { deckId, front, back });
+    const id = await ipc().addCard(deckId, front, back);
     ($("card-front") as HTMLInputElement).value = "";
     ($("card-back") as HTMLInputElement).value = "";
     setStatus("review-status", `added ${id}`);
@@ -671,7 +618,7 @@ async function addCard() {
 
 async function loadDecks() {
   try {
-    const decks = await invoke<Deck[]>("list_decks", {});
+    const decks = await ipc().listDecks();
     const sel = $("deck-select") as HTMLSelectElement;
     const prev = sel.value;
     sel.innerHTML = "";
@@ -698,10 +645,7 @@ async function loadDeckCards() {
   const box = $("deck-cards");
   try {
     const deckId = ($("deck-select") as HTMLSelectElement).value || undefined;
-    const cards = await invoke<CardItem[]>(
-      "list_cards",
-      deckId ? { deckId } : {}
-    );
+    const cards = await ipc().listCards(deckId);
     box.innerHTML = "";
     if (cards.length === 0) {
       box.textContent = "No cards in this deck yet.";
@@ -735,7 +679,7 @@ async function deleteCardById(cardId: string, front?: string) {
     return;
   }
   try {
-    await invoke<void>("delete_card", { cardId });
+    await ipc().deleteCard(cardId);
     setStatus("review-status", "card deleted");
     await loadDecks();
     await loadDeckCards();
@@ -755,7 +699,7 @@ async function deleteCurrentCard() {
 
 async function loadHistory() {
   try {
-    const rows = await invoke<RecentReview[]>("recent_reviews", { limit: 20 });
+    const rows = await ipc().recentReviews(20);
     const box = $("history-output");
     box.innerHTML = "";
     if (rows.length === 0) {
@@ -792,7 +736,7 @@ async function loadHistory() {
 
 async function loadEpReport() {
   try {
-    const report = await invoke<string>("ep_report");
+    const report = await ipc().epReport();
     $("ep-output").textContent = report;
   } catch (e) {
     $("ep-output").textContent = `providers unavailable: ${String(e)}`;
@@ -898,47 +842,35 @@ function bind() {
   });
   $("btn-reveal").addEventListener("click", () => reveal());
   document.querySelectorAll<HTMLButtonElement>("#grade-row button").forEach((b) =>
-    b.addEventListener("click", () => void grade(Number(b.dataset.grade)))
+    b.addEventListener("click", () => {
+      const rating = parseRating(b.dataset.grade);
+      if (rating) void grade(rating);
+    }),
   );
   // Keyboard: 1–4 grades the revealed card; Space/Enter reveals a hidden one.
-  // Never hijack typing or native button activation.
+  // The rule itself lives in `lib/keyboard` so it can be tested directly;
+  // this only reads the DOM and dispatches.
   document.addEventListener("keydown", (e) => {
     const t = e.target as HTMLElement | null;
-    const tag = t?.tagName ?? "";
-    // Never hijack typing, IME composition, or native media controls.
-    // BUTTON is deliberately NOT excluded: revealing focuses a grade button,
-    // so excluding it disabled 1-4 in exactly the state they exist for.
-    if (
-      tag === "INPUT" ||
-      tag === "SELECT" ||
-      tag === "TEXTAREA" ||
-      tag === "AUDIO" ||
-      t?.isContentEditable ||
-      e.isComposing
-    ) {
-      return;
-    }
-    const gradeRowHidden = ($("grade-row") as HTMLDivElement).hidden;
-    if (e.key >= "1" && e.key <= "4" && revealed && currentCard && !gradeRowHidden) {
-      e.preventDefault();
-      void grade(Number(e.key));
-    } else if (
-      (e.key === " " || e.key === "Enter") &&
-      currentCard &&
-      !revealed &&
-      !($("btn-reveal") as HTMLButtonElement).hidden &&
-      // A focused button already activates on Space/Enter; don't double-fire.
-      tag !== "BUTTON"
-    ) {
-      e.preventDefault();
-      reveal();
-    }
+    const action = reviewKeyAction(e.key, {
+      targetTag: t?.tagName ?? "",
+      isContentEditable: t?.isContentEditable === true,
+      isComposing: e.isComposing,
+      hasCard: currentCard !== null,
+      revealed,
+      gradeRowHidden: ($("grade-row") as HTMLDivElement).hidden,
+      revealHidden: ($("btn-reveal") as HTMLButtonElement).hidden,
+    });
+    if (!action) return;
+    e.preventDefault();
+    if (action.kind === "grade") void grade(action.rating);
+    else reveal();
   });
   // Backend → frontend async status broadcasts (Tauri events, not polling).
   // These always go to the toast, never to #asr-status, so they cannot
   // clobber in-progress transcribe state.
-  void listen<string>("system-status", (e) => {
-    const payload = e.payload ?? "";
+  void events().on("system-status", (raw) => {
+    const payload = raw ?? "";
     const toast = document.getElementById("system-toast");
     if (!payload || !toast) return;
     toast.textContent = payload;
