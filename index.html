@@ -72,13 +72,24 @@
         <div id="review-card" class="output" aria-live="polite">No card loaded.</div>
         <button id="btn-reveal" hidden>Show answer</button>
         <div class="row" id="grade-row" hidden>
-          <button data-grade="1" aria-label="Grade Again (1)">Again</button>
-          <button data-grade="2" aria-label="Grade Hard (2)">Hard</button>
-          <button data-grade="3" aria-label="Grade Good (3)">Good</button>
-          <button data-grade="4" aria-label="Grade Easy (4)">Easy</button>
+          <button data-grade="1" aria-label="Grade Again (1)">
+            <span class="grade-label">Again</span>
+            <span class="grade-interval" id="interval-1"></span>
+          </button>
+          <button data-grade="2" aria-label="Grade Hard (2)">
+            <span class="grade-label">Hard</span>
+            <span class="grade-interval" id="interval-2"></span>
+          </button>
+          <button data-grade="3" aria-label="Grade Good (3)">
+            <span class="grade-label">Good</span>
+            <span class="grade-interval" id="interval-3"></span>
+          </button>
+          <button data-grade="4" aria-label="Grade Easy (4)">
+            <span class="grade-label">Easy</span>
+            <span class="grade-interval" id="interval-4"></span>
+          </button>
         </div>
         <div id="memory-state" class="muted" aria-live="polite"></div>
-        <div id="intervals" class="muted"></div>
         <div class="row">
           <label for="retention">Retention</label>
           <input id="retention" type="number" min="0.7" max="0.98" step="0.01" />

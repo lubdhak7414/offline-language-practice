@@ -1,0 +1,151 @@
+/**
+ * Design tokens.
+ *
+ * Two rules this file exists to enforce:
+ *
+ * 1. Muted text is a *colour*, not `opacity: .7`. Opacity multiplies against
+ *    whatever is behind it, so `.muted.error` — an error message — came out
+ *    at roughly 3:1 against the page, below the 4.5:1 minimum. A token can be
+ *    checked; an opacity cannot.
+ * 2. Nothing is distinguished by hue alone. The grade buttons carry a glyph
+ *    and a key badge as well as a colour, so they still read for the ~8% of
+ *    men with a red-green colour vision deficiency.
+ */
+
+:root {
+  /* --- surfaces --- */
+  --bg: #fbfbfd;
+  --bg-raised: #ffffff;
+  --bg-sunken: #f1f2f6;
+  --border: #d5d7e0;
+  --border-strong: #b6b9c8;
+
+  /* --- text --- */
+  --fg: #16181d;
+  /* A real colour: 4.7:1 on --bg, so it passes even on error text. */
+  --fg-muted: #5b5f70;
+  --fg-on-accent: #ffffff;
+
+  /* --- intent --- */
+  --accent: #2d5bd7;
+  --accent-hover: #2449ad;
+  --danger: #a3241c;
+  --warning: #8a5000;
+  --success: #1f6b3d;
+
+  /* --- grade scale: four distinct hues, never the only signal --- */
+  --grade-again: #a3241c;
+  --grade-hard: #8a5000;
+  --grade-good: #1f6b3d;
+  --grade-easy: #2d5bd7;
+
+  /* --- type --- */
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.75rem;
+  --leading: 1.5;
+
+  /* --- space (4px base) --- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  /* --- radius + elevation --- */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgb(16 18 27 / 0.06);
+  --shadow-md: 0 4px 16px rgb(16 18 27 / 0.1);
+
+  /* --- motion --- */
+  --duration: 140ms;
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+
+  color-scheme: light dark;
+}
+
+/*
+ * Dark mode follows the system unless the page is explicitly light, and can
+ * also be forced with [data-theme="dark"] once Settings can set it.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14161c;
+    --bg-raised: #1c1f27;
+    --bg-sunken: #0f1116;
+    --border: #2e323d;
+    --border-strong: #454a59;
+
+    --fg: #eceef4;
+    /* 5.4:1 on --bg. */
+    --fg-muted: #a1a7b8;
+
+    --accent: #7ea2ff;
+    --accent-hover: #9cb7ff;
+    --danger: #ff9a92;
+    --warning: #e0a548;
+    --success: #6fd396;
+
+    --grade-again: #ff9a92;
+    --grade-hard: #e0a548;
+    --grade-good: #6fd396;
+    --grade-easy: #7ea2ff;
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-md: 0 4px 16px rgb(0 0 0 / 0.5);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #14161c;
+  --bg-raised: #1c1f27;
+  --bg-sunken: #0f1116;
+  --border: #2e323d;
+  --border-strong: #454a59;
+
+  --fg: #eceef4;
+  --fg-muted: #a1a7b8;
+
+  --accent: #7ea2ff;
+  --accent-hover: #9cb7ff;
+  --danger: #ff9a92;
+  --warning: #e0a548;
+  --success: #6fd396;
+
+  --grade-again: #ff9a92;
+  --grade-hard: #e0a548;
+  --grade-good: #6fd396;
+  --grade-easy: #7ea2ff;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.5);
+}
+
+/*
+ * One focus style for the whole app. `:focus-visible` rather than `:focus`
+ * so a mouse click does not leave a ring behind, and an outline rather than
+ * a box-shadow so it survives Windows high-contrast mode.
+ */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

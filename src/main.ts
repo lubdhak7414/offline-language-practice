@@ -3,6 +3,7 @@ import { events } from "./ipc/events";
 import type { DueCard, LintDiagnostic, Rating } from "./ipc/types";
 import { concatChunks, resampleTo16k, TARGET_SAMPLE_RATE } from "./lib/audio/resample";
 import { friendlyAsrError } from "./lib/errors";
+import { formatInterval } from "./lib/interval";
 import { reviewKeyAction } from "./lib/keyboard";
 import { parseRating } from "./lib/rating";
 import { byteSlice } from "./lib/text/byteSlice";
@@ -340,9 +341,25 @@ async function synthesize() {
 }
 
 // ---- FSRS review (2-step: front -> reveal -> grade) ----
+/**
+ * Write each grade's predicted interval onto its own button.
+ *
+ * Previously this was one dense line below the row, which meant reading
+ * "Again 0.01 / Hard 1.2 / Good 4.6 / Easy 9.8" and mapping it back to the
+ * buttons — every single grade.
+ */
 function renderIntervals(c: DueCard) {
-  $("intervals").textContent =
-    `predicted intervals (days) — Again ${c.intervals["1"] ?? "—"} / Hard ${c.intervals["2"] ?? "—"} / Good ${c.intervals["3"] ?? "—"} / Easy ${c.intervals["4"] ?? "—"}`;
+  for (const g of ["1", "2", "3", "4"] as const) {
+    const el = document.getElementById(`interval-${g}`);
+    if (el) el.textContent = formatInterval(c.intervals[g]);
+  }
+}
+
+function clearIntervals() {
+  for (const g of ["1", "2", "3", "4"] as const) {
+    const el = document.getElementById(`interval-${g}`);
+    if (el) el.textContent = "";
+  }
 }
 
 function renderMemoryState(c: DueCard) {
@@ -385,7 +402,7 @@ function clearCardView(msg: string) {
   ($("btn-reveal") as HTMLButtonElement).hidden = true;
   ($("grade-row") as HTMLDivElement).hidden = true;
   $("memory-state").textContent = "";
-  $("intervals").textContent = "";
+  clearIntervals();
 }
 
 async function loadDue() {
