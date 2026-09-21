@@ -228,6 +228,9 @@ struct VoiceInfo {
 /// worker. A full worker queue reports "engine busy, try again".
 /// Missing-model errors propagate (the frontend surfaces them in
 /// `asr-status`).
+/// Longest utterance the ASR command accepts, in seconds.
+const ASR_MAX_SECONDS: usize = 120;
+
 #[tauri::command]
 async fn transcribe_pcm_channel(
     channel: Channel<String>,
@@ -236,15 +239,16 @@ async fn transcribe_pcm_channel(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    if sample_rate != 16_000 {
+    let rate = crate::asr::ASR_SAMPLE_RATE;
+    if sample_rate != rate {
         return Err(format!("expected 16kHz mono, got {sample_rate}Hz"));
     }
     let mut pcm = crate::asr::AsrEngine::bytes_to_f32_mono(&pcm_bytes);
-    if pcm.len() > 16_000 * 120 {
+    let max_samples = rate as usize * ASR_MAX_SECONDS;
+    if pcm.len() > max_samples {
         return Err(format!(
-            "audio too long ({} samples); max is {} samples (120s at 16kHz)",
+            "audio too long ({} samples); max is {max_samples} samples ({ASR_MAX_SECONDS}s at 16kHz)",
             pcm.len(),
-            16_000 * 120
         ));
     }
     for x in pcm.iter_mut() {

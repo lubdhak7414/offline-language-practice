@@ -1,17 +1,25 @@
 //! On-device ASR via wav2vec2 ONNX (ort 2.0.0-rc.12).
 //!
-//! Greedy CTC decode (argmax over vocab, collapse blank id 0 + repeats).
+//! Greedy CTC decode (argmax over vocab, collapse blank + repeats).
 //! `vocab.json` next to the model is required; silence, bad shapes and
 //! missing vocab surface as `Err` with `ASR_*` prefixes (never debug text).
+//!
+//! [`AsrEngine::transcribe_pcm_detailed`] additionally returns the
+//! log-softmax frame posteriors, which pronunciation scoring needs; plain
+//! [`AsrEngine::transcribe_pcm`] never allocates them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::{session::Session, value::Tensor};
 
 use crate::inference::ordered_providers;
+
+/// Sample rate the exported wav2vec2 graph expects. Audio is resampled to
+/// this in the frontend and re-checked at the command boundary.
+pub const ASR_SAMPLE_RATE: u32 = 16_000;
 
 /// Candidate model locations, checked in order (relative to process CWD),
 /// then the startup-registered extra roots (`$RESOURCE/models/`, …).
@@ -60,11 +68,112 @@ pub fn vocab_available() -> bool {
     vocab_candidates().iter().any(|p| p.is_file())
 }
 
+/// A parsed `vocab.json`, both directions plus the resolved blank id.
+#[derive(Debug, Clone)]
+pub struct Vocab {
+    /// Token → id. Decoding only needs the reverse map; this direction is
+    /// what pronunciation scoring uses to turn a target phrase into labels.
+    // Consumed by pronunciation scoring in the next phase.
+    #[allow(dead_code)]
+    pub token_to_id: HashMap<String, i64>,
+    pub id_to_token: HashMap<i64, String>,
+    /// CTC blank. wav2vec2 CTC checkpoints use `<pad>` for this; it is
+    /// conventionally id 0 but that is a convention, not a guarantee, so it
+    /// is read from the file and only falls back to 0 when absent.
+    pub blank: i64,
+}
+
+impl Vocab {
+    /// Parse a `vocab.json` body (a flat `{token: id}` map).
+    ///
+    /// Pure, so the id/blank handling is testable without a model on disk.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let token_to_id: HashMap<String, i64> =
+            serde_json::from_str(text).map_err(|e| format!("invalid vocab.json: {e}"))?;
+        if token_to_id.is_empty() {
+            return Err("vocab.json is empty".to_string());
+        }
+        let mut id_to_token: HashMap<i64, String> = HashMap::new();
+        for (tok, id) in token_to_id.iter() {
+            id_to_token.entry(*id).or_insert_with(|| tok.clone());
+        }
+        let blank = token_to_id.get("<pad>").copied().unwrap_or(0);
+        Ok(Self {
+            token_to_id,
+            id_to_token,
+            blank,
+        })
+    }
+}
+
+/// Parsed vocab, cached for the process.
+///
+/// Only successes are cached: a user can install models while the app is
+/// running, and caching the "not found" answer would make that require a
+/// restart.
+static VOCAB: OnceLock<Arc<Vocab>> = OnceLock::new();
+
+/// Resolve and parse `vocab.json`, reusing the cached copy when present.
+///
+/// Before this cache the file was re-read and re-parsed from disk on every
+/// single transcription.
+pub fn load_vocab() -> ort::Result<Arc<Vocab>> {
+    if let Some(v) = VOCAB.get() {
+        return Ok(v.clone());
+    }
+    let path = vocab_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            ort::Error::new(
+                "ASR_NO_VOCAB: vocab.json not found (no candidate resolves)".to_string(),
+            )
+        })?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        ort::Error::new(format!("ASR_NO_VOCAB: cannot read {}: {e}", path.display()))
+    })?;
+    let parsed =
+        Arc::new(Vocab::parse(&text).map_err(|e| ort::Error::new(format!("ASR_NO_VOCAB: {e}")))?);
+    // Two threads may parse concurrently on first use; whichever `set` lands
+    // first wins and both callers go on to use that same instance.
+    let _ = VOCAB.set(parsed.clone());
+    Ok(VOCAB.get().cloned().unwrap_or(parsed))
+}
+
+/// Rewrite row-major `[frames, vocab]` logits into log-softmax in place.
+///
+/// Row-wise `x - max - ln(sum(exp(x - max)))`. The max subtraction is what
+/// keeps `exp` from overflowing; the sum is accumulated in `f64` because a
+/// long utterance sums thousands of terms. Rows that run past the end of the
+/// slice are left untouched rather than panicking.
+// Consumed by pronunciation scoring in the next phase.
+#[allow(dead_code)]
+pub fn log_softmax_rows(logits: &mut [f32], frames: usize, vocab: usize) {
+    if frames == 0 || vocab == 0 {
+        return;
+    }
+    for t in 0..frames {
+        let base = t.saturating_mul(vocab);
+        let Some(row) = logits.get_mut(base..base + vocab) else {
+            break;
+        };
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if !max.is_finite() {
+            continue;
+        }
+        let sum: f64 = row.iter().map(|&x| ((x - max) as f64).exp()).sum();
+        let log_sum = (max as f64) + sum.ln();
+        for x in row.iter_mut() {
+            *x = (*x as f64 - log_sum) as f32;
+        }
+    }
+}
+
 /// Greedy CTC collapse over row-major `[frames, vocab]` logits.
 ///
-/// Argmax per frame, skip blank id 0, collapse repeats. Pure (no IO).
+/// Argmax per frame, skip `blank`, collapse repeats. Pure (no IO).
 /// Short slices terminate early instead of panicking.
-pub fn ctc_collapse_argmax(logits: &[f32], frames: usize, vocab: usize) -> Vec<i64> {
+pub fn ctc_collapse_argmax(logits: &[f32], frames: usize, vocab: usize, blank: i64) -> Vec<i64> {
     if frames == 0 || vocab == 0 {
         return Vec::new();
     }
@@ -88,7 +197,7 @@ pub fn ctc_collapse_argmax(logits: &[f32], frames: usize, vocab: usize) -> Vec<i
                 None => break,
             }
         }
-        if best_id != 0 && Some(best_id) != prev {
+        if best_id != blank && Some(best_id) != prev {
             collapsed.push(best_id);
         }
         prev = Some(best_id);
@@ -138,6 +247,23 @@ pub fn is_silence(pcm: &[f32]) -> bool {
     pcm.iter().fold(0.0f32, |a, &b| a.max(b.abs())) < 1e-4
 }
 
+/// A transcription plus the frame posteriors it was decoded from.
+///
+/// `logp` is row-major `[frames, vocab]` log-softmax, i.e. every value is
+/// `<= 0` and each row sums (in probability space) to 1.
+#[derive(Debug, Clone)]
+// Consumed by pronunciation scoring in the next phase.
+#[allow(dead_code)]
+pub struct AsrOutput {
+    pub text: String,
+    pub logp: Vec<f32>,
+    pub frames: usize,
+    pub vocab: usize,
+    /// Milliseconds of audio per output frame, derived from this run.
+    pub frame_stride_ms: f32,
+    pub audio_ms: f32,
+}
+
 /// Wav2vec2 session wrapper. `Session::run` takes `&mut self`, hence the Mutex.
 pub struct AsrEngine {
     session: Mutex<Session>,
@@ -179,6 +305,63 @@ impl AsrEngine {
     /// logits shapes and missing vocab surface as `Err` with `ASR_*`
     /// prefixes (never debug text as transcript).
     pub fn transcribe_pcm(&self, pcm_f32: &[f32]) -> ort::Result<String> {
+        // Vocab is resolved before inference: without it the transcript
+        // cannot be rendered, so running the graph first would just burn
+        // seconds on audio whose result is unusable.
+        let vocab = load_vocab()?;
+        self.with_logits(pcm_f32, |data, frames, n_vocab| {
+            let collapsed = ctc_collapse_argmax(data, frames, n_vocab, vocab.blank);
+            Ok(decode_collapsed_ids(&collapsed, &vocab.id_to_token))
+        })
+    }
+
+    /// Transcribe and also return the frame posteriors.
+    ///
+    /// Same decode as [`Self::transcribe_pcm`], but the logits are kept and
+    /// converted to log-softmax so pronunciation scoring can run a CTC
+    /// forward pass over them. At the 120 s command cap this is roughly
+    /// 6000 frames x 32 vocab x 4 B, under 1 MB, and it stays inside the ASR
+    /// worker — it is never sent across a channel.
+    // Consumed by pronunciation scoring in the next phase.
+    #[allow(dead_code)]
+    pub fn transcribe_pcm_detailed(&self, pcm_f32: &[f32]) -> ort::Result<AsrOutput> {
+        let vocab = load_vocab()?;
+        let audio_samples = pcm_f32.len();
+        self.with_logits(pcm_f32, |data, frames, n_vocab| {
+            let len = frames.saturating_mul(n_vocab).min(data.len());
+            let mut logp = data[..len].to_vec();
+            log_softmax_rows(&mut logp, frames, n_vocab);
+            let collapsed = ctc_collapse_argmax(&logp, frames, n_vocab, vocab.blank);
+            let audio_ms = 1000.0 * audio_samples as f32 / ASR_SAMPLE_RATE as f32;
+            Ok(AsrOutput {
+                text: decode_collapsed_ids(&collapsed, &vocab.id_to_token),
+                logp,
+                frames,
+                vocab: n_vocab,
+                // Derived from the actual output length rather than assuming
+                // wav2vec2's nominal 20 ms hop, so a re-exported or strided
+                // model does not silently skew every word timing.
+                frame_stride_ms: if frames == 0 {
+                    0.0
+                } else {
+                    audio_ms / frames as f32
+                },
+                audio_ms,
+            })
+        })
+    }
+
+    /// Validate, normalize and run the graph, handing the raw `[frames,
+    /// vocab]` logits to `f` while the session output is still alive.
+    ///
+    /// The borrow is why this is a closure rather than a returned slice: it
+    /// lets [`Self::transcribe_pcm`] decode without copying the logits at
+    /// all, while [`Self::transcribe_pcm_detailed`] copies them deliberately.
+    fn with_logits<T>(
+        &self,
+        pcm_f32: &[f32],
+        f: impl FnOnce(&[f32], usize, usize) -> ort::Result<T>,
+    ) -> ort::Result<T> {
         if pcm_f32.is_empty() {
             return Err(ort::Error::new(
                 "ASR_SILENCE: empty audio (0 samples)".to_string(),
@@ -221,43 +404,7 @@ impl AsrEngine {
             )));
         }
 
-        // Greedy argmax per frame, then CTC collapse (blank id 0 + repeats).
-        let collapsed = ctc_collapse_argmax(data, frames, vocab);
-
-        Self::try_decode_ids(&collapsed)
-    }
-
-    /// Decode via `vocab.json` next to the resolved model.
-    ///
-    /// Returns `Err` with `ASR_NO_VOCAB:` when no vocab file resolves or
-    /// parsing fails (never raw token-id dumps).
-    fn try_decode_ids(collapsed: &[i64]) -> ort::Result<String> {
-        if !vocab_available() {
-            return Err(ort::Error::new(
-                "ASR_NO_VOCAB: vocab.json not found (no candidate resolves)".to_string(),
-            ));
-        }
-        let vocab_path = vocab_candidates()
-            .into_iter()
-            .find(|p| p.is_file())
-            .ok_or_else(|| {
-                ort::Error::new(
-                    "ASR_NO_VOCAB: vocab.json not found (no candidate resolves)".to_string(),
-                )
-            })?;
-        let text = std::fs::read_to_string(&vocab_path).map_err(|e| {
-            ort::Error::new(format!(
-                "ASR_NO_VOCAB: cannot read {}: {e}",
-                vocab_path.display()
-            ))
-        })?;
-        let token_to_id: HashMap<String, i64> = serde_json::from_str(&text)
-            .map_err(|e| ort::Error::new(format!("ASR_NO_VOCAB: invalid vocab.json: {e}")))?;
-        let mut id_to_token: HashMap<i64, String> = HashMap::new();
-        for (tok, id) in token_to_id.iter() {
-            id_to_token.entry(*id).or_insert_with(|| tok.clone());
-        }
-        Ok(decode_collapsed_ids(collapsed, &id_to_token))
+        f(data, frames, vocab)
     }
 
     /// Interpret LE f32 bytes as mono samples; ignore trailing partial chunk.
@@ -319,16 +466,16 @@ mod tests {
             9.0, 1.0, 1.0, // frame 2 -> blank 0
             0.0, 1.0, 7.0, // frame 3 -> id 2
         ];
-        assert_eq!(ctc_collapse_argmax(&logits, 4, 3), vec![1, 2]);
+        assert_eq!(ctc_collapse_argmax(&logits, 4, 3, 0), vec![1, 2]);
     }
 
     #[test]
     fn ctc_collapse_empty_and_truncated() {
-        assert!(ctc_collapse_argmax(&[], 0, 3).is_empty());
-        assert!(ctc_collapse_argmax(&[], 4, 0).is_empty());
+        assert!(ctc_collapse_argmax(&[], 0, 3, 0).is_empty());
+        assert!(ctc_collapse_argmax(&[], 4, 0, 0).is_empty());
         // Truncated slice terminates instead of panicking.
         let logits = vec![0.0f32, 1.0];
-        let out = ctc_collapse_argmax(&logits, 4, 3);
+        let out = ctc_collapse_argmax(&logits, 4, 3, 0);
         assert!(out.len() <= 1);
     }
 
@@ -370,13 +517,78 @@ mod tests {
         if vocab_available() {
             return;
         }
-        let err = AsrEngine::try_decode_ids(&[1, 2, 3])
-            .unwrap_err()
-            .to_string();
+        let err = load_vocab().unwrap_err().to_string();
         assert!(
             err.starts_with("ASR_NO_VOCAB:"),
             "expected ASR_NO_VOCAB: prefix, got {err:?}"
         );
+    }
+
+    #[test]
+    fn vocab_reads_blank_from_the_file() {
+        // wav2vec2 conventionally puts <pad> at 0, but the id is read rather
+        // than assumed: an export that numbers it differently must still
+        // collapse against the right symbol.
+        let v = Vocab::parse(r#"{"<pad>": 3, "a": 0, "b": 1, "|": 2}"#).expect("parse");
+        assert_eq!(v.blank, 3);
+        assert_eq!(v.token_to_id["a"], 0);
+        assert_eq!(v.id_to_token[&2], "|");
+    }
+
+    #[test]
+    fn vocab_defaults_blank_to_zero_without_pad() {
+        let v = Vocab::parse(r#"{"a": 0, "b": 1}"#).expect("parse");
+        assert_eq!(v.blank, 0);
+    }
+
+    #[test]
+    fn vocab_rejects_junk_and_empty() {
+        assert!(Vocab::parse("not json").is_err());
+        assert!(Vocab::parse("{}").is_err());
+    }
+
+    #[test]
+    fn collapse_honours_a_non_zero_blank() {
+        // Same logits as `ctc_collapse_skips_blank_and_repeats`; argmax per
+        // frame is [1, 1, 0, 2]. With blank=1 the 0 now survives and the
+        // leading 1s drop out.
+        let logits: Vec<f32> = vec![
+            0.0, 5.0, 1.0, //
+            0.0, 4.0, 1.0, //
+            9.0, 1.0, 1.0, //
+            0.0, 1.0, 7.0, //
+        ];
+        assert_eq!(ctc_collapse_argmax(&logits, 4, 3, 1), vec![0, 2]);
+    }
+
+    #[test]
+    fn log_softmax_rows_normalizes_each_row() {
+        let mut logits = vec![1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0];
+        log_softmax_rows(&mut logits, 2, 3);
+        for row in logits.chunks(3) {
+            let sum: f64 = row.iter().map(|&x| (x as f64).exp()).sum();
+            assert!((sum - 1.0).abs() < 1e-5, "row must sum to 1, got {sum}");
+            assert!(row.iter().all(|&x| x <= 0.0), "log-probs must be <= 0");
+        }
+        // Uniform row: every value is ln(1/3).
+        let expected = (1.0f32 / 3.0).ln();
+        assert!((logits[3] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn log_softmax_rows_survives_extremes() {
+        // Large magnitudes would overflow exp() without the max subtraction.
+        let mut logits = vec![1000.0f32, 999.0, -1000.0];
+        log_softmax_rows(&mut logits, 1, 3);
+        assert!(logits.iter().all(|x| x.is_finite()), "got {logits:?}");
+        assert!(logits[0] > logits[1] && logits[1] > logits[2]);
+
+        // Degenerate shapes and short rows must not panic.
+        let mut empty: Vec<f32> = Vec::new();
+        log_softmax_rows(&mut empty, 0, 0);
+        let mut short = vec![1.0f32, 2.0];
+        log_softmax_rows(&mut short, 4, 3);
+        assert_eq!(short.len(), 2);
     }
 
     #[test]
