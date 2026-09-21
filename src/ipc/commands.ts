@@ -8,6 +8,8 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 import type {
+  AttemptReport,
+  AttemptRow,
   CardItem,
   Deck,
   DueCard,
@@ -15,8 +17,12 @@ import type {
   Ipc,
   LintDiagnostic,
   LintReport,
+  DeckDeleteMode,
   ModelStatus,
+  NextPromptArgs,
+  PromptView,
   Rating,
+  ScoreAttemptArgs,
   RecentReview,
   ReviewStats,
   VoiceInfo,
@@ -110,6 +116,60 @@ export const tauriIpc: Ipc = {
 
   seedDemoDeck() {
     return invoke<number>("seed_demo_deck");
+  },
+
+  startSession(kind: string) {
+    return invoke<string>("start_session", { kind });
+  },
+
+  endSession(sessionId: string) {
+    return invoke<void>("end_session", { sessionId });
+  },
+
+  nextPrompt(args: NextPromptArgs) {
+    return invoke<PromptView | null>("next_prompt", {
+      sessionId: args.sessionId ?? null,
+      category: args.category ?? null,
+      level: args.level ?? null,
+    });
+  },
+
+  seedPrompts() {
+    return invoke<number>("seed_prompts");
+  },
+
+  scoreAttempt(args: ScoreAttemptArgs) {
+    return invoke<AttemptReport>("score_attempt", {
+      pcmBytes: args.pcm,
+      sampleRate: args.sampleRate,
+      sessionId: args.sessionId ?? null,
+      promptId: args.promptId ?? null,
+      targetText: args.targetText ?? null,
+      dialect: args.dialect ?? null,
+    });
+  },
+
+  listAttempts(sessionId: string | undefined, limit: number) {
+    return invoke<AttemptRow[]>("list_attempts", {
+      sessionId: sessionId ?? null,
+      limit,
+    });
+  },
+
+  createDeck(name: string) {
+    return invoke<string>("create_deck", { name });
+  },
+
+  renameDeck(deckId: string, name: string) {
+    return invoke<void>("rename_deck", { deckId, name });
+  },
+
+  deleteDeck(deckId: string, mode: DeckDeleteMode) {
+    return invoke<number>("delete_deck", { deckId, mode });
+  },
+
+  updateCard(cardId: string, front: string, back: string) {
+    return invoke<void>("update_card", { cardId, front, back });
   },
 
   modelStatus() {

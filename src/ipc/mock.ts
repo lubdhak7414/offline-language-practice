@@ -6,13 +6,20 @@
  * see it in `listCards`. Anything a test needs to vary is an option.
  */
 import type {
+  AttemptReport,
+  AttemptRow,
   CardItem,
+  DeckDeleteMode,
   Deck,
   DueCard,
   Ipc,
   LintReport,
   ModelStatus,
+  NextPromptArgs,
+  PromptView,
   Rating,
+  ScoreAttemptArgs,
+  WordAlignment,
   RecentReview,
   ReviewStats,
   VoiceInfo,
@@ -25,6 +32,9 @@ export type MockOptions = {
   modelStatus?: ModelStatus;
   stats?: ReviewStats;
   voices?: VoiceInfo[];
+  prompts?: PromptView[];
+  /** Overrides the report `scoreAttempt` returns. */
+  report?: Partial<AttemptReport>;
   lint?: LintReport;
   transcript?: string;
   retention?: number;
@@ -37,11 +47,25 @@ export type MockIpc = Ipc & {
   calls: Array<{ name: keyof Ipc; args: unknown[] }>;
 };
 
+export function makePrompt(over: Partial<PromptView> = {}): PromptView {
+  return {
+    id: "builtin-conversation-1",
+    category: "conversation",
+    topic: "small talk",
+    prompt_text: "Reply to a greeting:",
+    target_text: "Hi, good to see you again.",
+    level: 1,
+    ...over,
+  };
+}
+
 export function makeDueCard(over: Partial<DueCard> = {}): DueCard {
   return {
     id: "card-1",
     front: "the front",
     back: "the back",
+    deck_id: "default",
+    deck_name: "Default",
     stability: 3.2,
     difficulty: 5.1,
     days_elapsed: 2,
@@ -55,8 +79,11 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
   const cards: CardItem[] = [...(options.cards ?? [])];
   const due: DueCard[] = [...(options.due ?? [])];
   const reviews: RecentReview[] = [];
+  const attempts: AttemptRow[] = [];
+  const prompts: PromptView[] = [...(options.prompts ?? [makePrompt()])];
   let retention = options.retention ?? 0.9;
   let nextId = 1;
+  let promptCursor = 0;
 
   const calls: MockIpc["calls"] = [];
   const record = <T>(name: keyof Ipc, args: unknown[], value: T): Promise<T> => {
@@ -166,6 +193,109 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
 
     seedDemoDeck() {
       return record("seedDemoDeck", [], 0);
+    },
+
+    startSession(kind: string) {
+      // `calls` already carries the kind, so nothing extra is tracked here.
+      return record("startSession", [kind], "session-1");
+    },
+
+    endSession(sessionId: string) {
+      return record("endSession", [sessionId], undefined as void);
+    },
+
+    nextPrompt(args: NextPromptArgs) {
+      const pool = args.category
+        ? prompts.filter((p) => p.category === args.category)
+        : prompts;
+      const next = pool[promptCursor % Math.max(1, pool.length)];
+      promptCursor += 1;
+      return record("nextPrompt", [args], next ?? null);
+    },
+
+    seedPrompts() {
+      return record("seedPrompts", [], prompts.length);
+    },
+
+    scoreAttempt(args: ScoreAttemptArgs) {
+      const transcript = options.transcript ?? "HELLO WORLD";
+      const scored = args.targetText !== undefined && args.targetText !== "";
+      const alignment: WordAlignment | null = scored
+        ? {
+            ops: [{ kind: "match", hyp_index: 0, target_index: 0, word: "HELLO" }],
+            matched: 1,
+            substituted: 0,
+            inserted: 0,
+            deleted: 0,
+            accuracy: 100,
+          }
+        : null;
+      const report: AttemptReport = {
+        attempt_id: `attempt-${nextId++}`,
+        transcript,
+        target_text: args.targetText ?? null,
+        pron_method: scored ? "text" : null,
+        pron_overall: scored ? 100 : null,
+        alignment,
+        lint: options.lint ?? { diags: [], truncated: false },
+        grammar_score: 100,
+        duration_ms: 2000,
+        word_count: 2,
+        overall: 100,
+        overall_basis: scored ? ["pronunciation", "grammar"] : ["grammar"],
+        ...options.report,
+      };
+      attempts.unshift({
+        id: report.attempt_id,
+        prompt_id: args.promptId ?? null,
+        target_text: report.target_text,
+        transcript: report.transcript,
+        duration_ms: report.duration_ms,
+        created_at: Date.now(),
+        pron_overall: report.pron_overall,
+        pron_method: report.pron_method,
+        overall: report.overall,
+      });
+      return record("scoreAttempt", [args], report);
+    },
+
+    listAttempts(sessionId: string | undefined, limit: number) {
+      return record("listAttempts", [sessionId, limit], attempts.slice(0, limit));
+    },
+
+    createDeck(name: string) {
+      const id = `deck-${nextId++}`;
+      decks.push({ id, name });
+      return record("createDeck", [name], id);
+    },
+
+    renameDeck(deckId: string, name: string) {
+      const deck = decks.find((d) => d.id === deckId);
+      if (deck) deck.name = name;
+      return record("renameDeck", [deckId, name], undefined as void);
+    },
+
+    deleteDeck(deckId: string, mode: DeckDeleteMode) {
+      const affected = cards.filter((c) => c.deck_id === deckId).length;
+      if (mode === "move") {
+        for (const c of cards) if (c.deck_id === deckId) c.deck_id = "default";
+      } else {
+        for (let i = cards.length - 1; i >= 0; i -= 1) {
+          if (cards[i]?.deck_id === deckId) cards.splice(i, 1);
+        }
+      }
+      const idx = decks.findIndex((d) => d.id === deckId);
+      if (idx >= 0) decks.splice(idx, 1);
+      return record("deleteDeck", [deckId, mode], affected);
+    },
+
+    updateCard(cardId: string, front: string, back: string) {
+      const card = cards.find((c) => c.id === cardId);
+      if (card) {
+        card.front = front;
+        card.back = back;
+      }
+      return record("updateCard", [cardId, front, back], undefined as void);
     },
 
     modelStatus() {

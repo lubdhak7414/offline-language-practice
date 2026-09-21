@@ -1,0 +1,306 @@
+/* App shell: nav rail, routes, and the practice screen. */
+
+.shell {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+@media (max-width: 720px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .rail {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .wordmark {
+    display: none;
+  }
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4) var(--space-3);
+  background: var(--bg-sunken);
+  border-right: 1px solid var(--border);
+}
+
+.wordmark {
+  font-weight: 700;
+  font-size: var(--text-lg);
+  padding: 0 var(--space-2) var(--space-4);
+}
+
+.rail-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  text-align: left;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  white-space: nowrap;
+}
+
+.rail-link[aria-current="page"] {
+  background: var(--bg-raised);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.rail-soon {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+}
+
+.content {
+  padding: var(--space-6);
+}
+
+.route {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+/* Headings receive focus on navigation, but should not look clicked. */
+.route h1 {
+  font-size: var(--text-xl);
+  margin: 0 0 var(--space-4);
+}
+.route h1:focus {
+  outline: none;
+}
+.route h1:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.route-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.segmented button {
+  border: none;
+  border-radius: 0;
+}
+.segmented button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--fg-on-accent);
+}
+
+.notice {
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  border: 1px solid var(--border-strong);
+}
+.notice-error,
+.notice-blocking {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ─── Prompt ──────────────────────────────────────────────────────────── */
+
+.prompt-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-sm);
+}
+
+.prompt-meta {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3);
+}
+
+.chip {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px var(--space-2);
+}
+
+.prompt-framing {
+  color: var(--fg-muted);
+  margin: 0 0 var(--space-2);
+}
+
+/* The words to say: the largest thing on the screen, because it is read
+   while looking away from the keyboard. */
+.prompt-target {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  margin: 0 0 var(--space-4);
+}
+
+.record-row {
+  margin: var(--space-6) 0;
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--fg-on-accent);
+  border-color: var(--accent);
+  font-weight: 600;
+  padding: var(--space-3) var(--space-6);
+}
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+button.primary.recording {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.timer {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+
+.level {
+  display: inline-block;
+  width: 120px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+.level > span {
+  display: block;
+  height: 100%;
+  background: var(--success);
+  transition: width 80ms linear;
+}
+
+/* ─── Feedback ────────────────────────────────────────────────────────── */
+
+.meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-6) 0;
+}
+
+.meter {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--bg-raised);
+}
+
+.meter-label {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+}
+
+.meter-value {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.meter-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+  margin: var(--space-2) 0;
+}
+.meter-bar > span {
+  display: block;
+  height: 100%;
+}
+.meter[data-band="high"] .meter-bar > span { background: var(--success); }
+.meter[data-band="mid"] .meter-bar > span { background: var(--warning); }
+.meter[data-band="low"] .meter-bar > span { background: var(--danger); }
+
+.meter-note {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+}
+
+/* An unmeasured score shows why, never a greyed-out number: a faded "0"
+   and a real zero are indistinguishable, and one of them is false. */
+.meter-unmeasured {
+  border-style: dashed;
+}
+
+.transcript {
+  background: var(--bg-sunken);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  white-space: pre-wrap;
+}
+
+.transcript mark {
+  background: transparent;
+  color: inherit;
+}
+
+/* Word verdicts carry an underline style as well as a colour, so they are
+   still distinguishable without colour vision. */
+.alignment {
+  font-size: var(--text-lg);
+  line-height: 2;
+}
+.word + .word {
+  margin-left: 0.4em;
+}
+.word-match {
+  color: var(--fg);
+}
+.word-sub {
+  color: var(--warning);
+  text-decoration: underline wavy currentColor;
+}
+.word-del {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+.word-ins {
+  color: var(--fg-muted);
+  text-decoration: underline dotted currentColor;
+}
+.word-said {
+  font-size: var(--text-sm);
+}
+
+/* ─── Toast ───────────────────────────────────────────────────────────── */
+
+.toast:not(:empty) {
+  position: fixed;
+  inset-block-end: var(--space-4);
+  inset-inline-start: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2) var(--space-4);
+  max-width: min(90vw, 480px);
+}

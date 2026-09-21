@@ -59,6 +59,8 @@ export type DueCard = {
   id: string;
   front: string;
   back: string;
+  deck_id: string;
+  deck_name: string | null;
   stability: number;
   difficulty: number;
   days_elapsed: number;
@@ -75,6 +77,93 @@ export type RecentReview = {
   reviewed_at: number;
   front?: string;
 };
+
+// ─── Practice loop ──────────────────────────────────────────────────────
+
+export type PromptView = {
+  id: string;
+  category: string;
+  topic: string;
+  prompt_text: string;
+  /** `null` means free speaking: not scored for pronunciation. */
+  target_text: string | null;
+  level: number;
+};
+
+/**
+ * One step of the word alignment. Serde tags these with `kind`, so this is a
+ * discriminated union and TypeScript narrows on it.
+ */
+export type WordOp =
+  | { kind: "match"; hyp_index: number; target_index: number; word: string }
+  | {
+      kind: "sub";
+      hyp_index: number;
+      target_index: number;
+      spoken: string;
+      expected: string;
+    }
+  | { kind: "ins"; hyp_index: number; word: string }
+  | { kind: "del"; target_index: number; word: string };
+
+export type WordAlignment = {
+  ops: WordOp[];
+  matched: number;
+  substituted: number;
+  inserted: number;
+  deleted: number;
+  /** `null` when there was no reference text to compare against. */
+  accuracy: number | null;
+};
+
+export type AttemptReport = {
+  attempt_id: string;
+  transcript: string;
+  target_text: string | null;
+  /** `"text"` word alignment, or `"gop"` once acoustic scoring ships. */
+  pron_method: string | null;
+  /** `null` for free speaking — never a fabricated number. */
+  pron_overall: number | null;
+  alignment: WordAlignment | null;
+  lint: LintReport;
+  grammar_score: number;
+  duration_ms: number;
+  word_count: number;
+  overall: number;
+  /** Which components went into `overall`, e.g. `["pronunciation","grammar"]`. */
+  overall_basis: string[];
+};
+
+export type AttemptRow = {
+  id: string;
+  prompt_id: string | null;
+  target_text: string | null;
+  transcript: string;
+  duration_ms: number;
+  /** Milliseconds. */
+  created_at: number;
+  pron_overall: number | null;
+  pron_method: string | null;
+  overall: number;
+};
+
+export type ScoreAttemptArgs = {
+  pcm: Uint8Array;
+  sampleRate: number;
+  sessionId?: string;
+  promptId?: string;
+  targetText?: string;
+  dialect?: string;
+};
+
+export type NextPromptArgs = {
+  sessionId?: string;
+  category?: string;
+  level?: number;
+};
+
+/** What happens to a deck's cards when the deck is deleted. */
+export type DeckDeleteMode = "move" | "delete";
 
 export type DueCardsArgs = { limit: number; deckId?: string };
 
@@ -116,6 +205,21 @@ export type Ipc = {
   addCard(deckId: string, front: string, back: string): Promise<string>;
   deleteCard(cardId: string): Promise<void>;
   seedDemoDeck(): Promise<number>;
+
+  // --- practice loop ---
+  startSession(kind: string): Promise<string>;
+  endSession(sessionId: string): Promise<void>;
+  nextPrompt(args: NextPromptArgs): Promise<PromptView | null>;
+  seedPrompts(): Promise<number>;
+  scoreAttempt(args: ScoreAttemptArgs): Promise<AttemptReport>;
+  listAttempts(sessionId: string | undefined, limit: number): Promise<AttemptRow[]>;
+
+  // --- decks ---
+  createDeck(name: string): Promise<string>;
+  renameDeck(deckId: string, name: string): Promise<void>;
+  /** Returns how many cards were moved or deleted. */
+  deleteDeck(deckId: string, mode: DeckDeleteMode): Promise<number>;
+  updateCard(cardId: string, front: string, back: string): Promise<void>;
 
   // --- diagnostics ---
   modelStatus(): Promise<ModelStatus>;

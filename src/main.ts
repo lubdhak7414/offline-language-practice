@@ -907,5 +907,14 @@ async function boot() {
   await refreshOptimizeGate();
 }
 
-bind();
-void boot();
+/**
+ * Wire the harness to the markup currently in the DOM.
+ *
+ * Called by the Lab route *after* it clones `#lab-template` in. Running at
+ * module scope instead would bind before the elements exist, and would leave
+ * stale listeners behind if the route were reopened.
+ */
+export function mountLab() {
+  bind();
+  void boot();
+}

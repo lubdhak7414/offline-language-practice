@@ -5,13 +5,18 @@
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Offline Language Practice</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <script type="module" src="/src/main.tsx" defer></script>
   </head>
   <body>
-    <main class="container">
-      <h1>Offline Language Practice</h1>
-      <p class="muted">100% on-device: ASR · TTS · FSRS · grammar · SQLite</p>
+    <div id="app"></div>
 
+    <!--
+      The original developer harness. It is imperative DOM code driving this
+      markup, so rather than rewriting it twice it lives in a <template> and
+      the Lab route clones it in on demand. Both this block and `src/main.ts`
+      are deleted once Decks, Progress and Settings are real screens.
+    -->
+    <template id="lab-template">
       <section class="card">
         <h2>1. Speak</h2>
         <div class="row">
@@ -111,6 +116,6 @@
         <h3>Cards in deck</h3>
         <div id="deck-cards" class="output">No deck loaded yet.</div>
       </section>
-    </main>
+    </template>
   </body>
 </html>
