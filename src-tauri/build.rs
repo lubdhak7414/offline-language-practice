@@ -13,19 +13,5 @@ fn main() {
     let _ = std::fs::create_dir_all("../models");
     println!("cargo:rerun-if-changed=../models");
 
-    // Bake the short git SHA into the binary for release diagnostics.
-    // Falls back to "unknown" when git is absent (e.g. source tarball with
-    // no .git dir) so the build never fails for this.
-    let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=APP_GIT_SHA={sha}");
-
     tauri_build::build()
 }

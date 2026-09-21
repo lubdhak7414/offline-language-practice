@@ -1,12 +1,22 @@
 name: CI
 
 on:
+  # Branch-scoped so a PR branch doesn't run this twice (push + pull_request).
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   node:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,6 +32,7 @@ jobs:
 
   version-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Version triple check (package.json, tauri.conf.json, Cargo.toml)
@@ -39,6 +50,7 @@ jobs:
 
   icon-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Icon presence check (.icns/.ico)
@@ -53,12 +65,13 @@ jobs:
             MISSING=1
           fi
           if [ "$MISSING" -ne 0 ]; then
-            echo "::error::Missing release icon set: src-tauri/icons/*.icns and/or *.ico not found (only a 32px placeholder exists). Generate the full set with: npx tauri icon <1024px-master>.png -o src-tauri/icons"
+            echo "::error::Missing release icon set: src-tauri/icons/*.icns and/or *.ico not found. Regenerate with: npx tauri icon <1024px-master>.png -o src-tauri/icons"
             exit 1
           fi
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       # espeak-ng's vendored data compiler truncates paths through a small
       # fixed-size buffer; GitHub's default workspace path (which repeats
@@ -88,4 +101,6 @@ jobs:
           workspaces: "src-tauri"
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
+      # --all-targets so integration tests under src-tauri/tests/ actually run;
+      # --lib silently skipped them.
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets
