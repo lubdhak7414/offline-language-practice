@@ -18,6 +18,7 @@ mod asr;
 mod audio;
 mod db;
 mod error;
+mod fluency;
 mod grammar;
 mod inference;
 mod paths;
@@ -27,7 +28,7 @@ mod pronounce;
 mod scheduler;
 mod tts;
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use fsrs::{FSRS, FSRS6_DEFAULT_DECAY};
 use tauri::ipc::{Channel, Response};
@@ -40,7 +41,10 @@ use crate::db::{
     DB_URL, MIGRATION_1_SQL, MIGRATION_2_SQL, MIGRATION_3_SQL, MIGRATION_4_SQL, MIGRATION_5_SQL,
     MIGRATION_6_SQL,
 };
+use crate::fluency::FluencyReport;
 use crate::grammar::LintOutput;
+use crate::practice::AttemptInput;
+use crate::pronounce::PronScore;
 use crate::scheduler::{CardRow, DeckRow, DueCardView, ReviewRow, ReviewStats};
 use crate::tts::TtsEngine;
 
@@ -53,10 +57,33 @@ pub enum NeuralReq {
         pcm: Vec<f32>,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Transcribe and, when a target is given, score the pronunciation
+    /// against it *inside the worker*.
+    ///
+    /// Scoring is not a separate request on purpose: it needs the frame
+    /// posteriors, which are ~1 MB for a two-minute recording and would
+    /// otherwise have to cross a channel and be held by an async task. The
+    /// PCM is an `Arc` because the command keeps its own handle to run
+    /// fluency analysis in parallel, without copying the audio.
+    TranscribeScored {
+        pcm: Arc<Vec<f32>>,
+        target: Option<String>,
+        reply: oneshot::Sender<Result<ScoredTranscript, String>>,
+    },
     Synth {
         text: String,
         reply: oneshot::Sender<Result<(Vec<u8>, u32), String>>,
     },
+}
+
+/// What the ASR worker returns for a scored request.
+pub struct ScoredTranscript {
+    pub text: String,
+    /// `None` when there was no target, or when scoring refused.
+    pub pron: Option<PronScore>,
+    /// Why scoring refused, when it did. Surfaced so a fallback to text
+    /// alignment is explainable rather than silent.
+    pub pron_error: Option<String>,
 }
 
 /// Shared state: channel handles to the neural workers plus FSRS state.
@@ -79,6 +106,63 @@ const TTS_CHANNEL_SLOTS: usize = 8;
 /// chars per chunk. Longer input would always fail admission control.
 const AUDIOSTREAM_MAX_CHARS: usize = TTS_CHANNEL_SLOTS * 180;
 
+/// Lazy-load the ASR model into `slot` and hand back a reference.
+///
+/// The model is loaded once per process, inside the worker thread, on the
+/// first request that needs it — startup stays fast and a user without
+/// models installed gets an error only when they actually record.
+fn ensure_asr(slot: &mut Option<AsrEngine>) -> Result<&AsrEngine, String> {
+    if slot.is_none() {
+        let path = crate::asr::find_model().ok_or_else(|| {
+            "ASR_NO_MODEL: model not installed; install model to enable transcription".to_string()
+        })?;
+        *slot = Some(
+            AsrEngine::load(&path)
+                .map_err(|e| format!("ASR_NO_MODEL: failed to load model: {e}"))?,
+        );
+    }
+    slot.as_ref()
+        .ok_or_else(|| "ASR_NO_MODEL: model not installed".to_string())
+}
+
+/// Transcribe, and score against `target` when there is one.
+///
+/// A failure to *score* is not a failure to transcribe: the transcript is
+/// returned either way with `pron_error` explaining why no acoustic number
+/// came with it, and the caller falls back to word alignment. Only a failure
+/// to transcribe is an error.
+fn transcribe_scored(
+    engine: &AsrEngine,
+    pcm: &[f32],
+    target: Option<&str>,
+) -> Result<ScoredTranscript, String> {
+    let Some(target) = target else {
+        // No reference text: skip the posteriors entirely rather than
+        // allocating a megabyte nothing will read.
+        return Ok(ScoredTranscript {
+            text: engine.transcribe_pcm(pcm).map_err(|e| e.to_string())?,
+            pron: None,
+            pron_error: None,
+        });
+    };
+    let out = engine
+        .transcribe_pcm_detailed(pcm)
+        .map_err(|e| e.to_string())?;
+    let vocab = crate::asr::load_vocab().map_err(|e| e.to_string())?;
+    match crate::pronounce::score_against_target(&out, target, &vocab) {
+        Ok(pron) => Ok(ScoredTranscript {
+            text: out.text,
+            pron: Some(pron),
+            pron_error: None,
+        }),
+        Err(e) => Ok(ScoredTranscript {
+            text: out.text,
+            pron: None,
+            pron_error: Some(e.to_string()),
+        }),
+    }
+}
+
 /// Spawn the dedicated ASR thread: lazy-loads the model on first request,
 /// then serves `Transcribe` in FIFO order until the channel closes.
 ///
@@ -93,21 +177,13 @@ fn spawn_asr_worker(rx: mpsc::Receiver<NeuralReq>) {
             while let Some(req) = rx.blocking_recv() {
                 match req {
                     NeuralReq::Transcribe { pcm, reply } => {
-                        let res: Result<String, String> = (|| {
-                            if engine.is_none() {
-                                let path = crate::asr::find_model().ok_or_else(|| {
-                                    "ASR_NO_MODEL: model not installed; install model to enable transcription"
-                                        .to_string()
-                                })?;
-                                let eng = AsrEngine::load(&path)
-                                    .map_err(|e| format!("ASR_NO_MODEL: failed to load model: {e}"))?;
-                                engine = Some(eng);
-                            }
-                            let eng = engine
-                                .as_ref()
-                                .ok_or_else(|| "ASR_NO_MODEL: model not installed".to_string())?;
-                            eng.transcribe_pcm(&pcm).map_err(|e| e.to_string())
-                        })();
+                        let res = ensure_asr(&mut engine)
+                            .and_then(|eng| eng.transcribe_pcm(&pcm).map_err(|e| e.to_string()));
+                        let _ = reply.send(res);
+                    }
+                    NeuralReq::TranscribeScored { pcm, target, reply } => {
+                        let res = ensure_asr(&mut engine)
+                            .and_then(|eng| transcribe_scored(eng, &pcm, target.as_deref()));
                         let _ = reply.send(res);
                     }
                     NeuralReq::Synth { reply, .. } => {
@@ -153,6 +229,10 @@ fn spawn_tts_worker(rx: mpsc::Receiver<NeuralReq>) {
                         let _ = reply.send(res);
                     }
                     NeuralReq::Transcribe { reply, .. } => {
+                        let _ =
+                            reply.send(Err("TTS worker received Transcribe request".to_string()));
+                    }
+                    NeuralReq::TranscribeScored { reply, .. } => {
                         let _ =
                             reply.send(Err("TTS worker received Transcribe request".to_string()));
                     }
@@ -433,36 +513,76 @@ async fn score_attempt(
     db: State<'_, DbInstances>,
     state: State<'_, AppState>,
 ) -> Result<crate::practice::AttemptReport, String> {
-    let pcm = decode_pcm(&pcm_bytes, sample_rate)?;
+    let pcm = Arc::new(decode_pcm(&pcm_bytes, sample_rate)?);
     let duration_ms =
         (pcm.len() as f64 * 1000.0 / crate::asr::ASR_SAMPLE_RATE as f64).round() as i64;
+    // A whitespace-only target is free speaking, not a reference phrase;
+    // normalizing here keeps the worker from allocating posteriors for it.
+    let target = target_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
 
     let (tx, rx) = oneshot::channel();
     state
         .asr_tx
-        .try_send(NeuralReq::Transcribe { pcm, reply: tx })
+        .try_send(NeuralReq::TranscribeScored {
+            pcm: pcm.clone(),
+            target: target.clone(),
+            reply: tx,
+        })
         .map_err(busy_message)?;
-    let transcript = rx
+    let scored = rx
         .await
         .map_err(|_| "ASR engine unavailable".to_string())??;
 
     // Grammar runs after ASR rather than in parallel: it needs the
     // transcript, and harper's types are !Send so it has to stay inside its
     // own `spawn_blocking`.
-    let lint = crate::grammar::lint_text_async(transcript.clone(), dialect).await?;
+    let lint = crate::grammar::lint_text_async(scored.text.clone(), dialect).await?;
+
+    let fluency = analyze_fluency(pcm, &scored, duration_ms).await?;
 
     let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
     crate::practice::record_attempt(
         &pool,
-        session_id.as_deref(),
-        prompt_id.as_deref(),
-        target_text.as_deref(),
-        &transcript,
-        duration_ms,
-        lint,
+        AttemptInput::new(&scored.text, duration_ms, lint)
+            .session(session_id.as_deref())
+            .prompt(prompt_id.as_deref())
+            .target(target.as_deref())
+            .scored(scored.pron, fluency),
     )
     .await
     .map_err(String::from)
+}
+
+/// Run delivery analysis off the ASR worker.
+///
+/// Fluency is pure CPU over the raw audio, so it must not occupy the
+/// serialized `neural-asr` thread — that thread is the app's bottleneck and
+/// every other recording queues behind it. `spawn_blocking` instead, on a
+/// pool that exists for exactly this.
+async fn analyze_fluency(
+    pcm: Arc<Vec<f32>>,
+    scored: &ScoredTranscript,
+    duration_ms: i64,
+) -> Result<Option<FluencyReport>, String> {
+    let transcript = scored.text.clone();
+    // Word timings come from the forced alignment when acoustic scoring
+    // ran; without them the energy envelope finds the pauses instead.
+    let words = scored.pron.as_ref().map(|p| p.words.clone());
+    tokio::task::spawn_blocking(move || {
+        crate::fluency::analyze(
+            &pcm,
+            crate::asr::ASR_SAMPLE_RATE,
+            &transcript,
+            words.as_deref(),
+            duration_ms,
+        )
+    })
+    .await
+    .map_err(|e| format!("fluency analysis failed: {e}"))
 }
 
 /// Create a deck. The id is generated; `name` is what the user sees.

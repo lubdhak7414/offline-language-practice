@@ -73,8 +73,6 @@ pub fn vocab_available() -> bool {
 pub struct Vocab {
     /// Token → id. Decoding only needs the reverse map; this direction is
     /// what pronunciation scoring uses to turn a target phrase into labels.
-    // Consumed by pronunciation scoring in the next phase.
-    #[allow(dead_code)]
     pub token_to_id: HashMap<String, i64>,
     pub id_to_token: HashMap<i64, String>,
     /// CTC blank. wav2vec2 CTC checkpoints use `<pad>` for this; it is
@@ -146,8 +144,6 @@ pub fn load_vocab() -> ort::Result<Arc<Vocab>> {
 /// keeps `exp` from overflowing; the sum is accumulated in `f64` because a
 /// long utterance sums thousands of terms. Rows that run past the end of the
 /// slice are left untouched rather than panicking.
-// Consumed by pronunciation scoring in the next phase.
-#[allow(dead_code)]
 pub fn log_softmax_rows(logits: &mut [f32], frames: usize, vocab: usize) {
     if frames == 0 || vocab == 0 {
         return;
@@ -252,16 +248,15 @@ pub fn is_silence(pcm: &[f32]) -> bool {
 /// `logp` is row-major `[frames, vocab]` log-softmax, i.e. every value is
 /// `<= 0` and each row sums (in probability space) to 1.
 #[derive(Debug, Clone)]
-// Consumed by pronunciation scoring in the next phase.
-#[allow(dead_code)]
 pub struct AsrOutput {
     pub text: String,
     pub logp: Vec<f32>,
     pub frames: usize,
     pub vocab: usize,
     /// Milliseconds of audio per output frame, derived from this run.
+    /// Multiplied by `frames` it recovers the utterance length, so the
+    /// duration is not stored a second time.
     pub frame_stride_ms: f32,
-    pub audio_ms: f32,
 }
 
 /// Wav2vec2 session wrapper. `Session::run` takes `&mut self`, hence the Mutex.
@@ -322,8 +317,6 @@ impl AsrEngine {
     /// forward pass over them. At the 120 s command cap this is roughly
     /// 6000 frames x 32 vocab x 4 B, under 1 MB, and it stays inside the ASR
     /// worker — it is never sent across a channel.
-    // Consumed by pronunciation scoring in the next phase.
-    #[allow(dead_code)]
     pub fn transcribe_pcm_detailed(&self, pcm_f32: &[f32]) -> ort::Result<AsrOutput> {
         let vocab = load_vocab()?;
         let audio_samples = pcm_f32.len();
@@ -346,7 +339,6 @@ impl AsrEngine {
                 } else {
                     audio_ms / frames as f32
                 },
-                audio_ms,
             })
         })
     }

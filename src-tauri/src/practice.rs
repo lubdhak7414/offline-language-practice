@@ -13,9 +13,10 @@ use serde::Serialize;
 
 use crate::db::now_unix;
 use crate::error::AppError;
+use crate::fluency::FluencyReport;
 use crate::grammar::LintOutput;
 use crate::prompts_seed::BUILTIN_PROMPTS;
-use crate::pronounce::{align_words, tokenize, WordAlignment};
+use crate::pronounce::{align_words, tokenize, PronScore, WordAlignment};
 
 /// A prompt as the UI sees it.
 #[derive(Debug, Clone, Serialize)]
@@ -50,13 +51,19 @@ pub struct AttemptReport {
     pub attempt_id: String,
     pub transcript: String,
     pub target_text: Option<String>,
-    /// How pronunciation was measured: `"text"` (word alignment) or, once
-    /// the acoustic scorer ships, `"gop"`. `None` for free speaking.
+    /// How pronunciation was measured: `"gop"` when the acoustic scorer ran,
+    /// `"text"` when it could not and word alignment stood in. `None` for
+    /// free speaking. This always describes how the number in
+    /// `pron_overall` was actually produced.
     pub pron_method: Option<String>,
     /// 0..=100, or `None` when there is no reference to compare against.
     pub pron_overall: Option<u8>,
     /// Word-by-word comparison; `None` for free speaking.
     pub alignment: Option<WordAlignment>,
+    /// Per-word acoustic detail, present only when `pron_method` is `"gop"`.
+    pub pron: Option<PronScore>,
+    /// Delivery metrics; `None` when too little was said to measure.
+    pub fluency: Option<FluencyReport>,
     pub lint: LintOutput,
     /// 0..=100 from the grammar issues found, relative to how much was said.
     pub grammar_score: u8,
@@ -173,36 +180,112 @@ pub async fn next_prompt(
     ))
 }
 
+/// Everything one finished recording carries into the database.
+///
+/// A struct rather than nine positional parameters: every field but the
+/// transcript is optional in some combination, and a call site with four
+/// `None`s in a row is where the wrong one gets passed.
+pub struct AttemptInput<'a> {
+    pub session_id: Option<&'a str>,
+    pub prompt_id: Option<&'a str>,
+    /// The phrase the learner was asked to say. Blank or absent means free
+    /// speaking, which is never scored for pronunciation.
+    pub target_text: Option<&'a str>,
+    pub transcript: &'a str,
+    pub duration_ms: i64,
+    pub lint: LintOutput,
+    /// Acoustic scoring, when it ran. Absent means text alignment stands in.
+    pub pron: Option<PronScore>,
+    /// Delivery metrics, when there was enough speech to measure.
+    pub fluency: Option<FluencyReport>,
+}
+
+impl<'a> AttemptInput<'a> {
+    /// The minimum an attempt needs: what was said, for how long, and what
+    /// the grammar checker made of it.
+    pub fn new(transcript: &'a str, duration_ms: i64, lint: LintOutput) -> Self {
+        Self {
+            session_id: None,
+            prompt_id: None,
+            target_text: None,
+            transcript,
+            duration_ms,
+            lint,
+            pron: None,
+            fluency: None,
+        }
+    }
+
+    pub fn session(mut self, id: Option<&'a str>) -> Self {
+        self.session_id = id;
+        self
+    }
+
+    pub fn prompt(mut self, id: Option<&'a str>) -> Self {
+        self.prompt_id = id;
+        self
+    }
+
+    pub fn target(mut self, text: Option<&'a str>) -> Self {
+        self.target_text = text;
+        self
+    }
+
+    pub fn scored(mut self, pron: Option<PronScore>, fluency: Option<FluencyReport>) -> Self {
+        self.pron = pron;
+        self.fluency = fluency;
+        self
+    }
+}
+
 /// Score a finished recording and persist it.
 ///
 /// `transcript` is whatever ASR produced; this function never runs inference
 /// itself, which keeps it testable and keeps the logits inside the ASR
-/// worker where they belong.
-#[allow(clippy::too_many_arguments)]
+/// worker where they belong. Acoustic scoring, when it happened, arrives
+/// already computed in [`AttemptInput::pron`].
+///
+/// The pronunciation number prefers the acoustic score and falls back to
+/// word-level accuracy, recording which one it used in `pron_method`. Word
+/// alignment is computed either way: it is what tells the learner *which*
+/// word went missing, which a per-word confidence cannot.
 pub async fn record_attempt(
     pool: &sqlx::SqlitePool,
-    session_id: Option<&str>,
-    prompt_id: Option<&str>,
-    target_text: Option<&str>,
-    transcript: &str,
-    duration_ms: i64,
-    lint: LintOutput,
+    input: AttemptInput<'_>,
 ) -> Result<AttemptReport, AppError> {
+    let AttemptInput {
+        session_id,
+        prompt_id,
+        target_text,
+        transcript,
+        duration_ms,
+        lint,
+        pron,
+        fluency,
+    } = input;
+
     let target = target_text.map(str::trim).filter(|t| !t.is_empty());
     let word_count = tokenize(transcript).len();
 
     let alignment = target.map(|t| align_words(transcript, t));
+    // Acoustic first; word accuracy only where there was no acoustic score.
     // `accuracy` is None only for an empty reference, which `target` has
     // already excluded — but map rather than unwrap so a future change to
     // that rule cannot turn into a panic here.
-    let pron_overall = alignment.as_ref().and_then(|a| a.accuracy);
-    let pron_method = pron_overall.map(|_| "text".to_string());
+    let (pron_overall, pron_method) = match (&pron, alignment.as_ref().and_then(|a| a.accuracy)) {
+        (Some(p), _) => (Some(p.overall), Some("gop".to_string())),
+        (None, Some(acc)) => (Some(acc), Some("text".to_string())),
+        (None, None) => (None, None),
+    };
 
     let grammar_score = grammar_score(&lint, word_count);
 
     let mut components: Vec<(&str, u8)> = vec![("grammar", grammar_score)];
     if let Some(p) = pron_overall {
         components.insert(0, ("pronunciation", p));
+    }
+    if let Some(f) = fluency.as_ref() {
+        components.push(("fluency", f.score));
     }
     let overall =
         (components.iter().map(|(_, v)| *v as u32).sum::<u32>() / components.len() as u32) as u8;
@@ -231,32 +314,47 @@ pub async fn record_attempt(
 
     sqlx::query(
         "INSERT INTO attempt_scores \
-         (attempt_id, pron_overall, pron_method, lint_error_count, lint_suggestion_count, overall) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         (attempt_id, pron_overall, pron_method, target_logprob, free_logprob, \
+          normalized_conf, wpm, articulation_wpm, longest_pause_ms, pause_count, \
+          filler_count, lint_error_count, lint_suggestion_count, overall) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&attempt_id)
     .bind(pron_overall.map(i64::from))
     .bind(pron_method.as_deref())
+    .bind(pron.as_ref().map(|p| p.target_logprob as f64))
+    .bind(pron.as_ref().map(|p| p.free_logprob as f64))
+    .bind(pron.as_ref().map(|p| p.normalized_conf as f64))
+    .bind(fluency.as_ref().map(|f| f.wpm as f64))
+    .bind(fluency.as_ref().map(|f| f.articulation_wpm as f64))
+    .bind(fluency.as_ref().map(|f| f.longest_pause_ms))
+    .bind(fluency.as_ref().map(|f| f.pause_count))
+    .bind(fluency.as_ref().map(|f| f.filler_count + f.like_count))
     .bind(lint_errors)
     .bind(lint_suggestions)
     .bind(overall as i64)
     .execute(&mut *tx)
     .await?;
 
-    if let Some(a) = alignment.as_ref() {
-        for (index, word) in target_words(a).into_iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO attempt_word_scores \
-                 (attempt_id, word_index, word, score, verdict) VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(&attempt_id)
-            .bind(index as i64)
-            .bind(&word.0)
-            .bind(word.1)
-            .bind(word.2)
-            .execute(&mut *tx)
-            .await?;
-        }
+    for (index, w) in word_rows(pron.as_ref(), alignment.as_ref())
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO attempt_word_scores \
+             (attempt_id, word_index, word, start_ms, end_ms, gop, score, verdict) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&attempt_id)
+        .bind(index as i64)
+        .bind(&w.word)
+        .bind(w.start_ms)
+        .bind(w.end_ms)
+        .bind(w.gop)
+        .bind(w.score)
+        .bind(w.verdict)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
 
@@ -267,6 +365,8 @@ pub async fn record_attempt(
         pron_method,
         pron_overall,
         alignment,
+        pron,
+        fluency,
         lint,
         grammar_score,
         duration_ms,
@@ -274,6 +374,57 @@ pub async fn record_attempt(
         overall,
         overall_basis,
     })
+}
+
+/// One row of `attempt_word_scores`, from whichever scorer ran.
+struct WordRow {
+    word: String,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    gop: Option<f64>,
+    score: i64,
+    verdict: &'static str,
+}
+
+/// Per-word rows, preferring acoustic detail over the text verdict.
+///
+/// Timings and `gop` are `NULL` for text-level rows rather than zero: a
+/// missing measurement is not a measurement of zero, and `pron_method`
+/// records which scorer wrote them.
+fn word_rows(pron: Option<&PronScore>, alignment: Option<&WordAlignment>) -> Vec<WordRow> {
+    if let Some(p) = pron {
+        return p
+            .words
+            .iter()
+            .map(|w| WordRow {
+                word: w.word.clone(),
+                start_ms: Some(w.start_ms),
+                end_ms: Some(w.end_ms),
+                gop: Some(w.gop as f64),
+                score: w.score as i64,
+                verdict: match w.verdict.as_str() {
+                    "good" => "good",
+                    "unclear" => "unclear",
+                    _ => "poor",
+                },
+            })
+            .collect();
+    }
+    alignment
+        .map(|a| {
+            target_words(a)
+                .into_iter()
+                .map(|(word, score, verdict)| WordRow {
+                    word,
+                    start_ms: None,
+                    end_ms: None,
+                    gop: None,
+                    score,
+                    verdict,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Per-target-word outcome: `(word, score, verdict)`.
@@ -447,12 +598,10 @@ mod tests {
             assert!(seen.insert(p.id.clone()), "handed back {} twice", p.id);
             record_attempt(
                 &pool,
-                Some(&session),
-                Some(&p.id),
-                p.target_text.as_deref(),
-                "SOMETHING",
-                1000,
-                no_lint(),
+                AttemptInput::new("SOMETHING", 1000, no_lint())
+                    .session(Some(&session))
+                    .prompt(Some(&p.id))
+                    .target(p.target_text.as_deref()),
             )
             .await
             .unwrap();
@@ -473,12 +622,10 @@ mod tests {
         let session = start_session(&pool, "conversation").await.unwrap();
         record_attempt(
             &pool,
-            Some(&session),
-            Some("p1"),
-            Some("SAY THIS"),
-            "SAY THIS",
-            900,
-            no_lint(),
+            AttemptInput::new("SAY THIS", 900, no_lint())
+                .session(Some(&session))
+                .prompt(Some("p1"))
+                .target(Some("SAY THIS")),
         )
         .await
         .unwrap();
@@ -493,12 +640,8 @@ mod tests {
         let pool = test_pool().await;
         let report = record_attempt(
             &pool,
-            None,
-            None,
-            Some("The cat sat on the mat."),
-            "THE CAT SAT ON THE HAT",
-            3000,
-            no_lint(),
+            AttemptInput::new("THE CAT SAT ON THE HAT", 3000, no_lint())
+                .target(Some("The cat sat on the mat.")),
         )
         .await
         .unwrap();
@@ -514,12 +657,7 @@ mod tests {
         let pool = test_pool().await;
         let report = record_attempt(
             &pool,
-            None,
-            None,
-            None,
-            "I WENT TO THE SHOPS AND BOUGHT SOME BREAD",
-            5000,
-            no_lint(),
+            AttemptInput::new("I WENT TO THE SHOPS AND BOUGHT SOME BREAD", 5000, no_lint()),
         )
         .await
         .unwrap();
@@ -534,9 +672,12 @@ mod tests {
     #[tokio::test]
     async fn a_blank_target_is_treated_as_free_speaking() {
         let pool = test_pool().await;
-        let report = record_attempt(&pool, None, None, Some("   "), "ANYTHING", 100, no_lint())
-            .await
-            .unwrap();
+        let report = record_attempt(
+            &pool,
+            AttemptInput::new("ANYTHING", 100, no_lint()).target(Some("   ")),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.pron_overall, None, "whitespace is not a reference");
     }
 
@@ -546,12 +687,9 @@ mod tests {
         let session = start_session(&pool, "conversation").await.unwrap();
         let report = record_attempt(
             &pool,
-            Some(&session),
-            None,
-            Some("THE CAT SAT"),
-            "THE HAT SAT",
-            2000,
-            no_lint(),
+            AttemptInput::new("THE HAT SAT", 2000, no_lint())
+                .session(Some(&session))
+                .target(Some("THE CAT SAT")),
         )
         .await
         .unwrap();
@@ -579,17 +717,197 @@ mod tests {
         assert_eq!(rows[0].transcript, "THE HAT SAT");
     }
 
+    fn fake_pron(overall: u8) -> PronScore {
+        use crate::pronounce::WordScore;
+        PronScore {
+            overall,
+            words: vec![
+                WordScore {
+                    word: "THE".to_string(),
+                    start_ms: 0,
+                    end_ms: 200,
+                    gop: -0.05,
+                    score: 91,
+                    verdict: "good".to_string(),
+                },
+                WordScore {
+                    word: "CAT".to_string(),
+                    start_ms: 200,
+                    end_ms: 600,
+                    gop: -1.4,
+                    score: 8,
+                    verdict: "poor".to_string(),
+                },
+            ],
+            target_logprob: -3.2,
+            free_logprob: -1.1,
+            normalized_conf: 0.8,
+        }
+    }
+
+    fn fake_fluency(score: u8) -> FluencyReport {
+        FluencyReport {
+            wpm: 120.0,
+            articulation_wpm: 140.0,
+            longest_pause_ms: 500,
+            pause_count: 1,
+            pauses: Vec::new(),
+            filler_count: 2,
+            like_count: 1,
+            hesitation_count: 0,
+            speaking_ms: 1800,
+            method: "aligned".to_string(),
+            score,
+        }
+    }
+
+    #[tokio::test]
+    async fn acoustic_scoring_outranks_word_alignment() {
+        let pool = test_pool().await;
+        // The words are all correct, so text alignment would say 100. The
+        // acoustic scorer heard them badly and says 50 — and it is the one
+        // that actually listened.
+        let report = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint())
+                .target(Some("THE CAT"))
+                .scored(Some(fake_pron(50)), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pron_method.as_deref(), Some("gop"));
+        assert_eq!(report.pron_overall, Some(50));
+        assert_eq!(
+            report.alignment.as_ref().and_then(|a| a.accuracy),
+            Some(100),
+            "the word-by-word view is still computed; it answers a different question"
+        );
+    }
+
+    #[tokio::test]
+    async fn acoustic_word_rows_carry_timings_and_text_rows_do_not() {
+        let pool = test_pool().await;
+        let scored = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint())
+                .target(Some("THE CAT"))
+                .scored(Some(fake_pron(50)), None),
+        )
+        .await
+        .unwrap();
+        let row =
+            sqlx::query_as::<_, (String, Option<i64>, Option<i64>, Option<f64>, i64, String)>(
+                "SELECT word, start_ms, end_ms, gop, score, verdict FROM attempt_word_scores \
+             WHERE attempt_id = ? ORDER BY word_index",
+            )
+            .bind(&scored.attempt_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.len(), 2);
+        assert_eq!(row[1].0, "CAT");
+        assert_eq!((row[1].1, row[1].2), (Some(200), Some(600)));
+        assert_eq!(row[1].4, 8);
+        assert_eq!(row[1].5, "poor");
+
+        let text_only = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint()).target(Some("THE CAT")),
+        )
+        .await
+        .unwrap();
+        let text_rows = sqlx::query_as::<_, (Option<i64>, Option<f64>)>(
+            "SELECT start_ms, gop FROM attempt_word_scores WHERE attempt_id = ?",
+        )
+        .bind(&text_only.attempt_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            text_rows.iter().all(|r| r.0.is_none() && r.1.is_none()),
+            "a measurement that was never taken is NULL, not zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn fluency_joins_the_overall_score_only_when_measured() {
+        let pool = test_pool().await;
+        let with = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint())
+                .target(Some("THE CAT"))
+                .scored(Some(fake_pron(60)), Some(fake_fluency(90))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with.overall_basis, ["pronunciation", "grammar", "fluency"]);
+        assert_eq!(with.overall, (60 + 100 + 90) / 3);
+        assert!(with.fluency.is_some());
+
+        let without = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint())
+                .target(Some("THE CAT"))
+                .scored(Some(fake_pron(60)), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(without.overall_basis, ["pronunciation", "grammar"]);
+        assert!(without.fluency.is_none());
+    }
+
+    #[tokio::test]
+    async fn fluency_and_acoustic_columns_persist() {
+        let pool = test_pool().await;
+        let report = record_attempt(
+            &pool,
+            AttemptInput::new("THE CAT", 1000, no_lint())
+                .target(Some("THE CAT"))
+                .scored(Some(fake_pron(60)), Some(fake_fluency(90))),
+        )
+        .await
+        .unwrap();
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<f64>,
+                Option<f64>,
+                Option<f64>,
+                Option<f64>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT target_logprob, normalized_conf, wpm, articulation_wpm, filler_count \
+             FROM attempt_scores WHERE attempt_id = ?",
+        )
+        .bind(&report.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!((row.0.unwrap() - -3.2).abs() < 1e-5);
+        assert!((row.1.unwrap() - 0.8).abs() < 1e-5);
+        assert!((row.2.unwrap() - 120.0).abs() < 1e-3);
+        assert!((row.3.unwrap() - 140.0).abs() < 1e-3);
+        assert_eq!(row.4, Some(3), "certain fillers plus the hedged LIKE count");
+    }
+
     #[tokio::test]
     async fn list_attempts_is_scoped_to_its_session() {
         let pool = test_pool().await;
         let a = start_session(&pool, "conversation").await.unwrap();
         let b = start_session(&pool, "interview").await.unwrap();
-        record_attempt(&pool, Some(&a), None, None, "ONE", 1, no_lint())
-            .await
-            .unwrap();
-        record_attempt(&pool, Some(&b), None, None, "TWO", 1, no_lint())
-            .await
-            .unwrap();
+        record_attempt(
+            &pool,
+            AttemptInput::new("ONE", 1, no_lint()).session(Some(&a)),
+        )
+        .await
+        .unwrap();
+        record_attempt(
+            &pool,
+            AttemptInput::new("TWO", 1, no_lint()).session(Some(&b)),
+        )
+        .await
+        .unwrap();
         assert_eq!(list_attempts(&pool, Some(&a), 10).await.unwrap().len(), 1);
         assert_eq!(list_attempts(&pool, None, 10).await.unwrap().len(), 2);
     }
