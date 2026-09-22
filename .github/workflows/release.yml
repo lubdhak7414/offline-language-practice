@@ -61,8 +61,58 @@ jobs:
           esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-  build:
+  # One draft, created before any build starts, and every leg is handed its
+  # id. Letting tauri-action create the release per leg is a race: GitHub's
+  # get-release-by-tag API does not return drafts, so legs that start
+  # together each create their own. The second rehearsal (run 35766827124)
+  # ended with two drafts for v0.1.0-1 — Linux and Windows in one, macOS in
+  # the other — and a green run that checksummed only one of them.
+  release:
     needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      - id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # A re-run reuses its draft instead of making another. Listing, not
+          # the by-tag endpoint: that one returns 404 for a draft.
+          id=$(gh api "repos/$REPO/releases" --paginate \
+                 --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" | head -n 1)
+          if [ -z "$id" ]; then
+            # Code signing is deliberately not configured — see SECURITY.md.
+            # Unsigned artifacts plus published checksums and build
+            # provenance is an honest position; a self-signed certificate
+            # pretending to be a trusted one is not.
+            cat > notes.md <<'EOF'
+          See CHANGELOG.md for what changed.
+
+          These builds are **not code-signed**. Verify what you downloaded
+          against `SHA256SUMS`, which is attested to this workflow run:
+
+              sha256sum -c SHA256SUMS --ignore-missing
+              gh attestation verify <file> --repo ${{ github.repository }}
+
+          Models are not bundled. The app downloads them on first run, or
+          run `scripts/download-models.sh`.
+          EOF
+            id=$(gh api "repos/$REPO/releases" -X POST \
+                   -f tag_name="$TAG" -f name="v$VERSION" \
+                   -F draft=true -F prerelease=false -F body=@notes.md --jq .id)
+          fi
+          echo "draft release $id for $TAG"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [check, release]
     permissions:
       contents: write
     name: ${{ matrix.label }}
@@ -151,35 +201,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: "v__VERSION__"
-          releaseDraft: true
-          prerelease: false
+          # Upload to the one draft the `release` job made. No tagName: it
+          # would only shape the updater's latest.json, which is off.
+          releaseId: ${{ needs.release.outputs.id }}
           # The updater stays off until 1.0 (no signing key, no endpoint), and
           # v1 of this action uploads a latest.json by default. Say no rather
           # than rely on it quietly doing nothing without signatures.
           uploadUpdaterJson: false
-          # Code signing is deliberately not configured — see SECURITY.md.
-          # Unsigned artifacts plus published checksums and build
-          # provenance is an honest position; a self-signed certificate
-          # pretending to be a trusted one is not.
-          releaseBody: |
-            See CHANGELOG.md for what changed.
-
-            These builds are **not code-signed**. Verify what you downloaded
-            against `SHA256SUMS`, which is attested to this workflow run:
-
-                sha256sum -c SHA256SUMS --ignore-missing
-                gh attestation verify <file> --repo ${{ github.repository }}
-
-            Models are not bundled. The app downloads them on first run, or
-            run `scripts/download-models.sh`.
 
   # Checksums and provenance are the whole security story for an unsigned
   # release, so they are produced once, over every platform's output, rather
   # than per job where they could silently cover only part of the set.
   attest:
-    needs: build
+    needs: [release, build]
     # Not the default `success()`. With fail-fast off, tauri-action has already
     # uploaded every good platform's binaries to the draft by the time one leg
     # fails; skipping this job would leave them there with no checksums and no
@@ -200,16 +234,26 @@ jobs:
       # found the macOS `.app.tar.gz`, tarred at upload time, sitting in the
       # release with no checksum and no attestation, where
       # `sha256sum -c --ignore-missing` would silently skip it.
+      #
+      # By release id throughout. Tag lookup is ambiguous for drafts (and
+      # returns 404 for them), which is how a green run once checksummed the
+      # wrong half of a split release.
       - name: Download the draft's assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+          ID: ${{ needs.release.outputs.id }}
         run: |
           mkdir -p dist
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
-          # A previous attempt's list; it is regenerated below, and it must
-          # not become a subject of its own attestation.
-          rm -f dist/SHA256SUMS
+          gh api "repos/$REPO/releases/$ID/assets" --paginate \
+              --jq '.[] | "\(.id)\t\(.name)"' |
+            while IFS=$'\t' read -r asset name; do
+              # A previous attempt's list is regenerated below, and must not
+              # become a subject of its own attestation.
+              [ "$name" = SHA256SUMS ] && continue
+              gh api -H "Accept: application/octet-stream" \
+                "repos/$REPO/releases/assets/$asset" > "dist/$name"
+            done
 
       # `subject-path` fails on a glob that matches nothing, with an error that
       # does not say why. Say why.
@@ -240,15 +284,41 @@ jobs:
             | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          draft: true
-          files: dist/SHA256SUMS
+      - name: Attach SHA256SUMS to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ID: ${{ needs.release.outputs.id }}
+        run: |
+          # Replace a previous attempt's list rather than failing on the name.
+          for old in $(gh api "repos/$REPO/releases/$ID/assets" --paginate \
+                         --jq '.[] | select(.name == "SHA256SUMS") | .id'); do
+            gh api -X DELETE "repos/$REPO/releases/assets/$old"
+          done
+          gh api -X POST -H "Content-Type: text/plain" \
+            "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=SHA256SUMS" \
+            --input dist/SHA256SUMS --jq '"uploaded \(.name), \(.size) bytes"'
+
+      # Every build succeeding is not the same as every platform being in the
+      # draft: the split-release race was green. Name the files each platform
+      # must contribute, so a missing one fails the run by name.
+      - name: Require every platform in the draft
+        if: ${{ needs.build.result == 'success' }}
+        run: |
+          missing=0
+          for want in _amd64.deb _amd64.AppImage .x86_64.rpm \
+                      _aarch64.dmg _aarch64.app.tar.gz \
+                      _x64-setup.exe _x64_en-US.msi; do
+            if ! ls dist | grep -qF -- "$want"; then
+              echo "::error::The draft has no *$want."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       # The draft now carries correct checksums and provenance for the
       # platforms that built — and only those. End red, so nobody publishes a
-      # partial release believing a green tick covered all four.
+      # partial release believing a green tick covered all three.
       - name: Fail the run if the platform set is incomplete
         if: ${{ needs.build.result != 'success' }}
         run: |
