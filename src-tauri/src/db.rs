@@ -1,7 +1,7 @@
 //! Subsystem 5: embedded SQLite via tauri-plugin-sql.
 //!
 //! - WAL mode for concurrent reads during review-log writes (enabled once).
-//! - Declarative migrations at startup (1..=6; see `MIGRATION_N_SQL` below).
+//! - Declarative migrations at startup (1..=7; see `MIGRATION_N_SQL` below).
 //! - All access inside async DB worker tasks (never the webview thread).
 
 use tauri::State;
@@ -185,6 +185,76 @@ CREATE TABLE IF NOT EXISTS attempt_cards(
   PRIMARY KEY(attempt_id, card_id)
 );";
 
+/// Migration 7: tags, per-review undo, daily-cap defaults, missing index.
+///
+/// Three independent additions land together because they are all small and
+/// all needed by the same B1 work:
+///
+/// 1. Tags are a many-to-many sidecar (`tags` + `card_tags`) rather than a
+///    column, for the same reason `card_flags` is a sidecar table — no bare
+///    `ALTER TABLE` is allowed from migration 5 on, and a free-text tag list
+///    cannot be indexed or deduplicated as a column anyway.
+/// 2. `review_undo` remembers, per review, exactly enough of the prior
+///    `card_memory_states` row to put it back: `had_memory` distinguishes "no
+///    prior row" (undo deletes the memory row entirely) from "had a row"
+///    (undo restores its four fields). It is pruned to the newest
+///    `scheduler::MAX_UNDO_ROWS` after every grade, so it cannot grow
+///    unbounded over a long-lived database.
+/// 3. `idx_review_logs_card_at` supports `daily_caps`' "is this review this
+///    card's first" check without a table scan; the existing
+///    `idx_review_logs_at` (migration 5) is a poor substitute because it
+///    doesn't have `card_id` as a leading column.
+///
+/// The three `app_settings` defaults are what `prefs::Preferences` reads for
+/// `new_per_day` / `review_per_day` / `bury_hours` when nothing has been
+/// saved yet.
+///
+/// Every statement is `IF NOT EXISTS` / `OR IGNORE`, so re-running (a
+/// migration that fails partway is re-run from the top) is a no-op.
+pub const MIGRATION_7_SQL: &str = "
+CREATE TABLE IF NOT EXISTS tags(
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS card_tags(
+  card_id TEXT NOT NULL, tag_id TEXT NOT NULL,
+  PRIMARY KEY(card_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_card_tags_tag ON card_tags(tag_id);
+CREATE TABLE IF NOT EXISTS review_undo(
+  review_id TEXT PRIMARY KEY NOT NULL,
+  card_id TEXT NOT NULL,
+  had_memory INTEGER NOT NULL,
+  prev_stability REAL, prev_difficulty REAL,
+  prev_last_review_date INTEGER, prev_next_due_date INTEGER,
+  reviewed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_undo_at ON review_undo(reviewed_at);
+CREATE INDEX IF NOT EXISTS idx_review_logs_card_at ON review_logs(card_id, reviewed_at);
+INSERT OR IGNORE INTO app_settings(key,value) VALUES
+  ('new_per_day','20'),('review_per_day','200'),('bury_hours','20');";
+
+/// Minutes to ADD to UTC to get local time (UTC-5 -> `-300`). The frontend
+/// always sends `-new Date().getTimezoneOffset()`, which is exactly this
+/// sign convention (JS's own offset is the other way round).
+///
+/// Bucket a unix timestamp into a "practice day" that starts at
+/// `cutoff_hour` local time rather than local midnight — a session that runs
+/// past midnight (or a user who does their practice at 1am) should not have
+/// it counted as two different days. `div_euclid` (not `/`) so a timestamp
+/// before the epoch, or a negative `tz_offset_minutes` large enough to push
+/// the shifted time negative, still floors toward the correct earlier day
+/// instead of truncating toward zero.
+pub fn day_index(t: i64, tz_offset_minutes: i64, cutoff_hour: i64) -> i64 {
+    (t + tz_offset_minutes * 60 - cutoff_hour * 3600).div_euclid(86_400)
+}
+
+/// Inverse of [`day_index`]: the unix timestamp at which `day_index` starts.
+pub fn day_start_unix(day_index: i64, tz_offset_minutes: i64, cutoff_hour: i64) -> i64 {
+    day_index * 86_400 + cutoff_hour * 3600 - tz_offset_minutes * 60
+}
+
 /// WAL is idempotent but only needs to run once per process.
 static WAL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
@@ -277,6 +347,7 @@ pub mod testing {
             (4, super::MIGRATION_4_SQL),
             (5, super::MIGRATION_5_SQL),
             (6, super::MIGRATION_6_SQL),
+            (7, super::MIGRATION_7_SQL),
         ] {
             if !versions.contains(&version) {
                 continue;
@@ -290,7 +361,7 @@ pub mod testing {
 
     /// The full, current schema — what every non-migration test wants.
     pub async fn test_pool() -> sqlx::SqlitePool {
-        migrated_pool(6).await
+        migrated_pool(7).await
     }
 }
 
@@ -400,5 +471,76 @@ mod tests {
         // which is *below* that bound, while a merely implausible 5,000-day
         // interval is not epoch-shaped and must survive.
         assert_eq!(kept, vec!["legit".to_string(), "long-but-real".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn migration_7_is_idempotent() {
+        let pool = migrated_pool(7).await;
+        let before = setting(&pool, "new_per_day").await;
+        // A migration that fails partway is re-run from the top, so applying
+        // it twice must be a no-op rather than an error.
+        sqlx::raw_sql(super::MIGRATION_7_SQL)
+            .execute(&pool)
+            .await
+            .expect("migration 7 must be re-runnable");
+        assert_eq!(setting(&pool, "new_per_day").await, before);
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_settings WHERE key='new_per_day'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "re-running must not duplicate settings");
+    }
+
+    #[tokio::test]
+    async fn migration_7_seeds_daily_cap_defaults() {
+        let pool = migrated_pool(7).await;
+        assert_eq!(setting(&pool, "new_per_day").await.as_deref(), Some("20"));
+        assert_eq!(
+            setting(&pool, "review_per_day").await.as_deref(),
+            Some("200")
+        );
+        assert_eq!(setting(&pool, "bury_hours").await.as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn day_index_round_trips_through_day_start_unix() {
+        for (tz, cutoff) in [(0_i64, 4_i64), (-300, 4), (330, 0), (-720, 23)] {
+            for day in [-10_i64, 0, 1, 365, 20_000] {
+                let start = super::day_start_unix(day, tz, cutoff);
+                assert_eq!(
+                    super::day_index(start, tz, cutoff),
+                    day,
+                    "round trip failed for tz={tz} cutoff={cutoff} day={day}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn day_index_respects_the_cutoff_hour_boundary() {
+        // 2024-01-02 03:59:00 UTC and 04:00:00 UTC, straddling a cutoff=4
+        // boundary with tz=0: 03:59 belongs to the previous day, 04:00 to
+        // the day that just started.
+        let before_cutoff: i64 = 1_704_167_940; // 2024-01-02T03:59:00Z
+        let at_cutoff: i64 = 1_704_168_000; // 2024-01-02T04:00:00Z
+        let d_before = super::day_index(before_cutoff, 0, 4);
+        let d_at = super::day_index(at_cutoff, 0, 4);
+        assert_eq!(d_at, d_before + 1, "04:00 must start a new practice day");
+    }
+
+    #[test]
+    fn day_index_handles_a_negative_tz_offset() {
+        // UTC-5 (tz_offset_minutes = -300): 04:30 UTC is 23:30 the previous
+        // local day, still before a local cutoff of 4 — so it is still
+        // "yesterday" locally, one bucket behind the same instant at tz=0.
+        let t: i64 = 1_704_168_600; // 2024-01-02T04:30:00Z
+        let utc_day = super::day_index(t, 0, 4);
+        let local_day = super::day_index(t, -300, 4);
+        assert_eq!(
+            local_day,
+            utc_day - 1,
+            "a negative offset must shift the bucket backward"
+        );
     }
 }

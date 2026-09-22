@@ -30,27 +30,31 @@ pub struct DueCardView {
     pub intervals: HashMap<String, f32>,
 }
 
-/// One review-log row, serialized snake_case for the frontend
-/// (`card_id`, `delta_t`, `reviewed_at` keys).
+/// One deck row for deck browsers.
 ///
-/// Wired as Tauri commands by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
+/// `card_count`/`due_count`/`new_count` are computed in one query
+/// (see [`list_decks`]) rather than N+1 per-deck lookups.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct DeckRow {
     pub id: String,
     pub name: String,
+    pub card_count: i64,
+    pub due_count: i64,
+    pub new_count: i64,
 }
 
 /// One card row for deck browsers.
 ///
-/// Wired as Tauri commands by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
+/// `tags` is filled from one grouped query (see [`list_cards`]), not N+1.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CardRow {
     pub id: String,
     pub deck_id: String,
     pub front: String,
     pub back: String,
+    pub tags: Vec<String>,
+    pub suspended: bool,
+    pub buried_until: i64,
 }
 
 /// Aggregate review-history counts for the optimizer gate.
@@ -59,9 +63,6 @@ pub struct CardRow {
 /// `n >= 2` reviews contributes `n - 1` prefix items (see
 /// [`build_train_set`]), so it is the only count that predicts whether
 /// training can run. `trainable_cards` counts cards reaching `n >= 2`.
-///
-/// Wired as Tauri commands by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ReviewStats {
     pub distinct_cards: u64,
@@ -85,6 +86,133 @@ pub const DEFAULT_RETENTION: f32 = 0.9;
 pub const RETENTION_MIN: f32 = 0.70;
 /// Highest desired retention the scheduler will accept.
 pub const RETENTION_MAX: f32 = 0.98;
+
+/// Default daily new-card cap, used when no `app_settings` row (or per-deck
+/// `deck_config` override) exists yet.
+pub const DEFAULT_NEW_PER_DAY: i64 = 20;
+/// Default daily review cap, same fallback rule as [`DEFAULT_NEW_PER_DAY`].
+pub const DEFAULT_REVIEW_PER_DAY: i64 = 200;
+/// A card is "mature" once its stability reaches this many days — the
+/// conventional Anki-style threshold, used by `stats::overview` to split
+/// new/learning/mature. Lives here because it is a scheduling concept.
+pub const MATURE_STABILITY_DAYS: f32 = 21.0;
+/// How many `review_undo` rows to keep. Older rows are pruned after every
+/// grade so a long-lived database does not grow this table unboundedly —
+/// undo only ever needs the single newest row, but a small buffer survives
+/// a client that raced two grades before reading the result of the first.
+pub const MAX_UNDO_ROWS: i64 = 50;
+
+/// Remaining daily allowance for new cards and reviews, for one deck (or
+/// globally when `deck_id` is `None` — see [`daily_caps`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DailyCaps {
+    pub new_left: i64,
+    pub rev_left: i64,
+}
+
+impl DailyCaps {
+    /// No cap in effect — every existing caller that does not pass `caps`
+    /// gets this, so B1 landing does not change `due_cards` behavior for
+    /// anyone who hasn't touched daily-limit settings.
+    pub fn unlimited() -> Self {
+        Self {
+            new_left: i64::MAX,
+            rev_left: i64::MAX,
+        }
+    }
+}
+
+/// Global new/review daily caps from `app_settings`, falling back to the
+/// `DEFAULT_*` constants when the keys are missing or unparseable.
+async fn global_caps(pool: &sqlx::SqlitePool) -> Result<(i64, i64), AppError> {
+    async fn read(pool: &sqlx::SqlitePool, key: &str, default: i64) -> i64 {
+        sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(default)
+    }
+    let new_cap = read(pool, "new_per_day", DEFAULT_NEW_PER_DAY).await;
+    let rev_cap = read(pool, "review_per_day", DEFAULT_REVIEW_PER_DAY).await;
+    Ok((new_cap, rev_cap))
+}
+
+/// How many new cards and reviews are still allowed today.
+///
+/// "Today" is bucketed with [`crate::db::day_index`]/`day_start_unix` using
+/// `tz` and `cutoff` so a user who practices past midnight isn't cut off by
+/// a calendar-day boundary that doesn't match their own.
+///
+/// The cap source is `deck_config` for `deck_id` when a row for that deck
+/// exists there, else the global `app_settings` defaults — a deck with no
+/// override simply inherits the account-wide limit.
+///
+/// "Used" splits today's `review_logs` rows by whether each is the *first*
+/// review of its card ever (`rowid = MIN(rowid)` for that card — insertion
+/// order, not `reviewed_at`, which is only second-precision and so cannot
+/// tell apart two reviews of a brand-new card graded inside the same
+/// second): a first review is a new-card introduction and counts against
+/// `new_left`; every later review of the same card counts against
+/// `rev_left`. Both counts are floored at 0 — a cap lowered after cards were
+/// already reviewed today must not go negative.
+pub async fn daily_caps(
+    pool: &sqlx::SqlitePool,
+    deck_id: Option<&str>,
+    tz: i64,
+    cutoff: i64,
+) -> Result<DailyCaps, AppError> {
+    let now = now_unix();
+    let day = crate::db::day_index(now, tz, cutoff);
+    let day_start = crate::db::day_start_unix(day, tz, cutoff);
+    let day_end = day_start + 86_400;
+
+    let (new_cap, rev_cap) = match deck_id {
+        Some(id) => {
+            let row = sqlx::query(
+                "SELECT new_per_day, review_per_day FROM deck_config WHERE deck_id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+            match row {
+                Some(row) => (row.get("new_per_day"), row.get("review_per_day")),
+                None => global_caps(pool).await?,
+            }
+        }
+        None => global_caps(pool).await?,
+    };
+
+    // "First" is picked by `rowid` (insertion order), not `reviewed_at`:
+    // `reviewed_at` is second-precision, so two reviews of the same
+    // never-before-seen card graded inside the same second would otherwise
+    // both match `MIN(reviewed_at)` and both get counted as "new".
+    let row = sqlx::query(
+        "SELECT \
+           COALESCE(SUM(CASE WHEN rl.rowid = first.first_rowid THEN 1 ELSE 0 END), 0) AS new_used, \
+           COALESCE(SUM(CASE WHEN rl.rowid != first.first_rowid THEN 1 ELSE 0 END), 0) AS rev_used \
+         FROM review_logs rl \
+         JOIN cards c ON c.id = rl.card_id \
+         JOIN (SELECT card_id, MIN(rowid) AS first_rowid FROM review_logs GROUP BY card_id) first \
+           ON first.card_id = rl.card_id \
+         WHERE rl.reviewed_at >= ?1 AND rl.reviewed_at < ?2 \
+           AND (?3 IS NULL OR c.deck_id = ?3)",
+    )
+    .bind(day_start)
+    .bind(day_end)
+    .bind(deck_id)
+    .fetch_one(pool)
+    .await?;
+    let new_used: i64 = row.get("new_used");
+    let rev_used: i64 = row.get("rev_used");
+
+    Ok(DailyCaps {
+        new_left: (new_cap - new_used).max(0),
+        rev_left: (rev_cap - rev_used).max(0),
+    })
+}
 
 /// Minimum prefix items required before `optimize_parameters` will run.
 pub const MIN_TRAIN_ITEMS: u64 = 32;
@@ -182,6 +310,9 @@ pub struct DueOpts<'a> {
     /// Skip this card. Used straight after grading so the card just
     /// answered is not immediately presented again.
     pub exclude_card_id: Option<&'a str>,
+    /// Daily new/review caps still allowed today. `None` means unlimited —
+    /// every pre-B1 caller gets today's behavior unchanged.
+    pub caps: Option<DailyCaps>,
 }
 
 impl DueOpts<'_> {
@@ -222,6 +353,187 @@ fn fetch_window(limit: i64) -> i64 {
 /// `days_elapsed = max(0, (now - last_review) / 86400)`. Rows with no
 /// memory state get `stability = 0.0, difficulty = 0.0, elapsed = 0,
 /// mem = None`.
+/// Build a `(retrievability, DueCardView)` pair from a reviews-pass row
+/// (always carries a memory row, since that pass inner-joins
+/// `card_memory_states`).
+fn review_row_to_view(
+    row: sqlx::sqlite::SqliteRow,
+    now: i64,
+    fsrs: &FSRS,
+    retention: f32,
+    decay: f32,
+) -> Result<(f32, DueCardView), AppError> {
+    let id: String = row.get("id");
+    let front: String = row.get("front");
+    let back: String = row.get("back");
+    let deck_id: String = row.get("deck_id");
+    let deck_name: Option<String> = row.get("deck_name");
+    let stability_opt: Option<f64> = row.get("stability");
+    let difficulty_opt: Option<f64> = row.get("difficulty");
+    let last_review_opt: Option<i64> = row.get("last_review_date");
+
+    let (stability, difficulty, elapsed, mem) =
+        match (stability_opt, difficulty_opt, last_review_opt) {
+            (Some(s), Some(d), Some(last)) => {
+                let elapsed = elapsed_days(now, last);
+                let stability = s as f32;
+                let difficulty = d as f32;
+                let mem = Some(MemoryState {
+                    stability,
+                    difficulty,
+                });
+                (stability, difficulty, elapsed, mem)
+            }
+            _ => (0.0_f32, 0.0_f32, 0_u32, None),
+        };
+    let r = match mem {
+        None => NEW_CARD_R,
+        Some(_) => retrievability(stability, elapsed, decay),
+    };
+    let intervals = intervals_of(fsrs, mem, retention, elapsed)?;
+    Ok((
+        r,
+        DueCardView {
+            id,
+            front,
+            back,
+            deck_id,
+            deck_name,
+            stability,
+            difficulty,
+            days_elapsed: elapsed,
+            intervals,
+        },
+    ))
+}
+
+/// Per-deck (or global, when `deck_id` is `None`) daily new/review caps, as
+/// stored — not "remaining today" (see [`daily_caps`] for that).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DailyLimits {
+    pub deck_id: Option<String>,
+    pub new_per_day: i64,
+    pub review_per_day: i64,
+}
+
+/// Read the caps in effect for `deck_id` (or the global defaults when
+/// `None`), the same source [`daily_caps`] reads from.
+pub async fn get_daily_limits(
+    pool: &sqlx::SqlitePool,
+    deck_id: Option<&str>,
+) -> Result<DailyLimits, AppError> {
+    match deck_id {
+        Some(id) => {
+            let row = sqlx::query(
+                "SELECT new_per_day, review_per_day FROM deck_config WHERE deck_id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+            let (new_per_day, review_per_day) = match row {
+                Some(row) => (row.get("new_per_day"), row.get("review_per_day")),
+                None => global_caps(pool).await?,
+            };
+            Ok(DailyLimits {
+                deck_id: Some(id.to_string()),
+                new_per_day,
+                review_per_day,
+            })
+        }
+        None => {
+            let (new_per_day, review_per_day) = global_caps(pool).await?;
+            Ok(DailyLimits {
+                deck_id: None,
+                new_per_day,
+                review_per_day,
+            })
+        }
+    }
+}
+
+/// Persist new caps for `deck_id` (`deck_config`) or globally
+/// (`app_settings`, when `None`), clamped to `0..=9999` the same as
+/// `prefs::sanitize`. Returns what was actually stored.
+pub async fn set_daily_limits(
+    pool: &sqlx::SqlitePool,
+    deck_id: Option<&str>,
+    new_per_day: i64,
+    review_per_day: i64,
+) -> Result<DailyLimits, AppError> {
+    let new_per_day = new_per_day.clamp(0, 9999);
+    let review_per_day = review_per_day.clamp(0, 9999);
+    match deck_id {
+        Some(id) => {
+            sqlx::query(
+                "INSERT INTO deck_config(deck_id, new_per_day, review_per_day, updated_at) \
+                 VALUES(?, ?, ?, ?) \
+                 ON CONFLICT(deck_id) DO UPDATE SET \
+                   new_per_day = excluded.new_per_day, \
+                   review_per_day = excluded.review_per_day, \
+                   updated_at = excluded.updated_at",
+            )
+            .bind(id)
+            .bind(new_per_day)
+            .bind(review_per_day)
+            .bind(now_unix())
+            .execute(pool)
+            .await?;
+            Ok(DailyLimits {
+                deck_id: Some(id.to_string()),
+                new_per_day,
+                review_per_day,
+            })
+        }
+        None => {
+            for (key, value) in [
+                ("new_per_day", new_per_day),
+                ("review_per_day", review_per_day),
+            ] {
+                sqlx::query(
+                    "INSERT INTO app_settings(key, value) VALUES(?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(key)
+                .bind(value.to_string())
+                .execute(pool)
+                .await?;
+            }
+            Ok(DailyLimits {
+                deck_id: None,
+                new_per_day,
+                review_per_day,
+            })
+        }
+    }
+}
+
+/// Fetch due cards, reviews before new cards, most overdue first.
+///
+/// Two separate queries rather than one `UNION`/`CASE` — daily caps apply
+/// different limits to each class (`caps.rev_left` vs `caps.new_left`), and
+/// a single `LIMIT` cannot express "at most N of these, at most M of those,
+/// reviews always first". `opts.caps = None` means unlimited, so this
+/// changes nothing for any caller that hasn't touched daily-limit settings.
+///
+/// **Reviews pass**: `m.next_due_date IS NULL OR <= now` (`NULL` counts as
+/// due for pre-migration rows), inner-joined to `card_memory_states` so only
+/// previously-reviewed cards appear; deck/exclude/suspended/buried filters
+/// pushed into SQL; ordered by due date in SQL, then over-fetched
+/// ([`fetch_window`]) and re-sorted by retrievability in Rust, then
+/// truncated to `min(limit, caps.rev_left)`.
+///
+/// **New pass**: `m.card_id IS NULL`, same non-scheduling filters, ordered
+/// by `created_at` (creation order — a new card has no retrievability to
+/// sort by), limited to `min(limit - reviews.len(), caps.new_left)`. New
+/// cards get `NEW_CARD_R`, `mem = None`, `elapsed = 0`.
+///
+/// Result is `reviews ++ new`, truncated to `opts.limit` — reviews sorting
+/// before new cards is structural (two passes concatenated in order), not a
+/// SQL `CASE` that could silently stop doing that.
+///
+/// `days_elapsed = max(0, (now - last_review) / 86400)`. Rows with no
+/// memory state get `stability = 0.0, difficulty = 0.0, elapsed = 0,
+/// mem = None`.
 pub async fn fetch_due_cards(
     pool: &sqlx::SqlitePool,
     fsrs: &FSRS,
@@ -233,85 +545,94 @@ pub async fn fetch_due_cards(
         return Ok(Vec::new());
     }
     let now = now_unix();
-    let rows = sqlx::query(
-        "SELECT c.id AS id, c.content_front AS front, c.content_back AS back, \
-         c.deck_id AS deck_id, d.name AS deck_name, \
-         m.stability AS stability, m.difficulty AS difficulty, \
-         m.last_review_date AS last_review_date \
-         FROM cards c \
-         LEFT JOIN card_memory_states m ON m.card_id = c.id \
-         LEFT JOIN decks d ON d.id = c.deck_id \
-         LEFT JOIN card_flags f ON f.card_id = c.id \
-         WHERE (m.card_id IS NULL OR m.next_due_date IS NULL OR m.next_due_date <= ?1) \
-           AND (?2 IS NULL OR c.deck_id = ?2) \
-           AND (?3 IS NULL OR c.id <> ?3) \
-           AND COALESCE(f.suspended, 0) = 0 \
-           AND COALESCE(f.buried_until, 0) <= ?1 \
-         ORDER BY CASE WHEN m.card_id IS NULL THEN 1 ELSE 0 END ASC, \
-                  COALESCE(m.next_due_date, 0) ASC, \
-                  COALESCE(m.last_review_date, 0) ASC \
-         LIMIT ?4",
-    )
-    .bind(now)
-    .bind(opts.deck_id)
-    .bind(opts.exclude_card_id)
-    .bind(fetch_window(opts.limit))
-    .fetch_all(pool)
-    .await?;
+    let caps = opts.caps.unwrap_or_else(DailyCaps::unlimited);
 
-    let mut collected: Vec<(f32, DueCardView)> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: String = row.get("id");
-        let front: String = row.get("front");
-        let back: String = row.get("back");
-        let deck_id: String = row.get("deck_id");
-        let deck_name: Option<String> = row.get("deck_name");
-        let stability_opt: Option<f64> = row.get("stability");
-        let difficulty_opt: Option<f64> = row.get("difficulty");
-        let last_review_opt: Option<i64> = row.get("last_review_date");
-
-        let (stability, difficulty, elapsed, mem) =
-            match (stability_opt, difficulty_opt, last_review_opt) {
-                (Some(s), Some(d), Some(last)) => {
-                    let elapsed = elapsed_days(now, last);
-                    let stability = s as f32;
-                    let difficulty = d as f32;
-                    let mem = Some(MemoryState {
-                        stability,
-                        difficulty,
-                    });
-                    (stability, difficulty, elapsed, mem)
-                }
-                _ => (0.0_f32, 0.0_f32, 0_u32, None),
-            };
-
-        // A never-reviewed card has no retrievability to compute. It sorts
-        // after reviews in SQL, so give it a neutral value here rather than
-        // 0.0, which would drag it back to the front of the R sort.
-        let r = match mem {
-            None => NEW_CARD_R,
-            Some(_) => retrievability(stability, elapsed, decay),
-        };
-
-        let intervals = intervals_of(fsrs, mem, retention, elapsed)?;
-        collected.push((
-            r,
-            DueCardView {
-                id,
-                front,
-                back,
-                deck_id,
-                deck_name,
-                stability,
-                difficulty,
-                days_elapsed: elapsed,
-                intervals,
-            },
-        ));
+    let rev_limit = opts.limit.min(caps.rev_left).max(0);
+    let mut reviews: Vec<(f32, DueCardView)> = Vec::new();
+    if rev_limit > 0 {
+        let rows = sqlx::query(
+            "SELECT c.id AS id, c.content_front AS front, c.content_back AS back, \
+             c.deck_id AS deck_id, d.name AS deck_name, \
+             m.stability AS stability, m.difficulty AS difficulty, \
+             m.last_review_date AS last_review_date \
+             FROM cards c \
+             JOIN card_memory_states m ON m.card_id = c.id \
+             LEFT JOIN decks d ON d.id = c.deck_id \
+             LEFT JOIN card_flags f ON f.card_id = c.id \
+             WHERE (m.next_due_date IS NULL OR m.next_due_date <= ?1) \
+               AND (?2 IS NULL OR c.deck_id = ?2) \
+               AND (?3 IS NULL OR c.id <> ?3) \
+               AND COALESCE(f.suspended, 0) = 0 \
+               AND COALESCE(f.buried_until, 0) <= ?1 \
+             ORDER BY COALESCE(m.next_due_date, 0) ASC, \
+                      COALESCE(m.last_review_date, 0) ASC \
+             LIMIT ?4",
+        )
+        .bind(now)
+        .bind(opts.deck_id)
+        .bind(opts.exclude_card_id)
+        .bind(fetch_window(rev_limit))
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            reviews.push(review_row_to_view(row, now, fsrs, retention, decay)?);
+        }
+        // The window has to be bigger than what we return or this sort is a
+        // no-op — see fetch_window's doc.
+        reviews.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        reviews.truncate(rev_limit as usize);
     }
-    collected.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    collected.truncate(opts.limit as usize);
-    Ok(collected.into_iter().map(|(_, view)| view).collect())
+
+    let new_limit = (opts.limit - reviews.len() as i64)
+        .min(caps.new_left)
+        .max(0);
+    if new_limit > 0 {
+        let rows = sqlx::query(
+            "SELECT c.id AS id, c.content_front AS front, c.content_back AS back, \
+             c.deck_id AS deck_id, d.name AS deck_name \
+             FROM cards c \
+             LEFT JOIN card_memory_states m ON m.card_id = c.id \
+             LEFT JOIN decks d ON d.id = c.deck_id \
+             LEFT JOIN card_flags f ON f.card_id = c.id \
+             WHERE m.card_id IS NULL \
+               AND (?1 IS NULL OR c.deck_id = ?1) \
+               AND (?2 IS NULL OR c.id <> ?2) \
+               AND COALESCE(f.suspended, 0) = 0 \
+               AND COALESCE(f.buried_until, 0) <= ?3 \
+             ORDER BY c.created_at ASC, c.id ASC \
+             LIMIT ?4",
+        )
+        .bind(opts.deck_id)
+        .bind(opts.exclude_card_id)
+        .bind(now)
+        .bind(new_limit)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            let id: String = row.get("id");
+            let front: String = row.get("front");
+            let back: String = row.get("back");
+            let deck_id: String = row.get("deck_id");
+            let deck_name: Option<String> = row.get("deck_name");
+            let intervals = intervals_of(fsrs, None, retention, 0)?;
+            reviews.push((
+                NEW_CARD_R,
+                DueCardView {
+                    id,
+                    front,
+                    back,
+                    deck_id,
+                    deck_name,
+                    stability: 0.0,
+                    difficulty: 0.0,
+                    days_elapsed: 0,
+                    intervals,
+                },
+            ));
+        }
+    }
+    reviews.truncate(opts.limit as usize);
+    Ok(reviews.into_iter().map(|(_, view)| view).collect())
 }
 
 /// Grade a card and persist the FSRS transition.
@@ -320,16 +641,22 @@ pub async fn fetch_due_cards(
 /// 2. Load current `MemoryState` (or `None`) + `days_elapsed` from
 ///    `card_memory_states` (`delta_t = elapsed`, first review `0`).
 /// 3. `next_states(...)`, pick the `ItemState` for `rating`.
-/// 4. In a single transaction: upsert `card_memory_states`
-///    (`INSERT ... ON CONFLICT(card_id) DO UPDATE`) with new
-///    stability/difficulty/now plus `next_due_date` (second-precision
-///    so intraday Again/Hard steps survive a reload:
+/// 4. In a single transaction: insert a `review_undo` row carrying the new
+///    review's id and whatever the memory row said *before* this grade
+///    (`had_memory` distinguishes "no prior row" from "had one"), prune
+///    `review_undo` to the newest [`MAX_UNDO_ROWS`], then upsert
+///    `card_memory_states` (`INSERT ... ON CONFLICT(card_id) DO UPDATE`)
+///    with new stability/difficulty/now plus `next_due_date`
+///    (second-precision so intraday Again/Hard steps survive a reload:
 ///    `now + max(60, round(interval_days * 86400))`), then `INSERT` a
 ///    `review_logs` row (uuid v4, `delta_t = elapsed`,
-///    `reviewed_at = now`). Commit before re-fetch so either both rows
-///    land or neither does (atomicity).
+///    `reviewed_at = now`). Commit before re-fetch so either every row
+///    lands or none does (atomicity).
 /// 5. Return the next due card (`fetch_due_cards` limit 1, excluding the
-///    card just graded): `None` only when nothing else is actually due.
+///    card just graded, capped by the caller's remaining daily allowance so
+///    grading one card cannot pull in one more than the cap permits):
+///    `None` only when nothing else is actually due.
+#[allow(clippy::too_many_arguments)]
 pub async fn grade_card_db(
     pool: &sqlx::SqlitePool,
     fsrs: &FSRS,
@@ -337,6 +664,8 @@ pub async fn grade_card_db(
     decay: f32,
     card_id: &str,
     rating: u32,
+    tz_offset_minutes: i64,
+    cutoff_hour: i64,
 ) -> Result<Option<DueCardView>, AppError> {
     if !(1..=4).contains(&rating) {
         return Err(AppError::BadInput(format!(
@@ -346,26 +675,28 @@ pub async fn grade_card_db(
     let now = now_unix();
 
     let rec = sqlx::query(
-        "SELECT stability, difficulty, last_review_date \
+        "SELECT stability, difficulty, last_review_date, next_due_date \
          FROM card_memory_states WHERE card_id = ?",
     )
     .bind(card_id)
     .fetch_optional(pool)
     .await?;
 
-    let (mem, elapsed) = match rec {
+    let (mem, elapsed, had_memory, prev_stability, prev_difficulty, prev_last, prev_due) = match rec
+    {
         Some(row) => {
             let s: f64 = row.get("stability");
             let d: f64 = row.get("difficulty");
             let last: i64 = row.get("last_review_date");
+            let due: i64 = row.get("next_due_date");
             let elapsed = elapsed_days(now, last);
             let mem = Some(MemoryState {
                 stability: s as f32,
                 difficulty: d as f32,
             });
-            (mem, elapsed)
+            (mem, elapsed, true, Some(s), Some(d), Some(last), Some(due))
         }
-        None => (None, 0_u32),
+        None => (None, 0_u32, false, None, None, None, None),
     };
 
     let next = fsrs
@@ -386,7 +717,36 @@ pub async fn grade_card_db(
     let interval_secs = (chosen.interval * 86_400.0).round().max(60.0) as i64;
     let next_due_date = now.saturating_add(interval_secs);
 
+    let log_id = uuid::Uuid::new_v4().to_string();
     let mut tx = pool.begin().await?;
+    // Written before the upsert so it captures the *prior* state — undo has
+    // nothing to restore once this transaction commits the new one.
+    sqlx::query(
+        "INSERT INTO review_undo \
+         (review_id, card_id, had_memory, prev_stability, prev_difficulty, \
+          prev_last_review_date, prev_next_due_date, reviewed_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&log_id)
+    .bind(card_id)
+    .bind(had_memory as i64)
+    .bind(prev_stability)
+    .bind(prev_difficulty)
+    .bind(prev_last)
+    .bind(prev_due)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    // Keep only the newest MAX_UNDO_ROWS so this table cannot grow without
+    // bound over a long-lived database — undo only ever needs the latest.
+    sqlx::query(
+        "DELETE FROM review_undo WHERE review_id NOT IN \
+         (SELECT review_id FROM review_undo ORDER BY reviewed_at DESC, rowid DESC LIMIT ?)",
+    )
+    .bind(MAX_UNDO_ROWS)
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(
         "INSERT INTO card_memory_states \
          (card_id, stability, difficulty, last_review_date, next_due_date) \
@@ -405,12 +765,11 @@ pub async fn grade_card_db(
     .execute(&mut *tx)
     .await?;
 
-    let log_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO review_logs (id, card_id, rating, delta_t, reviewed_at) \
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(log_id)
+    .bind(&log_id)
     .bind(card_id)
     .bind(rating as i64)
     .bind(elapsed as i64)
@@ -419,6 +778,9 @@ pub async fn grade_card_db(
     .await?;
     tx.commit().await?;
 
+    // Recomputed after commit so the next card offered still respects
+    // today's remaining allowance, including the review just written.
+    let caps = daily_caps(pool, None, tz_offset_minutes, cutoff_hour).await?;
     // Exclude in SQL rather than fetching one row and discarding it when it
     // happens to be the card just graded — that ended sessions early, and
     // reported "nothing due" with other cards still waiting.
@@ -431,10 +793,108 @@ pub async fn grade_card_db(
             limit: 1,
             deck_id: None,
             exclude_card_id: Some(card_id),
+            caps: Some(caps),
         },
     )
     .await?;
     Ok(due.pop())
+}
+
+/// Result of successfully undoing the most recent review.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UndoResult {
+    pub card_id: String,
+    pub front: String,
+    pub rating: i64,
+}
+
+/// Undo the single most recent review, restoring the card's prior
+/// scheduling state.
+///
+/// One transaction: take the newest `review_undo` row
+/// (`ORDER BY reviewed_at DESC, rowid DESC LIMIT 1` — `rowid` breaks ties
+/// between two reviews graded in the same second), read the matching
+/// `review_logs` row for its rating, delete that review log, then either
+/// delete the `card_memory_states` row (`had_memory = 0`: the card was new,
+/// so undoing its first review must leave it new again) or restore the four
+/// prior values (`had_memory = 1`), then delete the undo row itself.
+/// Returns `None` when there is nothing to undo — a fresh session, or one
+/// that already used its only undo.
+pub async fn undo_last_review(pool: &sqlx::SqlitePool) -> Result<Option<UndoResult>, AppError> {
+    let mut tx = pool.begin().await?;
+    let undo_row = sqlx::query(
+        "SELECT review_id, card_id, had_memory, prev_stability, prev_difficulty, \
+         prev_last_review_date, prev_next_due_date \
+         FROM review_undo ORDER BY reviewed_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(undo_row) = undo_row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let review_id: String = undo_row.get("review_id");
+    let card_id: String = undo_row.get("card_id");
+    let had_memory: i64 = undo_row.get("had_memory");
+    let prev_stability: Option<f64> = undo_row.get("prev_stability");
+    let prev_difficulty: Option<f64> = undo_row.get("prev_difficulty");
+    let prev_last: Option<i64> = undo_row.get("prev_last_review_date");
+    let prev_due: Option<i64> = undo_row.get("prev_next_due_date");
+
+    let rating: Option<i64> = sqlx::query_scalar("SELECT rating FROM review_logs WHERE id = ?")
+        .bind(&review_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(rating) = rating else {
+        // The undo row outlived its review log (should not happen; belt and
+        // braces). Drop the stale undo row and report nothing to undo.
+        sqlx::query("DELETE FROM review_undo WHERE review_id = ?")
+            .bind(&review_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let front: String = sqlx::query_scalar("SELECT content_front FROM cards WHERE id = ?")
+        .bind(&card_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM review_logs WHERE id = ?")
+        .bind(&review_id)
+        .execute(&mut *tx)
+        .await?;
+
+    if had_memory == 0 {
+        sqlx::query("DELETE FROM card_memory_states WHERE card_id = ?")
+            .bind(&card_id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query(
+            "UPDATE card_memory_states SET stability = ?, difficulty = ?, \
+             last_review_date = ?, next_due_date = ? WHERE card_id = ?",
+        )
+        .bind(prev_stability)
+        .bind(prev_difficulty)
+        .bind(prev_last)
+        .bind(prev_due)
+        .bind(&card_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query("DELETE FROM review_undo WHERE review_id = ?")
+        .bind(&review_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Some(UndoResult {
+        card_id,
+        front,
+        rating,
+    }))
 }
 
 /// Seed 3 demo EN/ES cards so first-run review is non-empty.
@@ -679,6 +1139,8 @@ async fn delete_card_children(
     card_id: &str,
 ) -> Result<(), AppError> {
     for sql in [
+        "DELETE FROM review_undo WHERE card_id = ?",
+        "DELETE FROM card_tags WHERE card_id = ?",
         "DELETE FROM attempt_cards WHERE card_id = ?",
         "DELETE FROM card_flags WHERE card_id = ?",
         "DELETE FROM review_logs WHERE card_id = ?",
@@ -689,60 +1151,266 @@ async fn delete_card_children(
     Ok(())
 }
 
-/// List all decks ordered by name.
+/// List all decks ordered by name, with per-deck totals.
 ///
-/// Wired as a Tauri command by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
+/// `card_count`/`due_count`/`new_count` are computed in one grouped query
+/// rather than one query per deck. `due_count` mirrors `fetch_due_cards`'
+/// due predicate (`NULL` or past `next_due_date`, not suspended/buried);
+/// `new_count` mirrors its "no memory row, not suspended" predicate. Buried
+/// new cards still count as new here (a bury only ever applies to a card
+/// that has been reviewed at least once), matching `fetch_due_cards`, which
+/// never even queries `card_flags.buried_until` on the new-card side.
 pub async fn list_decks(pool: &sqlx::SqlitePool) -> Result<Vec<DeckRow>, AppError> {
-    let rows = sqlx::query("SELECT id, name FROM decks ORDER BY name ASC, id ASC")
-        .fetch_all(pool)
-        .await?;
+    let now = now_unix();
+    let rows = sqlx::query(
+        "SELECT d.id AS id, d.name AS name, \
+         COUNT(c.id) AS card_count, \
+         COALESCE(SUM(CASE WHEN m.card_id IS NOT NULL \
+                             AND (m.next_due_date IS NULL OR m.next_due_date <= ?1) \
+                             AND COALESCE(f.suspended, 0) = 0 \
+                             AND COALESCE(f.buried_until, 0) <= ?1 \
+                        THEN 1 ELSE 0 END), 0) AS due_count, \
+         COALESCE(SUM(CASE WHEN m.card_id IS NULL AND COALESCE(f.suspended, 0) = 0 \
+                        THEN 1 ELSE 0 END), 0) AS new_count \
+         FROM decks d \
+         LEFT JOIN cards c ON c.deck_id = d.id \
+         LEFT JOIN card_memory_states m ON m.card_id = c.id \
+         LEFT JOIN card_flags f ON f.card_id = c.id \
+         GROUP BY d.id, d.name \
+         ORDER BY d.name ASC, d.id ASC",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(|row| DeckRow {
             id: row.get("id"),
             name: row.get("name"),
+            card_count: row.get("card_count"),
+            due_count: row.get("due_count"),
+            new_count: row.get("new_count"),
         })
         .collect())
 }
 
 /// List cards, optionally filtered by deck.
 ///
-/// Maps `content_front`/`content_back` to `front`/`back`.
-/// Wired as a Tauri command by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
+/// Maps `content_front`/`content_back` to `front`/`back`. `tags` comes from
+/// a correlated `GROUP_CONCAT` subquery (one query overall, not one round
+/// trip per card), joined with `char(31)` (unit separator) so a tag name
+/// containing a comma cannot be mis-split.
 pub async fn list_cards(
     pool: &sqlx::SqlitePool,
     deck_id: Option<String>,
 ) -> Result<Vec<CardRow>, AppError> {
-    let rows = match deck_id {
-        Some(deck) => {
-            sqlx::query(
-                "SELECT id, deck_id, content_front AS front, content_back AS back \
-                 FROM cards WHERE deck_id = ? ORDER BY created_at ASC, id ASC",
-            )
-            .bind(deck)
-            .fetch_all(pool)
-            .await?
-        }
-        None => {
-            sqlx::query(
-                "SELECT id, deck_id, content_front AS front, content_back AS back \
-                 FROM cards ORDER BY created_at ASC, id ASC",
-            )
-            .fetch_all(pool)
-            .await?
-        }
-    };
+    let sql = "SELECT c.id AS id, c.deck_id AS deck_id, \
+         c.content_front AS front, c.content_back AS back, \
+         COALESCE(f.suspended, 0) AS suspended, \
+         COALESCE(f.buried_until, 0) AS buried_until, \
+         (SELECT GROUP_CONCAT(t.name, char(31)) \
+          FROM card_tags ct JOIN tags t ON t.id = ct.tag_id \
+          WHERE ct.card_id = c.id) AS tags \
+         FROM cards c \
+         LEFT JOIN card_flags f ON f.card_id = c.id \
+         WHERE (?1 IS NULL OR c.deck_id = ?1) \
+         ORDER BY c.created_at ASC, c.id ASC";
+    let rows = sqlx::query(sql).bind(deck_id).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(|row| CardRow {
-            id: row.get("id"),
-            deck_id: row.get("deck_id"),
-            front: row.get("front"),
-            back: row.get("back"),
+        .map(|row| {
+            let tags_raw: Option<String> = row.get("tags");
+            let tags = tags_raw
+                .map(|s| s.split('\u{1f}').map(str::to_string).collect())
+                .unwrap_or_default();
+            let suspended: i64 = row.get("suspended");
+            CardRow {
+                id: row.get("id"),
+                deck_id: row.get("deck_id"),
+                front: row.get("front"),
+                back: row.get("back"),
+                tags,
+                suspended: suspended != 0,
+                buried_until: row.get("buried_until"),
+            }
         })
         .collect())
+}
+
+/// Normalize a raw tag name: trim, collapse internal whitespace to `-`,
+/// lowercase. Empty (post-trim) names are dropped so a blank tag box in the
+/// UI never becomes a stored tag.
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let collapsed = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed)
+    }
+}
+
+/// One tag with how many cards currently carry it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TagRow {
+    pub id: String,
+    pub name: String,
+    pub card_count: i64,
+}
+
+/// All tags, ordered by name, with live card counts.
+pub async fn list_tags(pool: &sqlx::SqlitePool) -> Result<Vec<TagRow>, AppError> {
+    let rows = sqlx::query(
+        "SELECT t.id AS id, t.name AS name, COUNT(ct.card_id) AS card_count \
+         FROM tags t LEFT JOIN card_tags ct ON ct.tag_id = t.id \
+         GROUP BY t.id, t.name ORDER BY t.name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TagRow {
+            id: row.get("id"),
+            name: row.get("name"),
+            card_count: row.get("card_count"),
+        })
+        .collect())
+}
+
+/// Replace a card's tag set with `tags` (normalized, deduped), returning the
+/// normalized names actually stored.
+///
+/// One transaction: normalize + dedupe input, `INSERT OR IGNORE` each tag
+/// (uuid id, so a re-used name reuses its existing row via the `UNIQUE`
+/// constraint racing harmlessly with `OR IGNORE`), delete the card's current
+/// `card_tags` rows, insert the new set, then delete any tag left with zero
+/// references — tags are not manually managed, so an orphan would just be
+/// clutter in `list_tags` forever.
+pub async fn set_card_tags(
+    pool: &sqlx::SqlitePool,
+    card_id: &str,
+    tags: &[String],
+) -> Result<Vec<String>, AppError> {
+    let mut normalized: Vec<String> = Vec::new();
+    for raw in tags {
+        if let Some(n) = normalize_tag(raw) {
+            if !normalized.contains(&n) {
+                normalized.push(n);
+            }
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut tag_ids: Vec<String> = Vec::with_capacity(normalized.len());
+    for name in &normalized {
+        let existing: Option<String> = sqlx::query_scalar("SELECT id FROM tags WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                sqlx::query("INSERT OR IGNORE INTO tags(id, name, created_at) VALUES(?, ?, ?)")
+                    .bind(&id)
+                    .bind(name)
+                    .bind(now_unix())
+                    .execute(&mut *tx)
+                    .await?;
+                // Another writer may have raced this insert (UNIQUE(name));
+                // re-read rather than trust the id we just tried to insert.
+                sqlx::query_scalar("SELECT id FROM tags WHERE name = ?")
+                    .bind(name)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+        };
+        tag_ids.push(id);
+    }
+
+    sqlx::query("DELETE FROM card_tags WHERE card_id = ?")
+        .bind(card_id)
+        .execute(&mut *tx)
+        .await?;
+    for tag_id in &tag_ids {
+        sqlx::query("INSERT OR IGNORE INTO card_tags(card_id, tag_id) VALUES(?, ?)")
+            .bind(card_id)
+            .bind(tag_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM card_tags)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(normalized)
+}
+
+/// Suspend or unsuspend a card. Upserts `card_flags`; `Err(BadInput)` when
+/// the card does not exist (a suspend for a card that was just deleted out
+/// from under the caller should be visible, not silently a no-op).
+pub async fn set_card_suspended(
+    pool: &sqlx::SqlitePool,
+    card_id: &str,
+    suspended: bool,
+) -> Result<(), AppError> {
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM cards WHERE id = ?")
+        .bind(card_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::BadInput(format!("card not found: {card_id}")));
+    }
+    sqlx::query(
+        "INSERT INTO card_flags(card_id, suspended, buried_until, updated_at) \
+         VALUES(?, ?, 0, ?) \
+         ON CONFLICT(card_id) DO UPDATE SET suspended = excluded.suspended, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(card_id)
+    .bind(suspended as i64)
+    .bind(now_unix())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Bury a card until `until` (unix seconds), returning the value stored.
+/// `until <= now` clears the bury (stores `0`) rather than storing a
+/// past timestamp that would trivially satisfy every due check anyway.
+pub async fn bury_card(
+    pool: &sqlx::SqlitePool,
+    card_id: &str,
+    until: i64,
+) -> Result<i64, AppError> {
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM cards WHERE id = ?")
+        .bind(card_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::BadInput(format!("card not found: {card_id}")));
+    }
+    let now = now_unix();
+    let stored = if until <= now { 0 } else { until };
+    sqlx::query(
+        "INSERT INTO card_flags(card_id, suspended, buried_until, updated_at) \
+         VALUES(?, 0, ?, ?) \
+         ON CONFLICT(card_id) DO UPDATE SET buried_until = excluded.buried_until, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(card_id)
+    .bind(stored)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(stored)
 }
 
 /// Delete a card and all its child rows explicitly in one transaction.
@@ -751,9 +1419,6 @@ pub async fn list_cards(
 /// CASCADE` is NOT relied upon: `review_logs` → `card_memory_states` →
 /// `cards` are deleted explicitly. Returns `BadInput` if the card id
 /// does not exist.
-///
-/// Wired as a Tauri command by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
 pub async fn delete_card(pool: &sqlx::SqlitePool, card_id: &str) -> Result<(), AppError> {
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM cards WHERE id = ?")
         .bind(card_id)
@@ -777,9 +1442,6 @@ pub async fn delete_card(pool: &sqlx::SqlitePool, card_id: &str) -> Result<(), A
 /// `train_items` mirrors what [`build_train_set`] produces — each card with
 /// `n >= 2` reviews yields `n - 1` prefix items — so the frontend can gate the
 /// optimizer on the same number the optimizer itself checks.
-///
-/// Wired as a Tauri command by the lib.rs owner; allow dead code until then.
-#[allow(dead_code)]
 pub async fn review_stats(pool: &sqlx::SqlitePool) -> Result<ReviewStats, AppError> {
     let row = sqlx::query(
         "SELECT COUNT(*) AS distinct_cards, \
@@ -1095,7 +1757,7 @@ mod tests {
         sqlx::query("INSERT INTO cards (id, deck_id, content_front, content_back, created_at) VALUES ('c1','default','F','B',0)")
             .execute(&pool).await.unwrap();
         // Invalid rating must not write memory or log rows.
-        let err = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 9).await;
+        let err = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 9, 0, 4).await;
         assert!(err.is_err());
         let mem: Option<sqlx::sqlite::SqliteRow> =
             sqlx::query("SELECT * FROM card_memory_states WHERE card_id='c1'")
@@ -1117,7 +1779,7 @@ mod tests {
         sqlx::query("INSERT INTO cards (id, deck_id, content_front, content_back, created_at) VALUES ('c2','default','F','B',0)")
             .execute(&pool).await.unwrap();
         // Successful grade writes exactly one memory row + one log row.
-        let _ = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c2", 3)
+        let _ = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c2", 3, 0, 4)
             .await
             .expect("grade should succeed");
         let n_mem: i64 =
@@ -1208,7 +1870,7 @@ mod tests {
         sqlx::query("INSERT INTO cards (id, deck_id, content_front, content_back, created_at) VALUES ('intra','default','F','B',0)")
             .execute(&pool).await.unwrap();
         let before = crate::db::now_unix();
-        let _ = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "intra", 1)
+        let _ = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "intra", 1, 0, 4)
             .await
             .unwrap();
         let due_ts: i64 = sqlx::query_scalar(
@@ -1631,6 +2293,7 @@ mod tests {
                 limit: 10,
                 deck_id: Some("alpha"),
                 exclude_card_id: None,
+                caps: None,
             },
         )
         .await
@@ -1657,6 +2320,7 @@ mod tests {
                 limit: 10,
                 deck_id: None,
                 exclude_card_id: Some("skip"),
+                caps: None,
             },
         )
         .await
@@ -1675,7 +2339,7 @@ mod tests {
         let fsrs = FSRS::default();
         card(&pool, "first", "default").await;
         card(&pool, "second", "default").await;
-        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "first", 3)
+        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "first", 3, 0, 4)
             .await
             .unwrap();
         let next = next.expect("another card is still due");
@@ -1687,7 +2351,7 @@ mod tests {
         let pool = mem_pool().await;
         let fsrs = FSRS::default();
         card(&pool, "only", "default").await;
-        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "only", 3)
+        let next = grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "only", 3, 0, 4)
             .await
             .unwrap();
         assert!(next.is_none());
@@ -1768,7 +2432,7 @@ mod tests {
         let fsrs = FSRS::default();
         let id = create_deck(&pool, "Doomed").await.unwrap();
         card(&pool, "c1", &id).await;
-        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3)
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3, 0, 4)
             .await
             .unwrap();
         sqlx::query("INSERT INTO card_flags(card_id, suspended, buried_until, updated_at) VALUES ('c1',1,0,0)")
@@ -1819,7 +2483,7 @@ mod tests {
         let pool = mem_pool().await;
         let fsrs = FSRS::default();
         card(&pool, "c1", "default").await;
-        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3)
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "c1", 3, 0, 4)
             .await
             .unwrap();
         update_card(&pool, "c1", "new front", "new back")
@@ -1859,5 +2523,411 @@ mod tests {
             assert!(fetch_window(limit) > limit, "window too small for {limit}");
         }
         assert_eq!(fetch_window(i64::MAX), i64::MAX, "must not overflow");
+    }
+
+    // ─── B1: tags ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_tag_collapses_and_lowercases() {
+        assert_eq!(
+            normalize_tag("  Verb  Phrase "),
+            Some("verb-phrase".to_string())
+        );
+        assert_eq!(normalize_tag("   "), None);
+        assert_eq!(normalize_tag(""), None);
+        assert_eq!(normalize_tag("Solo"), Some("solo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_card_tags_replaces_rather_than_appends() {
+        let pool = mem_pool().await;
+        card(&pool, "t1", "default").await;
+        let stored = set_card_tags(&pool, "t1", &["Verb".to_string(), "Hard".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(stored, vec!["verb".to_string(), "hard".to_string()]);
+
+        // Replacing with a different set must drop the old tags, not add to
+        // them.
+        let stored2 = set_card_tags(&pool, "t1", &["Noun".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(stored2, vec!["noun".to_string()]);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM card_tags WHERE card_id='t1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn set_card_tags_removes_orphan_tags() {
+        let pool = mem_pool().await;
+        card(&pool, "t1", "default").await;
+        set_card_tags(&pool, "t1", &["only-here".to_string()])
+            .await
+            .unwrap();
+        // Reassigning to a different tag must leave the old one orphaned
+        // and therefore removed.
+        set_card_tags(&pool, "t1", &["elsewhere".to_string()])
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name='only-here'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "orphan tag must be deleted");
+    }
+
+    #[tokio::test]
+    async fn set_card_tags_dedupes_and_ignores_blank_entries() {
+        let pool = mem_pool().await;
+        card(&pool, "t1", "default").await;
+        let stored = set_card_tags(
+            &pool,
+            "t1",
+            &["Verb".to_string(), "  verb ".to_string(), "   ".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored, vec!["verb".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_tags_reports_live_counts() {
+        let pool = mem_pool().await;
+        card(&pool, "t1", "default").await;
+        card(&pool, "t2", "default").await;
+        set_card_tags(&pool, "t1", &["shared".to_string()])
+            .await
+            .unwrap();
+        set_card_tags(&pool, "t2", &["shared".to_string()])
+            .await
+            .unwrap();
+        let tags = list_tags(&pool).await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "shared");
+        assert_eq!(tags[0].card_count, 2);
+    }
+
+    // ─── B1: suspend / bury ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn suspend_card_toggles_and_rejects_missing_card() {
+        let pool = mem_pool().await;
+        card(&pool, "s1", "default").await;
+        set_card_suspended(&pool, "s1", true).await.unwrap();
+        let suspended: i64 =
+            sqlx::query_scalar("SELECT suspended FROM card_flags WHERE card_id='s1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(suspended, 1);
+        set_card_suspended(&pool, "s1", false).await.unwrap();
+        let suspended: i64 =
+            sqlx::query_scalar("SELECT suspended FROM card_flags WHERE card_id='s1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(suspended, 0);
+        assert!(set_card_suspended(&pool, "missing", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bury_card_clears_with_a_non_positive_until() {
+        let pool = mem_pool().await;
+        card(&pool, "b1", "default").await;
+        let now = crate::db::now_unix();
+        let until = bury_card(&pool, "b1", now + 3600).await.unwrap();
+        assert!(until > now);
+        let cleared = bury_card(&pool, "b1", now).await.unwrap();
+        assert_eq!(cleared, 0);
+        assert!(bury_card(&pool, "missing", now + 100).await.is_err());
+    }
+
+    // ─── B1: daily caps ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn daily_caps_defaults_to_the_global_app_settings() {
+        let pool = mem_pool().await;
+        let caps = daily_caps(&pool, None, 0, 4).await.unwrap();
+        assert_eq!(caps.new_left, DEFAULT_NEW_PER_DAY);
+        assert_eq!(caps.rev_left, DEFAULT_REVIEW_PER_DAY);
+    }
+
+    #[tokio::test]
+    async fn daily_caps_counts_first_review_as_new_and_later_as_review() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "cap1", "default").await;
+        // First grade: introduces the card, counts against `new`.
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "cap1", 3, 0, 4)
+            .await
+            .unwrap();
+        let caps = daily_caps(&pool, None, 0, 4).await.unwrap();
+        assert_eq!(caps.new_left, DEFAULT_NEW_PER_DAY - 1);
+        assert_eq!(caps.rev_left, DEFAULT_REVIEW_PER_DAY);
+        // Second grade of the same card: counts against `review`.
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "cap1", 3, 0, 4)
+            .await
+            .unwrap();
+        let caps = daily_caps(&pool, None, 0, 4).await.unwrap();
+        assert_eq!(caps.new_left, DEFAULT_NEW_PER_DAY - 1);
+        assert_eq!(caps.rev_left, DEFAULT_REVIEW_PER_DAY - 1);
+    }
+
+    #[tokio::test]
+    async fn daily_caps_floor_at_zero_with_a_low_cap() {
+        let pool = mem_pool().await;
+        set_daily_limits(&pool, None, 2, 2).await.unwrap();
+        let fsrs = FSRS::default();
+        card(&pool, "cap-a", "default").await;
+        card(&pool, "cap-b", "default").await;
+        // Two "first" reviews consume the whole new cap.
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "cap-a", 3, 0, 4)
+            .await
+            .unwrap();
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "cap-b", 3, 0, 4)
+            .await
+            .unwrap();
+        let caps = daily_caps(&pool, None, 0, 4).await.unwrap();
+        assert_eq!(caps.new_left, 0);
+        assert_eq!(
+            caps.rev_left, 2,
+            "reviews cap untouched by new introductions"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_and_set_daily_limits_round_trip_globally_and_per_deck() {
+        let pool = mem_pool().await;
+        let global = get_daily_limits(&pool, None).await.unwrap();
+        assert_eq!(global.new_per_day, DEFAULT_NEW_PER_DAY);
+        set_daily_limits(&pool, None, 5, 55).await.unwrap();
+        let global = get_daily_limits(&pool, None).await.unwrap();
+        assert_eq!((global.new_per_day, global.review_per_day), (5, 55));
+
+        card(&pool, "d1", "alpha").await;
+        // A deck with no override still reads the (now-changed) global.
+        let per_deck = get_daily_limits(&pool, Some("alpha")).await.unwrap();
+        assert_eq!((per_deck.new_per_day, per_deck.review_per_day), (5, 55));
+        set_daily_limits(&pool, Some("alpha"), 3, 30).await.unwrap();
+        let per_deck = get_daily_limits(&pool, Some("alpha")).await.unwrap();
+        assert_eq!((per_deck.new_per_day, per_deck.review_per_day), (3, 30));
+        // The global default must be unaffected by the per-deck override.
+        let global = get_daily_limits(&pool, None).await.unwrap();
+        assert_eq!((global.new_per_day, global.review_per_day), (5, 55));
+    }
+
+    #[tokio::test]
+    async fn fetch_due_cards_honours_review_cap() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        for i in 0..5 {
+            let id = format!("rev{i}");
+            card(&pool, &id, "default").await;
+            reviewed(&pool, &id, 2.0, 400).await;
+        }
+        let due = fetch_due_cards(
+            &pool,
+            &fsrs,
+            0.9,
+            FSRS6_DEFAULT_DECAY,
+            DueOpts {
+                limit: 10,
+                deck_id: None,
+                exclude_card_id: None,
+                caps: Some(DailyCaps {
+                    new_left: 100,
+                    rev_left: 2,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            due.len(),
+            2,
+            "rev_left=2 must cap reviews even though 5 are due"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_due_cards_honours_new_cap_even_with_room_in_limit() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "brand-new-1", "default").await;
+        card(&pool, "brand-new-2", "default").await;
+        let due = fetch_due_cards(
+            &pool,
+            &fsrs,
+            0.9,
+            FSRS6_DEFAULT_DECAY,
+            DueOpts {
+                limit: 10,
+                deck_id: None,
+                exclude_card_id: None,
+                caps: Some(DailyCaps {
+                    new_left: 0,
+                    rev_left: 100,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            due.is_empty(),
+            "new_left=0 must exclude new cards even though limit has room"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_due_cards_still_puts_reviews_before_new_cards_under_caps() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "capped-new", "default").await;
+        card(&pool, "capped-review", "default").await;
+        reviewed(&pool, "capped-review", 2.0, 400).await;
+        let due = fetch_due_cards(
+            &pool,
+            &fsrs,
+            0.9,
+            FSRS6_DEFAULT_DECAY,
+            DueOpts {
+                limit: 10,
+                deck_id: None,
+                exclude_card_id: None,
+                caps: Some(DailyCaps {
+                    new_left: 5,
+                    rev_left: 5,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(due[0].id, "capped-review");
+        assert_eq!(due[1].id, "capped-new");
+    }
+
+    // ─── B1: undo ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn undo_after_a_new_cards_first_review_makes_it_new_again() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "u1", "default").await;
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "u1", 3, 0, 4)
+            .await
+            .unwrap();
+        let undone = undo_last_review(&pool)
+            .await
+            .unwrap()
+            .expect("something to undo");
+        assert_eq!(undone.card_id, "u1");
+        assert_eq!(undone.rating, 3);
+
+        let mem: Option<sqlx::sqlite::SqliteRow> =
+            sqlx::query("SELECT * FROM card_memory_states WHERE card_id='u1'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(
+            mem.is_none(),
+            "undoing the first review must remove the memory row"
+        );
+        let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_logs WHERE card_id='u1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(logs, 0);
+
+        let due = fetch_due_cards(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, DueOpts::limit(10))
+            .await
+            .unwrap();
+        assert!(
+            due.iter().any(|c| c.id == "u1"),
+            "the card must be due again after undo"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_restores_the_prior_review_exactly() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        card(&pool, "u2", "default").await;
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "u2", 3, 0, 4)
+            .await
+            .unwrap();
+        let (first_stability, first_due): (f64, i64) = sqlx::query_as(
+            "SELECT stability, next_due_date FROM card_memory_states WHERE card_id='u2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "u2", 4, 0, 4)
+            .await
+            .unwrap();
+
+        let undone = undo_last_review(&pool)
+            .await
+            .unwrap()
+            .expect("something to undo");
+        assert_eq!(undone.rating, 4);
+
+        let (restored_stability, restored_due): (f64, i64) = sqlx::query_as(
+            "SELECT stability, next_due_date FROM card_memory_states WHERE card_id='u2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(restored_stability, first_stability);
+        assert_eq!(restored_due, first_due);
+        let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_logs WHERE card_id='u2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(logs, 1, "only the second review's log must remain");
+    }
+
+    #[tokio::test]
+    async fn undo_with_nothing_to_undo_is_none() {
+        let pool = mem_pool().await;
+        assert!(undo_last_review(&pool).await.unwrap().is_none());
+    }
+
+    // ─── B1: grown row types ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_decks_reports_card_due_and_new_counts() {
+        let pool = mem_pool().await;
+        let fsrs = FSRS::default();
+        let id = create_deck(&pool, "Counted").await.unwrap();
+        card(&pool, "lc1", &id).await;
+        card(&pool, "lc2", &id).await;
+        reviewed(&pool, "lc1", 2.0, 400).await; // due (overdue)
+        grade_card_db(&pool, &fsrs, 0.9, FSRS6_DEFAULT_DECAY, "lc1", 3, 0, 4)
+            .await
+            .unwrap();
+        let decks = list_decks(&pool).await.unwrap();
+        let found = decks.iter().find(|d| d.id == id).expect("deck");
+        assert_eq!(found.card_count, 2);
+        assert_eq!(found.new_count, 1, "lc2 has no memory row");
+    }
+
+    #[tokio::test]
+    async fn list_cards_includes_tags_and_flags() {
+        let pool = mem_pool().await;
+        card(&pool, "lc-tag", "default").await;
+        set_card_tags(&pool, "lc-tag", &["Alpha".to_string(), "Beta".to_string()])
+            .await
+            .unwrap();
+        set_card_suspended(&pool, "lc-tag", true).await.unwrap();
+        let cards = list_cards(&pool, None).await.unwrap();
+        let found = cards.iter().find(|c| c.id == "lc-tag").expect("card");
+        let mut tags = found.tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(found.suspended);
+        assert_eq!(found.buried_until, 0);
     }
 }
