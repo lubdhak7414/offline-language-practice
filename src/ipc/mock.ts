@@ -116,6 +116,27 @@ export function makeDueCard(over: Partial<DueCard> = {}): DueCard {
   };
 }
 
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+const oneOf = <T extends string>(value: string, allowed: readonly T[], fallback: T): T =>
+  (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
+
+/**
+ * Mirrors src-tauri/src/prefs.rs `sanitize`, by hand — keep them in step.
+ * `contract.test.ts` pins each clamp so a drift on this side is caught.
+ */
+export function sanitizePrefs(p: Preferences): Preferences {
+  return {
+    ...p,
+    theme: oneOf(p.theme, ["system", "light", "dark"] as const, "system"),
+    dialect: oneOf(p.dialect, ["american", "british", "canadian", "australian"] as const, "american"),
+    goal: oneOf(p.goal, ["everyday", "interview", "both"] as const, "both"),
+    day_cutoff_hour: clamp(p.day_cutoff_hour, 0, 23),
+    new_per_day: clamp(p.new_per_day, 0, 9999),
+    review_per_day: clamp(p.review_per_day, 0, 9999),
+    bury_hours: clamp(p.bury_hours, 0, 168),
+  };
+}
+
 /** Same rule the backend documents: trim, collapse whitespace, lowercase. */
 function normalizeTag(raw: string): string | null {
   const collapsed = raw.trim().replace(/\s+/g, "-").toLowerCase();
@@ -255,7 +276,28 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       },
     ]
   ).map((g) => ({ ...g }));
-  let downloadCancelled = false;
+  // Mirrors download.rs `Control`: one job at a time, with pause, resume and
+  // cancel observed at checkpoints before each file and between chunks.
+  // Starting a job resets it to running, so a pause issued while idle is
+  // discarded — as the backend's compare-exchange discards it — and cancel
+  // wakes a paused job so it can observe the cancel instead of sleeping.
+  type DownloadState = "idle" | "running" | "paused" | "cancelled";
+  let downloadState: DownloadState = "idle";
+  let downloadBusy = false;
+  let wakers: Array<() => void> = [];
+  const wakeDownload = () => {
+    const pending = wakers;
+    wakers = [];
+    for (const wake of pending) wake();
+  };
+  /** Resolves `true` to carry on, `false` once cancelled. */
+  const downloadCheckpoint = async (): Promise<boolean> => {
+    for (;;) {
+      if (downloadState === "cancelled") return false;
+      if (downloadState !== "paused") return true;
+      await new Promise<void>((resolve) => wakers.push(resolve));
+    }
+  };
 
   const calls: MockIpc["calls"] = [];
   const record = <T>(name: keyof Ipc, args: unknown[], value: T): Promise<T> => {
@@ -435,7 +477,10 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
 
     buryCard(cardId: string, hours?: number) {
       const card = cards.find((c) => c.id === cardId);
-      const until = hours && hours > 0 ? Math.floor(Date.now() / 1000) + hours * 3600 : 0;
+      // Mirrors lib.rs `bury_card`: omitted means the saved preference, only
+      // an explicit 0 clears, and a negative value clamps to 0.
+      const h = Math.max(0, hours ?? preferences.bury_hours);
+      const until = h === 0 ? 0 : Math.floor(Date.now() / 1000) + h * 3600;
       if (card) card.buried_until = until;
       return record("buryCard", [cardId, hours], until);
     },
@@ -445,7 +490,10 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     },
 
     setPreferences(prefs: Preferences) {
-      preferences = { ...prefs };
+      // The backend returns the sanitized value, which can differ from what
+      // was sent. Echoing input back would let a regression that ignores the
+      // returned value pass every test.
+      preferences = sanitizePrefs(prefs);
       voice = preferences.tts_voice;
       return record("setPreferences", [prefs], { ...preferences });
     },
@@ -554,6 +602,9 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       return record("endSession", [sessionId], undefined as void);
     },
 
+    // Known, accepted gap: the backend skips prompts already attempted in the
+    // session (a NOT IN over `attempts`); this cycles through the pool. No
+    // route depends on the skip, so no test can be misled by it yet.
     nextPrompt(args: NextPromptArgs) {
       const pool = args.category
         ? prompts.filter((p) => p.category === args.category)
@@ -718,53 +769,71 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       if (options.fail && "downloadModels" in options.fail) {
         return record("downloadModels", [which], [] as string[]);
       }
+      // The backend refuses a second concurrent job rather than queueing it.
+      if (downloadBusy) {
+        calls.push({ name: "downloadModels", args: [which] });
+        return Promise.reject("a download is already running");
+      }
       const targets = catalog.filter(
         (g) => which.length === 0 || which.includes(g.id),
       );
-      downloadCancelled = false;
-      const installed: string[] = [];
-      let index = 0;
-      for (const group of targets) {
-        const file = `${group.id}.bin`;
-        if (downloadCancelled) {
-          onEvent({ kind: "cancelled", id: group.id });
-          throw new Error("download cancelled");
+      downloadBusy = true;
+      downloadState = "running";
+      const stop = (id: string): never => {
+        onEvent({ kind: "cancelled", id });
+        throw new Error("download cancelled");
+      };
+      try {
+        const installed: string[] = [];
+        let index = 0;
+        for (const group of targets) {
+          const file = `${group.id}.bin`;
+          if (!(await downloadCheckpoint())) stop(group.id);
+          onEvent({
+            kind: "started",
+            id: group.id,
+            file,
+            total: group.bytes,
+            index,
+            count: targets.length,
+          });
+          onEvent({
+            kind: "progress",
+            id: group.id,
+            received: Math.floor(group.bytes / 2),
+            total: group.bytes,
+          });
+          // Between chunks, where the backend checks too.
+          if (!(await downloadCheckpoint())) stop(group.id);
+          onEvent({ kind: "progress", id: group.id, received: group.bytes, total: group.bytes });
+          onEvent({ kind: "verifying", id: group.id });
+          onEvent({ kind: "installed", id: group.id, file });
+          group.installed = true;
+          installed.push(file);
+          index += 1;
         }
-        onEvent({
-          kind: "started",
-          id: group.id,
-          file,
-          total: group.bytes,
-          index,
-          count: targets.length,
-        });
-        onEvent({
-          kind: "progress",
-          id: group.id,
-          received: Math.floor(group.bytes / 2),
-          total: group.bytes,
-        });
-        onEvent({ kind: "progress", id: group.id, received: group.bytes, total: group.bytes });
-        onEvent({ kind: "verifying", id: group.id });
-        onEvent({ kind: "installed", id: group.id, file });
-        group.installed = true;
-        installed.push(file);
-        index += 1;
+        onEvent({ kind: "done", installed });
+        return record("downloadModels", [which], installed);
+      } finally {
+        downloadBusy = false;
+        downloadState = "idle";
       }
-      onEvent({ kind: "done", installed });
-      return record("downloadModels", [which], installed);
     },
 
     pauseDownloads() {
+      if (downloadState === "running") downloadState = "paused";
       return record("pauseDownloads", [], undefined as void);
     },
 
     resumeDownloads() {
+      if (downloadState === "paused") downloadState = "running";
+      wakeDownload();
       return record("resumeDownloads", [], undefined as void);
     },
 
     cancelDownloads() {
-      downloadCancelled = true;
+      downloadState = "cancelled";
+      wakeDownload();
       return record("cancelDownloads", [], undefined as void);
     },
   };

@@ -6,6 +6,28 @@ import { setIpc } from "../ipc/commands";
 import { createMockIpc, makePrompt, type MockIpc } from "../ipc/mock";
 import { Practice } from "./Practice";
 
+// jsdom has no microphone. A recorder that hands back one second of silence
+// is enough to drive Practice through scoring into its feedback view.
+vi.mock("../app/recorder", () => {
+  let recording = false;
+  return {
+    MAX_RECORDING_MS: 120_000,
+    createRecorder: () => ({
+      start: async () => {
+        recording = true;
+      },
+      stop: async () => {
+        recording = false;
+        return { pcm: new Uint8Array(64_000), durationMs: 1000, peak: 0.3 };
+      },
+      cancel: () => {
+        recording = false;
+      },
+      isRecording: () => recording,
+    }),
+  };
+});
+
 let restore: (() => void) | undefined;
 
 function mount(mock: MockIpc) {
@@ -101,6 +123,53 @@ describe("Practice", () => {
     await new Promise((r) => setTimeout(r, 0));
     await waitFor(() => expect(screen.getByText("Fresh prompt")).toBeInTheDocument());
     expect(screen.queryByText("Stale prompt")).not.toBeInTheDocument();
+  });
+
+  it("says so when pronunciation fell back to word matching", async () => {
+    const user = userEvent.setup();
+    // What the backend returns when acoustic scoring refuses: no per-word
+    // acoustic detail, the word-alignment accuracy standing in, and fluency
+    // measured from the audio envelope.
+    const mock = createMockIpc({
+      report: {
+        pron_method: "text",
+        pron: null,
+        pron_overall: 100,
+        fluency: {
+          wpm: 120,
+          articulation_wpm: 140,
+          longest_pause_ms: 0,
+          pause_count: 0,
+          pauses: [],
+          filler_count: 0,
+          like_count: 0,
+          hesitation_count: 0,
+          speaking_ms: 1800,
+          method: "energy",
+          score: 88,
+        },
+      },
+    });
+    mount(mock);
+    await screen.findByText("Reply to a greeting:");
+
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+
+    expect(await screen.findByText(/word-by-word matching/)).toBeInTheDocument();
+    expect(mock.calls.find((c) => c.name === "scoreAttempt")?.args[0]).toMatchObject({
+      targetText: "Hi, good to see you again.",
+    });
+  });
+
+  it("does not claim a fallback when acoustic scoring ran", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    expect(await screen.findByText(/^Overall/)).toBeInTheDocument();
+    expect(screen.queryByText(/word-by-word matching/)).not.toBeInTheDocument();
   });
 
   it("switches the session when the category changes", async () => {

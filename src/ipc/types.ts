@@ -383,7 +383,11 @@ export type Ipc = {
   listTags(): Promise<TagRow[]>;
   setCardTags(cardId: string, tags: string[]): Promise<string[]>;
   suspendCard(cardId: string, suspended: boolean): Promise<void>;
-  /** `hours` omitted or 0 clears the bury. Returns the new `buried_until`. */
+  /**
+   * Buries the card until `hours` from now. Omitting `hours` uses the saved
+   * `bury_hours` preference (it does not clear); `0` clears the bury, and a
+   * negative value is treated as 0. Returns the new `buried_until`.
+   */
   buryCard(cardId: string, hours?: number): Promise<number>;
 
   // --- preferences & caps ---

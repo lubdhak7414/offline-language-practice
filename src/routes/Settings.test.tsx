@@ -19,6 +19,20 @@ afterEach(() => {
 });
 
 describe("Settings", () => {
+  it("shows the value the backend saved, not the one typed", async () => {
+    // Number inputs do not stop a typed out-of-range value; the backend clamps
+    // it. The screen must show what was stored, or it disagrees with the next
+    // launch.
+    const mock = createMockIpc();
+    mount(mock);
+    const input = (await screen.findByLabelText("New cards per day")) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: "99999" } });
+    await waitFor(() =>
+      expect(mock.calls.some((c) => c.name === "setPreferences")).toBe(true),
+    );
+    await waitFor(() => expect(input.value).toBe("9999"));
+  });
+
   it("sends a retention value inside the allowed range", async () => {
     const mock = createMockIpc({ retention: 0.9 });
     mount(mock);
