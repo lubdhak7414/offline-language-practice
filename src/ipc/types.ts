@@ -116,15 +116,57 @@ export type WordAlignment = {
   accuracy: number | null;
 };
 
+/** One word's acoustic result. `gop` is always <= 0; 0 is perfect. */
+export type WordScore = {
+  word: string;
+  start_ms: number;
+  end_ms: number;
+  gop: number;
+  score: number;
+  verdict: "good" | "unclear" | "poor";
+};
+
+export type PronScore = {
+  overall: number;
+  words: WordScore[];
+  target_logprob: number;
+  free_logprob: number;
+  /** `(0, 1]`, length-independent, so phrases are comparable. */
+  normalized_conf: number;
+};
+
+export type Pause = { start_ms: number; end_ms: number };
+
+export type FluencyReport = {
+  wpm: number;
+  /** Words per minute of speaking time, pauses removed. */
+  articulation_wpm: number;
+  longest_pause_ms: number;
+  pause_count: number;
+  pauses: Pause[];
+  filler_count: number;
+  /** `LIKE` alone, which is a filler only about half the time. */
+  like_count: number;
+  hesitation_count: number;
+  speaking_ms: number;
+  /** `"aligned"` from word timings, `"energy"` from the audio envelope. */
+  method: string;
+  score: number;
+};
+
 export type AttemptReport = {
   attempt_id: string;
   transcript: string;
   target_text: string | null;
-  /** `"text"` word alignment, or `"gop"` once acoustic scoring ships. */
+  /** `"gop"` when the acoustic scorer ran, `"text"` when it fell back. */
   pron_method: string | null;
   /** `null` for free speaking — never a fabricated number. */
   pron_overall: number | null;
   alignment: WordAlignment | null;
+  /** Per-word acoustic detail; `null` unless `pron_method` is `"gop"`. */
+  pron: PronScore | null;
+  /** `null` when too little was said to measure delivery honestly. */
+  fluency: FluencyReport | null;
   lint: LintReport;
   grammar_score: number;
   duration_ms: number;

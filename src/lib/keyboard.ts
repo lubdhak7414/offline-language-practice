@@ -18,6 +18,8 @@ export type ReviewKeyContext = {
   revealed: boolean;
   gradeRowHidden: boolean;
   revealHidden: boolean;
+  /** True while the global `g` prefix is armed; the route stands down. */
+  goPending: boolean;
 };
 
 export type ReviewKeyAction = { kind: "grade"; rating: Rating } | { kind: "reveal" };
@@ -32,7 +34,7 @@ export function reviewKeyAction(
   if (TEXT_ENTRY.has(ctx.targetTag) || ctx.isContentEditable || ctx.isComposing) {
     return null;
   }
-  if (!ctx.hasCard) return null;
+  if (ctx.goPending || !ctx.hasCard) return null;
 
   const rating = parseRating(key);
   if (rating) {
@@ -48,4 +50,43 @@ export function reviewKeyAction(
   }
 
   return null;
+}
+
+/** What the practice screen looks like when a key arrives. */
+export type PracticeKeyContext = {
+  targetTag: string;
+  isContentEditable: boolean;
+  isComposing: boolean;
+  goPending: boolean;
+  hasPrompt: boolean;
+  recording: boolean;
+  /** False while the model is missing or a score is still being computed. */
+  canRecord: boolean;
+};
+
+export type PracticeKeyAction =
+  | { kind: "record" }
+  | { kind: "stop" }
+  | { kind: "listen" };
+
+export function practiceKeyAction(
+  key: string,
+  ctx: PracticeKeyContext,
+): PracticeKeyAction | null {
+  if (TEXT_ENTRY.has(ctx.targetTag) || ctx.isContentEditable || ctx.isComposing) {
+    return null;
+  }
+  if (ctx.goPending || !ctx.hasPrompt) return null;
+
+  switch (key.toLowerCase()) {
+    case "r":
+      // One key for both edges: a learner mid-sentence should not have to
+      // remember a different key to stop than the one they used to start.
+      if (ctx.recording) return { kind: "stop" };
+      return ctx.canRecord ? { kind: "record" } : null;
+    case "p":
+      return ctx.recording ? null : { kind: "listen" };
+    default:
+      return null;
+  }
 }

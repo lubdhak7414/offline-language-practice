@@ -12,11 +12,13 @@ import type {
   DeckDeleteMode,
   Deck,
   DueCard,
+  FluencyReport,
   Ipc,
   LintReport,
   ModelStatus,
   NextPromptArgs,
   PromptView,
+  PronScore,
   Rating,
   ScoreAttemptArgs,
   WordAlignment,
@@ -230,19 +232,56 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
             accuracy: 100,
           }
         : null;
+      // Mirrors the real backend: a read-aloud prompt comes back acoustically
+      // scored, free speaking comes back with no pronunciation number at all.
+      const pron: PronScore | null = scored
+        ? {
+            overall: 100,
+            words: [
+              {
+                word: "HELLO",
+                start_ms: 0,
+                end_ms: 400,
+                gop: -0.01,
+                score: 100,
+                verdict: "good",
+              },
+            ],
+            target_logprob: -2.5,
+            free_logprob: -1.5,
+            normalized_conf: 0.9,
+          }
+        : null;
+      const fluency: FluencyReport = {
+        wpm: 120,
+        articulation_wpm: 140,
+        longest_pause_ms: 0,
+        pause_count: 0,
+        pauses: [],
+        filler_count: 0,
+        like_count: 0,
+        hesitation_count: 0,
+        speaking_ms: 1800,
+        method: scored ? "aligned" : "energy",
+        score: 88,
+      };
       const report: AttemptReport = {
         attempt_id: `attempt-${nextId++}`,
         transcript,
         target_text: args.targetText ?? null,
-        pron_method: scored ? "text" : null,
+        pron_method: scored ? "gop" : null,
         pron_overall: scored ? 100 : null,
         alignment,
+        pron,
+        fluency,
         lint: options.lint ?? { diags: [], truncated: false },
         grammar_score: 100,
         duration_ms: 2000,
         word_count: 2,
-        overall: 100,
-        overall_basis: scored ? ["pronunciation", "grammar"] : ["grammar"],
+        overall: 96,
+        overall_basis: scored
+          ? ["pronunciation", "grammar", "fluency"]
+          : ["grammar", "fluency"],
         ...options.report,
       };
       attempts.unshift({

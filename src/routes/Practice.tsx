@@ -4,7 +4,15 @@ import { ipc } from "../ipc/commands";
 import type { AttemptReport, PromptView } from "../ipc/types";
 import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
 import { friendlyAsrError } from "../lib/errors";
-import { LintedText, Meter, WordAlignmentView } from "../components/Meter";
+import { goPrefix } from "../lib/globalKeys";
+import { practiceKeyAction } from "../lib/keyboard";
+import {
+  DeliveryNote,
+  LintedText,
+  Meter,
+  WordAlignmentView,
+  WordScoreView,
+} from "../components/Meter";
 
 type Stage = "prompt" | "recording" | "scoring" | "feedback";
 
@@ -141,6 +149,38 @@ export function Practice(props: { announce: (msg: string) => void }) {
     }
   }, [prompt]);
 
+  // Same pattern as the review keys: the rule is pure and tested, and the
+  // listener reads current state through a ref so it never has to be
+  // re-registered — a listener rebuilt on every render is stale for exactly
+  // as long as it takes effects to flush, which is long enough to drop a
+  // keystroke.
+  const latest = useRef({ stage, prompt, asrReady, startRecording, stopAndScore, speakPrompt });
+  latest.current = { stage, prompt, asrReady, startRecording, stopAndScore, speakPrompt };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const now = latest.current;
+      const target = e.target as HTMLElement | null;
+      const action = practiceKeyAction(e.key, {
+        targetTag: target?.tagName ?? "",
+        isContentEditable: target?.isContentEditable ?? false,
+        isComposing: e.isComposing,
+        goPending: goPrefix.armed,
+        hasPrompt: now.prompt !== null,
+        recording: now.stage === "recording",
+        canRecord: now.asrReady && now.stage !== "scoring",
+      });
+      if (!action) return;
+      e.preventDefault();
+      if (action.kind === "record") void now.startRecording();
+      else if (action.kind === "stop") void now.stopAndScore();
+      else void now.speakPrompt();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
   const saveToReview = useCallback(async () => {
     if (!prompt?.target_text) return;
     try {
@@ -192,7 +232,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
           {prompt.target_text && <p class="prompt-target">{prompt.target_text}</p>}
           <div class="row">
             <button type="button" onClick={() => void speakPrompt()}>
-              Listen
+              Listen <kbd>P</kbd>
             </button>
             <button
               type="button"
@@ -213,11 +253,11 @@ export function Practice(props: { announce: (msg: string) => void }) {
             disabled={!asrReady || !prompt || stage === "scoring"}
             onClick={() => void startRecording()}
           >
-            {stage === "feedback" ? "Try again" : "Record"}
+            {stage === "feedback" ? "Try again" : "Record"} <kbd>R</kbd>
           </button>
         ) : (
           <button type="button" class="primary recording" onClick={() => void stopAndScore()}>
-            Stop
+            Stop <kbd>R</kbd>
           </button>
         )}
         {stage === "recording" && (
@@ -242,15 +282,24 @@ export function Practice(props: { announce: (msg: string) => void }) {
             <Meter label="Grammar" value={report.grammar_score} />
             <Meter
               label="Fluency"
-              value={null}
-              unmeasuredNote="Coming soon"
+              value={report.fluency?.score ?? null}
+              unmeasuredNote="Say a few more words to measure this"
             />
           </div>
+
+          {report.fluency && <DeliveryNote fluency={report.fluency} />}
 
           <h2>What you said</h2>
           <LintedText text={report.transcript} diags={report.lint.diags} />
           {report.lint.truncated && (
             <p class="muted">Only the first part was checked for grammar.</p>
+          )}
+
+          {report.pron && (
+            <>
+              <h2>How clearly you said it</h2>
+              <WordScoreView words={report.pron.words} />
+            </>
           )}
 
           {report.alignment && (
@@ -269,6 +318,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
           <p class="muted">
             Overall {report.overall} — based on {report.overall_basis.join(" and ")}.
           </p>
+          {report.pron_method === "text" && (
+            <p class="muted">
+              Pronunciation here is word-by-word matching: the close listen
+              could not run on this recording.
+            </p>
+          )}
 
           <div class="row">
             <button type="button" class="primary" onClick={() => void loadPrompt(sessionId, category)}>

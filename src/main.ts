@@ -4,6 +4,7 @@ import type { DueCard, LintDiagnostic, Rating } from "./ipc/types";
 import { concatChunks, resampleTo16k, TARGET_SAMPLE_RATE } from "./lib/audio/resample";
 import { friendlyAsrError } from "./lib/errors";
 import { formatInterval } from "./lib/interval";
+import { goPrefix } from "./lib/globalKeys";
 import { reviewKeyAction } from "./lib/keyboard";
 import { parseRating } from "./lib/rating";
 import { byteSlice } from "./lib/text/byteSlice";
@@ -877,6 +878,7 @@ function bind() {
       revealed,
       gradeRowHidden: ($("grade-row") as HTMLDivElement).hidden,
       revealHidden: ($("btn-reveal") as HTMLButtonElement).hidden,
+      goPending: goPrefix.armed,
     });
     if (!action) return;
     e.preventDefault();

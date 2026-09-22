@@ -83,7 +83,7 @@ describe("Practice", () => {
       await screen.findByText(/speech model is not installed yet/i),
     ).toBeInTheDocument();
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Record" })).toBeDisabled(),
+      expect(screen.getByRole("button", { name: /^Record/ })).toBeDisabled(),
     );
   });
 
@@ -92,7 +92,7 @@ describe("Practice", () => {
     mount(createMockIpc({ fail: { modelStatus: new Error("probe blew up") } }));
     await screen.findByText("Reply to a greeting:");
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Record" })).toBeEnabled(),
+      expect(screen.getByRole("button", { name: /^Record/ })).toBeEnabled(),
     );
   });
 

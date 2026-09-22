@@ -1,5 +1,10 @@
 import { byteSlice } from "../lib/text/byteSlice";
-import type { LintDiagnostic, WordOp } from "../ipc/types";
+import type {
+  FluencyReport,
+  LintDiagnostic,
+  WordOp,
+  WordScore,
+} from "../ipc/types";
 
 /**
  * A single score with a plain-English verdict.
@@ -91,6 +96,67 @@ export function WordAlignmentView(props: { ops: WordOp[] }) {
       })}
     </p>
   );
+}
+
+/**
+ * The target sentence again, this time with how clearly each word was said.
+ *
+ * Shown only when acoustic scoring ran. It answers a different question from
+ * the alignment above — that one says which word was wrong, this one says
+ * which word was mumbled.
+ */
+export function WordScoreView(props: { words: WordScore[] }) {
+  return (
+    <p class="alignment" aria-label="Word by word pronunciation">
+      {props.words.map((w, i) => (
+        <span
+          key={i}
+          class={`word word-gop word-${w.verdict}`}
+          title={`${w.word}: ${w.score} out of 100`}
+        >
+          {w.word}
+          <span class="word-score">{w.score}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+/**
+ * Delivery in one line of plain English.
+ *
+ * Rate is reported as articulation rate — words per minute of actual
+ * speaking — because that is the number a learner can act on. Overall wpm
+ * drops when someone pauses to think, which is not a speaking-speed problem.
+ */
+export function DeliveryNote(props: { fluency: FluencyReport }) {
+  const f = props.fluency;
+  const bits = [`${Math.round(f.articulation_wpm)} words a minute while speaking`];
+  if (f.pause_count > 0) {
+    bits.push(
+      `${f.pause_count} ${plural(f.pause_count, "pause")}, longest ${(
+        f.longest_pause_ms / 1000
+      ).toFixed(1)}s`,
+    );
+  }
+  const fillers = f.filler_count + f.hesitation_count;
+  if (fillers > 0) bits.push(`${fillers} ${plural(fillers, "filler")}`);
+  return (
+    <>
+      <p class="muted">{bits.join(" · ")}</p>
+      {f.like_count > 0 && (
+        <p class="muted">
+          You said "like" {f.like_count} {plural(f.like_count, "time")} — some of
+          those are probably the ordinary word, so this one is a hint, not a
+          count.
+        </p>
+      )}
+    </>
+  );
+}
+
+function plural(n: number, word: string): string {
+  return n === 1 ? word : `${word}s`;
 }
 
 /**

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { reviewKeyAction, type ReviewKeyContext } from "./keyboard";
+import {
+  practiceKeyAction,
+  reviewKeyAction,
+  type PracticeKeyContext,
+  type ReviewKeyContext,
+} from "./keyboard";
 
 const revealedWithGradeButtonFocused = (over: Partial<ReviewKeyContext> = {}): ReviewKeyContext => ({
   targetTag: "BUTTON",
@@ -10,6 +15,7 @@ const revealedWithGradeButtonFocused = (over: Partial<ReviewKeyContext> = {}): R
   revealed: true,
   gradeRowHidden: false,
   revealHidden: true,
+  goPending: false,
   ...over,
 });
 
@@ -21,6 +27,7 @@ const hiddenCard = (over: Partial<ReviewKeyContext> = {}): ReviewKeyContext => (
   revealed: false,
   gradeRowHidden: true,
   revealHidden: false,
+  goPending: false,
   ...over,
 });
 
@@ -77,5 +84,64 @@ describe("reviewKeyAction", () => {
     expect(reviewKeyAction("5", revealedWithGradeButtonFocused())).toBeNull();
     expect(reviewKeyAction("a", revealedWithGradeButtonFocused())).toBeNull();
     expect(reviewKeyAction("Tab", hiddenCard())).toBeNull();
+  });
+});
+
+const practising = (over: Partial<PracticeKeyContext> = {}): PracticeKeyContext => ({
+  targetTag: "BODY",
+  isContentEditable: false,
+  isComposing: false,
+  goPending: false,
+  hasPrompt: true,
+  recording: false,
+  canRecord: true,
+  ...over,
+});
+
+describe("the go prefix", () => {
+  it("stops the review keys from firing on the destination letter", () => {
+    // `g` then `r` means "go to Review". Without this both listeners see the
+    // `r`, and the route acts on it as well as the navigation.
+    expect(
+      reviewKeyAction("3", revealedWithGradeButtonFocused({ goPending: true })),
+    ).toBeNull();
+    expect(reviewKeyAction(" ", hiddenCard({ goPending: true }))).toBeNull();
+  });
+
+  it("stops the practice keys too", () => {
+    expect(practiceKeyAction("p", practising({ goPending: true }))).toBeNull();
+    expect(practiceKeyAction("r", practising({ goPending: true }))).toBeNull();
+  });
+});
+
+describe("practiceKeyAction", () => {
+  it("uses one key for both ends of a recording", () => {
+    expect(practiceKeyAction("r", practising())).toEqual({ kind: "record" });
+    expect(practiceKeyAction("R", practising({ recording: true }))).toEqual({
+      kind: "stop",
+    });
+  });
+
+  it("will not start a recording that cannot be scored", () => {
+    expect(practiceKeyAction("r", practising({ canRecord: false }))).toBeNull();
+    expect(practiceKeyAction("r", practising({ hasPrompt: false }))).toBeNull();
+  });
+
+  it("stops a recording even when recording was not otherwise allowed", () => {
+    // Whatever went wrong, the microphone must still be closable by keyboard.
+    expect(practiceKeyAction("r", practising({ recording: true, canRecord: false }))).toEqual(
+      { kind: "stop" },
+    );
+  });
+
+  it("plays the prompt on P, but never over a live recording", () => {
+    expect(practiceKeyAction("p", practising())).toEqual({ kind: "listen" });
+    expect(practiceKeyAction("p", practising({ recording: true }))).toBeNull();
+  });
+
+  it("keeps out of text entry and leaves other keys alone", () => {
+    expect(practiceKeyAction("r", practising({ targetTag: "INPUT" }))).toBeNull();
+    expect(practiceKeyAction("r", practising({ isComposing: true }))).toBeNull();
+    expect(practiceKeyAction("x", practising())).toBeNull();
   });
 });

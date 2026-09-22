@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { events } from "../ipc/events";
+import { globalKeyAction, goPrefix } from "../lib/globalKeys";
 import { navigate, route, startRouter, type Route } from "./router";
+import { KeyboardHelp } from "../components/KeyboardHelp";
 import { Practice } from "../routes/Practice";
+import { Review } from "../routes/Review";
 import { Lab } from "../routes/Lab";
 
 const NAV: Array<{ id: Route; label: string; ready: boolean }> = [
   { id: "practice", label: "Practice", ready: true },
-  { id: "review", label: "Review", ready: false },
+  { id: "review", label: "Review", ready: true },
   { id: "decks", label: "Decks", ready: false },
   { id: "progress", label: "Progress", ready: false },
   { id: "lab", label: "Lab", ready: true },
@@ -18,6 +21,7 @@ const TOAST_MS = 4000;
 
 export function App() {
   const [toast, setToast] = useState("");
+  const [helpOpen, setHelpOpen] = useState(false);
   const heading = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -58,6 +62,42 @@ export function App() {
     heading.current?.querySelector<HTMLElement>("h1")?.focus();
   }, [current]);
 
+  // The global map. Route-level shortcuts (grades, record) are handled in
+  // their own routes; anything this rule does not claim passes straight
+  // through to them.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const action = globalKeyAction(e.key, {
+        targetTag: target?.tagName ?? "",
+        isContentEditable: target?.isContentEditable ?? false,
+        isComposing: e.isComposing,
+        hasModifier: e.metaKey || e.ctrlKey || e.altKey,
+        helpOpen,
+        pendingGo: goPrefix.armed,
+      });
+      if (!action) return;
+      e.preventDefault();
+      switch (action.kind) {
+        case "go":
+          goPrefix.armed = true;
+          return;
+        case "cancel":
+          goPrefix.armed = false;
+          return;
+        case "navigate":
+          goPrefix.armed = false;
+          navigate(action.route);
+          return;
+        case "help":
+          goPrefix.armed = false;
+          setHelpOpen(action.open);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [helpOpen]);
+
   return (
     <div class="shell">
       <nav class="rail" aria-label="Main">
@@ -78,8 +118,9 @@ export function App() {
 
       <main class="content" ref={heading}>
         {current === "practice" && <Practice announce={announce} />}
+        {current === "review" && <Review announce={announce} />}
         {current === "lab" && <Lab />}
-        {current !== "practice" && current !== "lab" && (
+        {current !== "practice" && current !== "review" && current !== "lab" && (
           <section class="route">
             <h1 tabIndex={-1}>{NAV.find((n) => n.id === current)?.label}</h1>
             <p class="muted">
@@ -97,6 +138,8 @@ export function App() {
       <div class="toast" role="status" aria-live="polite">
         {toast}
       </div>
+
+      {helpOpen && <KeyboardHelp onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
