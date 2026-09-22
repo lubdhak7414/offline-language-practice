@@ -105,7 +105,7 @@ describe("Review", () => {
     fireEvent.keyDown(document, { key: " " });
     await user.click(await screen.findByRole("button", { name: /Good/ }));
     expect(await screen.findByText("Round finished")).toBeInTheDocument();
-    expect(screen.getByText("You reviewed 1 card.")).toBeInTheDocument();
+    expect(screen.getByText(/You have reviewed 1 card this session\./)).toBeInTheDocument();
     expect(screen.getByText("Good: 1")).toBeInTheDocument();
   });
 

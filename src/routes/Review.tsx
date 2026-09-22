@@ -198,8 +198,14 @@ export function Review(props: { announce: (msg: string) => void }) {
           <h2>{reviewed > 0 ? "Round finished" : "Nothing due"}</h2>
           {reviewed > 0 ? (
             <>
+              {/*
+                The tally is not cleared by "Check again", so this counts the
+                whole sitting rather than the last round — which is the
+                number worth reporting, as long as the wording says so.
+              */}
               <p>
-                You reviewed {reviewed} {reviewed === 1 ? "card" : "cards"}.
+                You have reviewed {reviewed} {reviewed === 1 ? "card" : "cards"}{" "}
+                this session.
               </p>
               <ul class="tally">
                 {GRADES.map((g) => (
