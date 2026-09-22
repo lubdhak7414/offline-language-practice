@@ -92,7 +92,10 @@ jobs:
           command: check
 
   rust:
-    runs-on: ubuntu-latest
+    # Pinned to match the build matrix, so the job that gates merges and the
+    # jobs that produce artifacts agree on the image. NOT the glibc floor: that
+    # only binds downward, and ubuntu-latest never moves backwards.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       # espeak-ng's vendored data compiler truncates paths through a small

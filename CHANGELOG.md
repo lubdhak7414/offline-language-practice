@@ -14,6 +14,16 @@ Notable changes to this project. The format follows
   reported as speaking slowly. Timings are now used only when what was said
   lines up word for word with the prompt; otherwise pauses are measured from
   the audio itself.
+- **Release builds are verifiable even when a platform fails to build.**
+  Checksums and build provenance are now produced for whatever did build,
+  and the release run is marked failed so an incomplete set is not published
+  by mistake.
+
+### Changed
+
+- Release builds cover Linux (x86_64), macOS (Apple Silicon) and Windows
+  (x86_64). Intel Macs are not supported: the ONNX Runtime binding ships no
+  prebuilt library for them.
 
 ## [0.1.0] — 2026-09-22
 

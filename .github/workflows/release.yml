@@ -72,9 +72,14 @@ jobs:
           - os: macos-14
             label: macos-aarch64
             target_dir: /tmp/cargo-target
-          - os: macos-13
-            label: macos-x86_64
-            target_dir: /tmp/cargo-target
+          # No Intel macOS leg. `ort` publishes no prebuilt ONNX Runtime for
+          # x86_64-apple-darwin — its build script stops with "ort does not
+          # provide prebuilt binaries for the target" — so that leg could only
+          # ever fail, and a permanently failing leg would turn every release
+          # run red. Supporting Intel Macs means compiling ONNX Runtime from
+          # source on that runner (see https://ort.pyke.io/setup/linking).
+          # The retired `macos-13` label it used would not have been scheduled
+          # anyway; the Intel runners are `macos-15-intel` / `macos-26-intel`.
           # espeak-ng's data compiler truncates paths through a fixed-size
           # buffer and the default workspace path is already long.
           - os: windows-latest
@@ -128,7 +133,7 @@ jobs:
           workspaces: "src-tauri"
           key: release-${{ matrix.os }}
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -137,6 +142,10 @@ jobs:
           releaseName: "v__VERSION__"
           releaseDraft: true
           prerelease: false
+          # The updater stays off until 1.0 (no signing key, no endpoint), and
+          # v1 of this action uploads a latest.json by default. Say no rather
+          # than rely on it quietly doing nothing without signatures.
+          uploadUpdaterJson: false
           # Code signing is deliberately not configured — see SECURITY.md.
           # Unsigned artifacts plus published checksums and build
           # provenance is an honest position; a self-signed certificate
@@ -188,6 +197,13 @@ jobs:
   # than per job where they could silently cover only part of the set.
   attest:
     needs: build
+    # Not the default `success()`. With fail-fast off, tauri-action has already
+    # uploaded every good platform's binaries to the draft by the time one leg
+    # fails; skipping this job would leave them there with no checksums and no
+    # provenance, under a release body telling people to verify against both.
+    # So: run over whatever built, then fail the run (last step) so a partial
+    # set is loud. `skipped` means the version check failed and nothing built.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -201,11 +217,24 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # `subject-path` fails on a glob that matches nothing, with an error that
+      # does not say why. Say why.
+      - name: Require at least one bundle
+        shell: bash
+        run: |
+          count=$(find dist -maxdepth 1 -type f 2>/dev/null | wc -l)
+          echo "bundles to attest: $count"
+          ls -l dist || true
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No bundles were produced; nothing to checksum or attest."
+            exit 1
+          fi
+
       # Before SHA256SUMS is written, so the subjects are exactly the
       # release binaries. Attesting the artifacts rather than only the
       # checksum file matters: provenance over a list of hashes proves
       # where the list came from, not where the binaries came from.
-      - uses: actions/attest-build-provenance@v1
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*"
 
@@ -222,3 +251,12 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           draft: true
           files: dist/SHA256SUMS
+
+      # The draft now carries correct checksums and provenance for the
+      # platforms that built — and only those. End red, so nobody publishes a
+      # partial release believing a green tick covered all four.
+      - name: Fail the run if the platform set is incomplete
+        if: ${{ needs.build.result != 'success' }}
+        run: |
+          echo "::error::build result was '${{ needs.build.result }}'. SHA256SUMS and provenance cover only the platforms that built. Re-run the failed jobs (this one re-runs with them) before publishing."
+          exit 1

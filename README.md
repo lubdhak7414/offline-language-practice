@@ -47,6 +47,8 @@ Either way the files are pinned to immutable upstream commits and verified by sh
 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
 ```
 
+**Intel Macs are not supported yet.** The ONNX Runtime binding ships no prebuilt library for `x86_64-apple-darwin`, so an Intel build needs ONNX Runtime compiled from source and linked in (see the `ort` linking guide). Apple Silicon Macs work.
+
 ## Tech stack
 
 | Layer | Tech |
@@ -68,7 +70,7 @@ cd src-tauri && cargo build --release
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt`, `cargo clippy -D warnings` and `cargo test` on every push, compiles on Linux, macOS and Windows, audits dependencies with `cargo-deny`, and checks that `package.json`, `tauri.conf.json` and `Cargo.toml` agree on the version and that the release icon set exists.
 
-Tagging `v*` builds every platform and opens a **draft** GitHub release with `SHA256SUMS` and build provenance attached (`.github/workflows/release.yml`). Binaries are not code-signed — SECURITY.md explains why and how to verify them instead.
+Tagging `v*` builds Linux (x86_64), macOS (Apple Silicon) and Windows (x86_64) and opens a **draft** GitHub release with `SHA256SUMS` and build provenance attached (`.github/workflows/release.yml`). Binaries are not code-signed — SECURITY.md explains why and how to verify them instead.
 
 See CONTRIBUTING.md for the house rules, which exist because breaking them has already cost real debugging time.
 
