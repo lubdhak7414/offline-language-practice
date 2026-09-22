@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           # jsdom 30 (via vitest) needs ^22.22.2 || ^24.15.0 || >=26; on
           # Node 20 its bundled undici throws
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Version triple check (package.json, tauri.conf.json, Cargo.toml)
         run: |
           PKG_VER=$(jq -r .version package.json)
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Icon presence check (.icns/.ico)
         run: |
           MISSING=0
@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: src-tauri/Cargo.toml
@@ -103,7 +103,7 @@ jobs:
       # the repo name) is long enough to overflow it. Keep the build dir short.
       CARGO_TARGET_DIR: /tmp/cargo-target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # espeak (pulled in by the TTS backend) needs cmake at build time.
       # ubuntu-latest runners ship cmake; this is a sanity check only (no apt install).
       - run: cmake --version
@@ -160,7 +160,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: ${{ matrix.cargo_target_dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Tauri Linux build dependencies
         if: runner.os == 'Linux'
         run: |
