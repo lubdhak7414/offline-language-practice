@@ -85,6 +85,21 @@ describe("reviewKeyAction", () => {
     expect(reviewKeyAction("a", revealedWithGradeButtonFocused())).toBeNull();
     expect(reviewKeyAction("Tab", hiddenCard())).toBeNull();
   });
+
+  it("undoes on u, even with no card loaded", () => {
+    // Undo restores the just-graded card, so it must work right after the
+    // queue empties out — that is exactly when someone reaches for it.
+    expect(reviewKeyAction("u", hiddenCard({ hasCard: false }))).toEqual({
+      kind: "undo",
+    });
+    expect(reviewKeyAction("U", revealedWithGradeButtonFocused())).toEqual({
+      kind: "undo",
+    });
+  });
+
+  it("never hijacks u while typing", () => {
+    expect(reviewKeyAction("u", hiddenCard({ targetTag: "INPUT" }))).toBeNull();
+  });
 });
 
 const practising = (over: Partial<PracticeKeyContext> = {}): PracticeKeyContext => ({

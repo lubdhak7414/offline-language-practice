@@ -60,7 +60,11 @@ describe("Review", () => {
     await waitFor(() =>
       expect(mock.calls.filter((c) => c.name === "gradeCard")).toHaveLength(1),
     );
-    expect(mock.calls.find((c) => c.name === "gradeCard")?.args).toEqual(["c1", 3]);
+    expect(mock.calls.find((c) => c.name === "gradeCard")?.args).toEqual([
+      "c1",
+      3,
+      expect.any(Number),
+    ]);
     expect(await screen.findByText("second front")).toBeInTheDocument();
   });
 
@@ -125,5 +129,29 @@ describe("Review", () => {
     const log = await screen.findByRole("log");
     await waitFor(() => expect(log).toHaveTextContent("Good: first front"));
     expect(screen.getAllByRole("log")).toHaveLength(1);
+  });
+
+  it("undoes the last grade on u and re-fetches the queue", async () => {
+    const mock = twoCards();
+    mount(mock);
+    await screen.findByText("first front");
+    fireEvent.keyDown(document, { key: " " });
+    fireEvent.click(await screen.findByRole("button", { name: /Good/ }));
+    await screen.findByText("second front");
+
+    fireEvent.keyDown(document, { key: "u" });
+    await waitFor(() =>
+      expect(mock.calls.some((c) => c.name === "undoReview")).toBe(true),
+    );
+    // Undo re-fetches the due queue, so the restored card is due again.
+    await waitFor(() =>
+      expect(mock.calls.filter((c) => c.name === "dueCards")).toHaveLength(2),
+    );
+  });
+
+  it("does not offer undo before anything has been graded", async () => {
+    mount(twoCards());
+    await screen.findByText("first front");
+    expect(screen.queryByRole("button", { name: /Undo/ })).not.toBeInTheDocument();
   });
 });

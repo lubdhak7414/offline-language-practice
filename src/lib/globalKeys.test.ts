@@ -39,6 +39,10 @@ describe("globalKeyAction", () => {
       kind: "navigate",
       route: "progress",
     });
+    expect(globalKeyAction(",", ctx({ pendingGo: true }))).toEqual({
+      kind: "navigate",
+      route: "settings",
+    });
   });
 
   it("always consumes the prefix, even on a mistyped destination", () => {

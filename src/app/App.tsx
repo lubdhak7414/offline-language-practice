@@ -6,14 +6,16 @@ import { navigate, route, startRouter, type Route } from "./router";
 import { KeyboardHelp } from "../components/KeyboardHelp";
 import { Practice } from "../routes/Practice";
 import { Review } from "../routes/Review";
-import { Lab } from "../routes/Lab";
+import { Decks } from "../routes/Decks";
+import { Progress } from "../routes/Progress";
+import { Settings } from "../routes/Settings";
 
 const NAV: Array<{ id: Route; label: string; ready: boolean }> = [
   { id: "practice", label: "Practice", ready: true },
   { id: "review", label: "Review", ready: true },
-  { id: "decks", label: "Decks", ready: false },
-  { id: "progress", label: "Progress", ready: false },
-  { id: "lab", label: "Lab", ready: true },
+  { id: "decks", label: "Decks", ready: true },
+  { id: "progress", label: "Progress", ready: true },
+  { id: "settings", label: "Settings", ready: true },
 ];
 
 /** How long a transient announcement stays on screen. */
@@ -119,16 +121,9 @@ export function App() {
       <main class="content" ref={heading}>
         {current === "practice" && <Practice announce={announce} />}
         {current === "review" && <Review announce={announce} />}
-        {current === "lab" && <Lab />}
-        {current !== "practice" && current !== "review" && current !== "lab" && (
-          <section class="route">
-            <h1 tabIndex={-1}>{NAV.find((n) => n.id === current)?.label}</h1>
-            <p class="muted">
-              This screen is still being built. Everything it will do is
-              available on the Lab screen in the meantime.
-            </p>
-          </section>
-        )}
+        {current === "decks" && <Decks announce={announce} />}
+        {current === "progress" && <Progress />}
+        {current === "settings" && <Settings announce={announce} />}
       </main>
 
       {/*

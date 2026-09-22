@@ -1,5 +1,70 @@
 /* App shell: nav rail, routes, and the practice screen. */
 
+/*
+ * General-purpose primitives every route reaches for. These used to live in
+ * the harness-only `styles.css`; they are not harness-specific at all, so
+ * they moved here when the Lab was retired rather than being deleted.
+ */
+.row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin: var(--space-2) 0;
+}
+
+/* A colour, not an opacity: see the note in tokens.css. */
+.muted {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.error {
+  color: var(--danger);
+}
+
+button {
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  cursor: pointer;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  transition: background var(--duration) var(--ease);
+}
+
+button:hover:not(:disabled) {
+  background: var(--bg-sunken);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="range"],
+select,
+textarea {
+  padding: var(--space-2);
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+label {
+  font-size: var(--text-sm);
+}
+
 .shell {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
@@ -516,4 +581,159 @@ kbd {
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* ─── Decks, Progress, Settings ──────────────────────────────────────────
+   These three screens carry more content than a phone-width column, so they
+   opt out of the 720px cap the other routes use. */
+.route-wide {
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.output {
+  white-space: pre-wrap;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  min-height: 48px;
+}
+
+.deck-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-4) 0;
+}
+
+.deck-item {
+  flex: 1;
+  text-align: left;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+}
+.deck-item-active {
+  background: var(--bg-sunken);
+  font-weight: 600;
+}
+
+.confirm-panel {
+  border: 2px solid var(--danger);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  margin: var(--space-4) 0;
+  background: var(--bg-raised);
+}
+
+.cards-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: var(--space-4) 0;
+}
+.cards-table th,
+.cards-table td {
+  border: 1px solid var(--border);
+  padding: var(--space-2);
+  font-size: var(--text-sm);
+  text-align: left;
+  vertical-align: top;
+}
+.cards-table thead th {
+  background: var(--bg-sunken);
+}
+
+.settings-section {
+  border-top: 1px solid var(--border);
+  padding: var(--space-4) 0;
+}
+.settings-section:first-of-type {
+  border-top: none;
+}
+.settings-section h2 {
+  font-size: var(--text-lg);
+  margin: 0 0 var(--space-2);
+}
+
+.diagnostics-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-4) 0;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--bg-raised);
+}
+.tile-label {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+}
+.tile-value {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.charts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.chart {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--bg-raised);
+}
+.chart figcaption {
+  font-weight: 600;
+  margin-bottom: var(--space-2);
+}
+.chart svg {
+  width: 100%;
+  height: auto;
+}
+.chart-bar {
+  fill: var(--accent);
+}
+.chart-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.chart-dot {
+  fill: var(--accent);
+}
+
+/* ─── Practice: the standalone grammar check ─────────────────────────────
+   The one thing the retired Lab was the only home for. Kept compact and out
+   of the way, at the bottom of the screen. */
+.check-writing {
+  margin-top: var(--space-6);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-3);
+}
+.check-writing summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.check-writing textarea {
+  margin-top: var(--space-2);
 }

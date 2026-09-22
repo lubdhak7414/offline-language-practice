@@ -6,25 +6,41 @@
  * and the UI can be tested against `mock.ts` with no host.
  */
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 import type {
   AttemptReport,
   AttemptRow,
-  CardItem,
-  Deck,
+  BackupInfo,
+  BackupResult,
+  CardRow,
+  DailyLimits,
+  DayCount,
+  DeckRow,
   DueCard,
   DueCardsArgs,
+  ExportDataArgs,
+  ExportResult,
+  ForecastDay,
+  ImportDataArgs,
+  ImportSummary,
   Ipc,
   LintDiagnostic,
   LintReport,
   DeckDeleteMode,
   ModelStatus,
   NextPromptArgs,
+  Overview,
+  Preferences,
   PromptView,
   Rating,
+  RetentionBucket,
   ScoreAttemptArgs,
+  SetDailyLimitsArgs,
   RecentReview,
   ReviewStats,
+  TagRow,
+  UndoResult,
   VoiceInfo,
 } from "./types";
 
@@ -68,14 +84,21 @@ export const tauriIpc: Ipc = {
   dueCards(args: DueCardsArgs) {
     // `deckId: undefined` and an absent key are not the same over IPC, so
     // "all decks" omits the key rather than sending an empty string.
-    return invoke<DueCard[]>(
-      "due_cards",
-      args.deckId ? { limit: args.limit, deckId: args.deckId } : { limit: args.limit },
-    );
+    return invoke<DueCard[]>("due_cards", {
+      limit: args.limit,
+      ...(args.deckId ? { deckId: args.deckId } : {}),
+      ...(args.tzOffsetMinutes !== undefined
+        ? { tzOffsetMinutes: args.tzOffsetMinutes }
+        : {}),
+    });
   },
 
-  gradeCard(cardId: string, rating: Rating) {
-    return invoke<DueCard | null>("grade_card", { cardId, rating });
+  gradeCard(cardId: string, rating: Rating, tzOffsetMinutes?: number) {
+    return invoke<DueCard | null>("grade_card", {
+      cardId,
+      rating,
+      ...(tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {}),
+    });
   },
 
   recentReviews(limit: number) {
@@ -99,11 +122,11 @@ export const tauriIpc: Ipc = {
   },
 
   listDecks() {
-    return invoke<Deck[]>("list_decks", {});
+    return invoke<DeckRow[]>("list_decks", {});
   },
 
   listCards(deckId?: string) {
-    return invoke<CardItem[]>("list_cards", deckId ? { deckId } : {});
+    return invoke<CardRow[]>("list_cards", deckId ? { deckId } : {});
   },
 
   addCard(deckId: string, front: string, back: string) {
@@ -178,6 +201,130 @@ export const tauriIpc: Ipc = {
 
   epReport() {
     return invoke<string>("ep_report");
+  },
+
+  undoReview() {
+    return invoke<UndoResult | null>("undo_review", {});
+  },
+
+  listTags() {
+    return invoke<TagRow[]>("list_tags", {});
+  },
+
+  setCardTags(cardId: string, tags: string[]) {
+    return invoke<string[]>("set_card_tags", { cardId, tags });
+  },
+
+  suspendCard(cardId: string, suspended: boolean) {
+    return invoke<void>("suspend_card", { cardId, suspended });
+  },
+
+  buryCard(cardId: string, hours?: number) {
+    return invoke<number>("bury_card", {
+      cardId,
+      ...(hours !== undefined ? { hours } : {}),
+    });
+  },
+
+  getPreferences() {
+    return invoke<Preferences>("get_preferences", {});
+  },
+
+  setPreferences(prefs: Preferences) {
+    return invoke<Preferences>("set_preferences", { prefs });
+  },
+
+  getDailyLimits(deckId?: string) {
+    return invoke<DailyLimits>("get_daily_limits", deckId ? { deckId } : {});
+  },
+
+  setDailyLimits(args: SetDailyLimitsArgs) {
+    return invoke<DailyLimits>("set_daily_limits", {
+      ...(args.deckId ? { deckId: args.deckId } : {}),
+      newPerDay: args.newPerDay,
+      reviewPerDay: args.reviewPerDay,
+    });
+  },
+
+  exportData(args: ExportDataArgs) {
+    return invoke<ExportResult>("export_data", {
+      ...(args.deckId ? { deckId: args.deckId } : {}),
+      path: args.path,
+      format: args.format,
+    });
+  },
+
+  importData(args: ImportDataArgs) {
+    return invoke<ImportSummary>("import_data", {
+      path: args.path,
+      ...(args.deckId ? { deckId: args.deckId } : {}),
+    });
+  },
+
+  backupDatabase(path: string) {
+    return invoke<BackupResult>("backup_database", { path });
+  },
+
+  restoreDatabase(path: string) {
+    return invoke<BackupInfo>("restore_database", { path });
+  },
+
+  statsOverview(tzOffsetMinutes?: number) {
+    return invoke<Overview>(
+      "stats_overview",
+      tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {},
+    );
+  },
+
+  statsDaily(days: number, tzOffsetMinutes?: number) {
+    return invoke<DayCount[]>("stats_daily", {
+      days,
+      ...(tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {}),
+    });
+  },
+
+  statsForecast(days: number, tzOffsetMinutes?: number) {
+    return invoke<ForecastDay[]>("stats_forecast", {
+      days,
+      ...(tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {}),
+    });
+  },
+
+  statsRetention(days: number, bucketDays: number, tzOffsetMinutes?: number) {
+    return invoke<RetentionBucket[]>("stats_retention", {
+      days,
+      bucketDays,
+      ...(tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {}),
+    });
+  },
+
+  getVoice() {
+    return invoke<string>("get_voice", {});
+  },
+
+  setVoice(voiceId: string) {
+    return invoke<string>("set_voice", { voiceId });
+  },
+
+  // Dialogs live inside `ipc/` for the same reason `@tauri-apps/api` does:
+  // nothing outside this module may reach for a native picker directly.
+  async pickOpenPath(opts: { title: string; extensions: string[] }) {
+    const result = await open({
+      title: opts.title,
+      multiple: false,
+      directory: false,
+      filters: [{ name: opts.title, extensions: opts.extensions }],
+    });
+    return typeof result === "string" ? result : null;
+  },
+
+  async pickSavePath(opts: { title: string; defaultName: string; extensions: string[] }) {
+    const result = await save({
+      title: opts.title,
+      defaultPath: opts.defaultName,
+      filters: [{ name: opts.title, extensions: opts.extensions }],
+    });
+    return result ?? null;
   },
 };
 

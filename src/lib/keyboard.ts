@@ -22,7 +22,10 @@ export type ReviewKeyContext = {
   goPending: boolean;
 };
 
-export type ReviewKeyAction = { kind: "grade"; rating: Rating } | { kind: "reveal" };
+export type ReviewKeyAction =
+  | { kind: "grade"; rating: Rating }
+  | { kind: "reveal" }
+  | { kind: "undo" };
 
 /** Elements whose own keyboard behaviour must never be hijacked. */
 const TEXT_ENTRY = new Set(["INPUT", "SELECT", "TEXTAREA", "AUDIO"]);
@@ -34,7 +37,9 @@ export function reviewKeyAction(
   if (TEXT_ENTRY.has(ctx.targetTag) || ctx.isContentEditable || ctx.isComposing) {
     return null;
   }
-  if (ctx.goPending || !ctx.hasCard) return null;
+  if (ctx.goPending) return null;
+  if (key.toLowerCase() === "u") return { kind: "undo" };
+  if (!ctx.hasCard) return null;
 
   const rating = parseRating(key);
   if (rating) {

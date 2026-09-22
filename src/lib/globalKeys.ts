@@ -49,14 +49,15 @@ const TEXT_ENTRY = new Set(["INPUT", "SELECT", "TEXTAREA", "AUDIO"]);
  *
  * `p` is Practice and `s` is "stats" for Progress, because both routes start
  * with a P and a shortcut that depends on remembering which one won is not a
- * shortcut.
+ * shortcut. Settings takes `,` (as in many editors' "go to preferences")
+ * since every letter that reads as "settings" is already spoken for.
  */
 const GO_TARGETS: Record<string, Route> = {
   p: "practice",
   r: "review",
   d: "decks",
   s: "progress",
-  l: "lab",
+  ",": "settings",
 };
 
 export function globalKeyAction(
@@ -87,12 +88,14 @@ export function globalKeyAction(
 export const KEY_HELP: Array<{ keys: string; what: string }> = [
   { keys: "1 – 4", what: "Grade the card you are reviewing" },
   { keys: "Space", what: "Show the answer" },
+  { keys: "U", what: "Undo the last grade" },
   { keys: "R", what: "Start or stop recording" },
   { keys: "P", what: "Play the prompt aloud" },
   { keys: "G then P", what: "Go to Practice" },
   { keys: "G then R", what: "Go to Review" },
   { keys: "G then D", what: "Go to Decks" },
   { keys: "G then S", what: "Go to Progress" },
+  { keys: "G then ,", what: "Go to Settings" },
   { keys: "?", what: "Show this list" },
   { keys: "Esc", what: "Close this list" },
 ];

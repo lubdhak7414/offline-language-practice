@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
-import type { AttemptReport, PromptView } from "../ipc/types";
+import type { AttemptReport, LintReport, PromptView } from "../ipc/types";
 import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
 import { friendlyAsrError } from "../lib/errors";
 import { goPrefix } from "../lib/globalKeys";
@@ -34,6 +34,29 @@ export function Practice(props: { announce: (msg: string) => void }) {
   const [asrReady, setAsrReady] = useState(true);
   const recorder = useRef(createRecorder());
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+
+  // The Lab's one irreplaceable feature: checking arbitrary writing, not
+  // just a transcript. Kept small and out of the way in a <details> panel so
+  // it does not compete with the practice flow above it.
+  const [checkText, setCheckText] = useState("");
+  const [checkLint, setCheckLint] = useState<LintReport | null>(null);
+  const [checking, setChecking] = useState(false);
+  const checkingRef = useRef(false);
+
+  const runCheck = useCallback(async () => {
+    if (checkingRef.current || checkText.trim() === "") return;
+    checkingRef.current = true;
+    setChecking(true);
+    try {
+      const lint = await ipc().lintText(checkText);
+      setCheckLint(lint);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      checkingRef.current = false;
+      setChecking(false);
+    }
+  }, [checkText]);
 
   const loadPrompt = useCallback(
     async (session: string | undefined, cat: string) => {
@@ -337,6 +360,36 @@ export function Practice(props: { announce: (msg: string) => void }) {
           </div>
         </article>
       )}
+
+      <details class="check-writing">
+        <summary>Check writing</summary>
+        <div class="row">
+          <textarea
+            value={checkText}
+            onInput={(e) => setCheckText((e.target as HTMLTextAreaElement).value)}
+            placeholder="Paste or type anything to check its grammar…"
+            rows={4}
+          />
+        </div>
+        <div class="row">
+          <button
+            type="button"
+            disabled={checking || checkText.trim() === ""}
+            onClick={() => void runCheck()}
+          >
+            Check
+          </button>
+        </div>
+        {checkLint && (
+          <>
+            <LintedText text={checkText} diags={checkLint.diags} />
+            {checkLint.truncated && (
+              <p class="muted">Only the first part was checked.</p>
+            )}
+            {checkLint.diags.length === 0 && <p class="muted">No issues found.</p>}
+          </>
+        )}
+      </details>
     </section>
   );
 }

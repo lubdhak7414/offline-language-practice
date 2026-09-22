@@ -27,13 +27,30 @@ export type LintReport = {
   truncated: boolean;
 };
 
-export type Deck = { id: string; name: string };
+/**
+ * A deck row. Grew counts in Phase 4 so Decks.tsx can show them without a
+ * second round trip per deck.
+ */
+export type DeckRow = {
+  id: string;
+  name: string;
+  card_count: number;
+  due_count: number;
+  new_count: number;
+};
 
-export type CardItem = {
+/**
+ * A card row. Grew tags and flags in Phase 4 — see `DeckRow` for the same
+ * reasoning.
+ */
+export type CardRow = {
   id: string;
   deck_id: string;
   front: string;
   back: string;
+  tags: string[];
+  suspended: boolean;
+  buried_until: number;
 };
 
 export type ReviewStats = {
@@ -207,7 +224,82 @@ export type NextPromptArgs = {
 /** What happens to a deck's cards when the deck is deleted. */
 export type DeckDeleteMode = "move" | "delete";
 
-export type DueCardsArgs = { limit: number; deckId?: string };
+export type DueCardsArgs = {
+  limit: number;
+  deckId?: string;
+  /** `-new Date().getTimezoneOffset()`. See `lib/tz`. */
+  tzOffsetMinutes?: number;
+};
+
+// ─── Shared contracts (Phase 4) ─────────────────────────────────────────
+//
+// These mirror `#[derive(serde::Serialize)]` structs in the Rust backend
+// verbatim: plain snake_case fields, no rename attributes. Two backend
+// streams (B1, B2) produce these; this file is the seam they must match.
+
+export type Preferences = {
+  dialect: string;
+  theme: string;
+  day_cutoff_hour: number;
+  tts_voice: string;
+  new_per_day: number;
+  review_per_day: number;
+  bury_hours: number;
+};
+
+export type DailyLimits = {
+  deck_id: string | null;
+  new_per_day: number;
+  review_per_day: number;
+};
+
+export type TagRow = { id: string; name: string; card_count: number };
+
+export type UndoResult = { card_id: string; front: string; rating: number };
+
+export type Overview = {
+  total_reviews: number;
+  reviews_today: number;
+  streak_days: number;
+  cards_total: number;
+  cards_new: number;
+  cards_learning: number;
+  cards_mature: number;
+  /** `null` on an empty database — never a fabricated 0. */
+  retention_30d: number | null;
+  practice_ms_30d: number;
+  attempts_total: number;
+};
+
+/** `day` is the bucket's start, unix **seconds**. */
+export type DayCount = { day: number; reviews: number; again: number };
+
+export type ForecastDay = { day: number; due: number };
+
+export type RetentionBucket = { day: number; n: number; ok: number; rate: number };
+
+export type ExportFormat = "json" | "csv" | "tsv";
+
+export type ImportSummary = {
+  decks_created: number;
+  cards_created: number;
+  cards_updated: number;
+  reviews_imported: number;
+  skipped: number;
+  warnings: string[];
+};
+
+export type ExportResult = { path: string; cards: number; bytes: number };
+export type BackupResult = { path: string; bytes: number };
+export type BackupInfo = { cards: number; reviews: number; decks: number };
+
+export type ExportDataArgs = { deckId?: string; path: string; format: ExportFormat };
+export type ImportDataArgs = { path: string; deckId?: string };
+export type SetDailyLimitsArgs = {
+  deckId?: string;
+  newPerDay: number;
+  reviewPerDay: number;
+};
 
 /**
  * Every backend command, in one place.
@@ -234,19 +326,63 @@ export type Ipc = {
 
   // --- review ---
   dueCards(args: DueCardsArgs): Promise<DueCard[]>;
-  gradeCard(cardId: string, rating: Rating): Promise<DueCard | null>;
+  gradeCard(
+    cardId: string,
+    rating: Rating,
+    tzOffsetMinutes?: number,
+  ): Promise<DueCard | null>;
   recentReviews(limit: number): Promise<RecentReview[]>;
   reviewStats(): Promise<ReviewStats>;
   optimizeParameters(): Promise<number[]>;
   getRetention(): Promise<number>;
   setRetention(retention: number): Promise<number>;
+  undoReview(): Promise<UndoResult | null>;
 
   // --- content ---
-  listDecks(): Promise<Deck[]>;
-  listCards(deckId?: string): Promise<CardItem[]>;
+  listDecks(): Promise<DeckRow[]>;
+  listCards(deckId?: string): Promise<CardRow[]>;
   addCard(deckId: string, front: string, back: string): Promise<string>;
   deleteCard(cardId: string): Promise<void>;
   seedDemoDeck(): Promise<number>;
+  listTags(): Promise<TagRow[]>;
+  setCardTags(cardId: string, tags: string[]): Promise<string[]>;
+  suspendCard(cardId: string, suspended: boolean): Promise<void>;
+  /** `hours` omitted or 0 clears the bury. Returns the new `buried_until`. */
+  buryCard(cardId: string, hours?: number): Promise<number>;
+
+  // --- preferences & caps ---
+  getPreferences(): Promise<Preferences>;
+  setPreferences(prefs: Preferences): Promise<Preferences>;
+  getDailyLimits(deckId?: string): Promise<DailyLimits>;
+  setDailyLimits(args: SetDailyLimitsArgs): Promise<DailyLimits>;
+
+  // --- data safety ---
+  exportData(args: ExportDataArgs): Promise<ExportResult>;
+  importData(args: ImportDataArgs): Promise<ImportSummary>;
+  backupDatabase(path: string): Promise<BackupResult>;
+  restoreDatabase(path: string): Promise<BackupInfo>;
+
+  // --- stats ---
+  statsOverview(tzOffsetMinutes?: number): Promise<Overview>;
+  statsDaily(days: number, tzOffsetMinutes?: number): Promise<DayCount[]>;
+  statsForecast(days: number, tzOffsetMinutes?: number): Promise<ForecastDay[]>;
+  statsRetention(
+    days: number,
+    bucketDays: number,
+    tzOffsetMinutes?: number,
+  ): Promise<RetentionBucket[]>;
+
+  // --- voice ---
+  getVoice(): Promise<string>;
+  setVoice(voiceId: string): Promise<string>;
+
+  // --- dialogs (native file pickers, via @tauri-apps/plugin-dialog) ---
+  pickOpenPath(opts: { title: string; extensions: string[] }): Promise<string | null>;
+  pickSavePath(opts: {
+    title: string;
+    defaultName: string;
+    extensions: string[];
+  }): Promise<string | null>;
 
   // --- practice loop ---
   startSession(kind: string): Promise<string>;

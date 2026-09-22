@@ -47,32 +47,53 @@ describe("Ipc implementations", () => {
     expect(methods.sort()).toEqual(
       [
         "addCard",
+        "backupDatabase",
+        "buryCard",
         "createDeck",
         "deleteCard",
         "deleteDeck",
         "dueCards",
         "endSession",
         "epReport",
+        "exportData",
+        "getDailyLimits",
+        "getPreferences",
         "getRetention",
+        "getVoice",
         "gradeCard",
+        "importData",
         "lintText",
         "listAttempts",
         "listCards",
         "listDecks",
+        "listTags",
         "listVoices",
         "modelStatus",
         "nextPrompt",
         "optimizeParameters",
+        "pickOpenPath",
+        "pickSavePath",
         "recentReviews",
         "renameDeck",
+        "restoreDatabase",
         "reviewStats",
         "scoreAttempt",
         "seedDemoDeck",
         "seedPrompts",
+        "setCardTags",
+        "setDailyLimits",
+        "setPreferences",
         "setRetention",
+        "setVoice",
         "startSession",
+        "statsDaily",
+        "statsForecast",
+        "statsOverview",
+        "statsRetention",
+        "suspendCard",
         "synthesizeSpeech",
         "transcribePcm",
+        "undoReview",
         "updateCard",
       ].sort(),
     );
@@ -91,10 +112,14 @@ describe("setIpc", () => {
 
 describe("mock backend", () => {
   it("records calls and keeps state across them", async () => {
-    const mock = createMockIpc();
+    // An empty seed, not the default fixture deck: this test is about call
+    // recording and persistence, not the realistic sample data.
+    const mock = createMockIpc({ decks: [{ id: "default", name: "Default" }], cards: [] });
     const id = await mock.addCard("default", "front", "back");
     const cards = await mock.listCards("default");
-    expect(cards).toEqual([{ id, deck_id: "default", front: "front", back: "back" }]);
+    expect(cards).toEqual([
+      { id, deck_id: "default", front: "front", back: "back", tags: [], suspended: false, buried_until: 0 },
+    ]);
     expect(mock.calls.map((c) => c.name)).toEqual(["addCard", "listCards"]);
   });
 

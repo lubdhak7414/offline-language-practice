@@ -5,6 +5,7 @@ import type { DueCard, Rating } from "../ipc/types";
 import { formatInterval } from "../lib/interval";
 import { goPrefix } from "../lib/globalKeys";
 import { reviewKeyAction } from "../lib/keyboard";
+import { tzOffsetMinutes } from "../lib/tz";
 
 /**
  * How many due cards to fetch at once.
@@ -40,6 +41,9 @@ export function Review(props: { announce: (msg: string) => void }) {
   // read the state from their own closure and both see `false`. The button
   // going disabled is the visible half of the guard; this is the real one.
   const grading = useRef(false);
+  // Same reasoning, separate guard: undo and grade are different backend
+  // calls, so one busy flag cannot cover both without one blocking the other.
+  const undoing = useRef(false);
 
   const card = queue[index];
   const finished = !loading && !card;
@@ -48,7 +52,10 @@ export function Review(props: { announce: (msg: string) => void }) {
     setLoading(true);
     setError(null);
     try {
-      const cards = await ipc().dueCards({ limit: REVIEW_QUEUE_SIZE });
+      const cards = await ipc().dueCards({
+        limit: REVIEW_QUEUE_SIZE,
+        tzOffsetMinutes: tzOffsetMinutes(),
+      });
       setQueue(cards);
       setIndex(0);
       setRevealed(false);
@@ -82,7 +89,7 @@ export function Review(props: { announce: (msg: string) => void }) {
       grading.current = true;
       setBusy(true);
       try {
-        const replacement = await ipc().gradeCard(card.id, rating);
+        const replacement = await ipc().gradeCard(card.id, rating, tzOffsetMinutes());
         const label = GRADES.find((g) => g.rating === rating)?.label ?? "";
         setTally((t) => ({ ...t, [rating]: t[rating] + 1 }));
         setLog((l) => [...l, `${label}: ${firstLine(card.front)}`]);
@@ -105,12 +112,36 @@ export function Review(props: { announce: (msg: string) => void }) {
     [announce, card, index, revealed],
   );
 
+  // Restoring the exact card and its position is the backend's job (the undo
+  // row remembers the prior FSRS state); the frontend's job is just to ask
+  // for the queue again so the restored card shows back up in it.
+  const undo = useCallback(async () => {
+    if (undoing.current) return;
+    undoing.current = true;
+    try {
+      const result = await ipc().undoReview();
+      if (!result) {
+        announce("Nothing to undo.");
+        return;
+      }
+      const rating = result.rating as Rating;
+      setTally((t) => ({ ...t, [rating]: Math.max(0, t[rating] - 1) }));
+      setLog((l) => l.slice(0, -1));
+      announce(`Undid ${firstLine(result.front)}.`);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      undoing.current = false;
+    }
+  }, [announce, load]);
+
   // The handler reads through a ref rather than closing over state, so the
   // listener is registered exactly once. Re-registering it per render means
   // there is a window after every state change where the attached listener
   // still believes the previous state — long enough to swallow a keystroke.
-  const latest = useRef({ card, revealed, reveal, grade });
-  latest.current = { card, revealed, reveal, grade };
+  const latest = useRef({ card, revealed, reveal, grade, undo });
+  latest.current = { card, revealed, reveal, grade, undo };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -130,6 +161,7 @@ export function Review(props: { announce: (msg: string) => void }) {
       if (!action) return;
       e.preventDefault();
       if (action.kind === "reveal") now.reveal();
+      else if (action.kind === "undo") void now.undo();
       else void now.grade(action.rating);
     };
     document.addEventListener("keydown", onKey);
@@ -142,11 +174,18 @@ export function Review(props: { announce: (msg: string) => void }) {
     <section class="route review">
       <div class="route-head">
         <h1 tabIndex={-1}>Review</h1>
-        {card && (
-          <p class="muted" aria-live="off">
-            {index + 1} of {queue.length}
-          </p>
-        )}
+        <div class="row">
+          {card && (
+            <p class="muted" aria-live="off">
+              {index + 1} of {queue.length}
+            </p>
+          )}
+          {reviewed > 0 && (
+            <button type="button" onClick={() => void undo()}>
+              Undo <kbd>U</kbd>
+            </button>
+          )}
+        </div>
       </div>
 
       {error && (

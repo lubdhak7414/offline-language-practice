@@ -7,7 +7,7 @@ import { signal } from "@preact/signals";
  * history API would buy nothing and cost a dev-server rewrite rule. The hash
  * also survives the Tauri custom protocol unchanged.
  */
-export const ROUTES = ["practice", "review", "decks", "progress", "lab"] as const;
+export const ROUTES = ["practice", "review", "decks", "progress", "settings"] as const;
 
 export type Route = (typeof ROUTES)[number];
 
