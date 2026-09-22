@@ -484,7 +484,9 @@ pub fn export_csv(env: &ExportEnvelope, delimiter: char) -> String {
 /// Parse `front,back,tags` CSV/TSV text (delimiter sniffed from the first
 /// line) into `(front, back, tags)` triples, ready for
 /// [`import_csv_cards`]. Skips a case-insensitive `front`/`back` header row
-/// and blank lines.
+/// and blank lines, and removes the formula guard [`export_csv`] adds — before
+/// the content hash is computed, so re-importing our own export updates the
+/// card rather than creating a second one.
 pub fn parse_csv_cards(text: &str) -> Result<Vec<(String, String, Vec<String>)>, String> {
     let first_line = text.lines().next().unwrap_or("");
     let delimiter = crate::csvfmt::sniff_delimiter(first_line);
@@ -494,15 +496,20 @@ pub fn parse_csv_cards(text: &str) -> Result<Vec<(String, String, Vec<String>)>,
         if row.iter().all(|f| f.trim().is_empty()) {
             continue;
         }
-        let front = row.first().cloned().unwrap_or_default();
-        let back = row.get(1).cloned().unwrap_or_default();
+        let field = |i: usize| {
+            row.get(i)
+                .map(|s| crate::csvfmt::strip_formula_guard(s).to_string())
+                .unwrap_or_default()
+        };
+        let front = field(0);
+        let back = field(1);
         if front.trim().eq_ignore_ascii_case("front") && back.trim().eq_ignore_ascii_case("back") {
             continue;
         }
-        let tags = row
-            .get(2)
-            .map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let tags = field(2)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         out.push((front, back, tags));
     }
     Ok(out)
@@ -830,6 +837,48 @@ mod tests {
             parsed[0].2,
             vec!["greeting".to_string(), "basics".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_formula_card_survives_a_csv_round_trip_without_duplicating() {
+        let db = pool().await;
+        let rows = vec![("=1+1".to_string(), "-two".to_string(), vec![])];
+        import_csv_cards(&db, "default", &rows).await.unwrap();
+
+        let env = ExportEnvelope {
+            schema: EXPORT_SCHEMA.to_string(),
+            exported_at: 0,
+            app_version: "0".to_string(),
+            decks: vec![],
+            cards: vec![ExportCard {
+                id: "ignored".to_string(),
+                deck_id: "default".to_string(),
+                front: "=1+1".to_string(),
+                back: "-two".to_string(),
+                created_at: 0,
+                tags: vec![],
+                suspended: false,
+                buried_until: 0,
+                memory: None,
+                reviews: vec![],
+            }],
+        };
+        let text = export_csv(&env, ',');
+        assert!(text.contains("'=1+1"), "exported unguarded: {text}");
+
+        let parsed = parse_csv_cards(&text).unwrap();
+        assert_eq!(parsed[0].0, "=1+1");
+        assert_eq!(parsed[0].1, "-two");
+        let summary = import_csv_cards(&db, "default", &parsed).await.unwrap();
+        assert_eq!(summary.cards_created, 0, "same content hash, so an update");
+        assert_eq!(summary.cards_updated, 1);
+
+        let fronts: Vec<String> =
+            sqlx::query_scalar("SELECT content_front FROM cards WHERE deck_id = 'default'")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(fronts, vec!["=1+1".to_string()]);
     }
 
     #[tokio::test]

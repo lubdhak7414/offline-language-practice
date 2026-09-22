@@ -11,6 +11,12 @@
 //! escaped by doubling it (`""`). The parser accepts both CRLF and bare LF
 //! row terminators, strips a leading UTF-8 BOM (Excel likes to add one), and
 //! understands a quoted field that itself contains embedded newlines.
+//!
+//! Formula guard (not RFC 4180 — spreadsheet safety): a field that begins
+//! with `=`, `+`, `-` or `@` is written with a leading apostrophe, because
+//! Excel, LibreOffice and Sheets evaluate such a cell as a formula even when
+//! it is quoted. [`strip_formula_guard`] undoes exactly that shape on import.
+//! The parser itself stays byte-faithful; stripping is the importer's choice.
 
 /// Serialize `rows` to CSV/TSV text using `delimiter` (`,` or `\t`).
 ///
@@ -36,12 +42,45 @@ fn needs_quoting(field: &str, delimiter: char) -> bool {
     field.contains(delimiter) || field.contains('"') || field.contains('\r') || field.contains('\n')
 }
 
+/// Leading characters a spreadsheet treats as the start of a formula.
+///
+/// Quoting is not enough: a quoted `"=1+1"` is evaluated too. Only changing
+/// the first character stops it, which is why Excel itself writes a leading
+/// apostrophe for a literal.
+const FORMULA_LEAD: [char; 4] = ['=', '+', '-', '@'];
+
+fn is_formula_lead(field: &str) -> bool {
+    field
+        .chars()
+        .next()
+        .is_some_and(|c| FORMULA_LEAD.contains(&c))
+}
+
 fn write_field(field: &str, delimiter: char) -> String {
-    if needs_quoting(field, delimiter) {
-        let escaped = field.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+    // The apostrophe is part of the value as far as CSV is concerned, so it
+    // goes inside any quotes; the receiving spreadsheet is what consumes it.
+    let guarded = if is_formula_lead(field) {
+        format!("'{field}")
     } else {
         field.to_string()
+    };
+    if needs_quoting(&guarded, delimiter) {
+        let escaped = guarded.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        guarded
+    }
+}
+
+/// Undo the formula guard [`write_csv`] applies.
+///
+/// Only the exact shape this module writes — an apostrophe immediately
+/// followed by a formula lead — so a field that merely starts with an
+/// apostrophe (`'tis`) survives a round trip untouched.
+pub fn strip_formula_guard(field: &str) -> &str {
+    match field.strip_prefix('\'') {
+        Some(rest) if is_formula_lead(rest) => rest,
+        _ => field,
     }
 }
 
@@ -140,6 +179,48 @@ mod tests {
         let text = write_csv(&rows, ',');
         let parsed = parse_csv(&text, ',').unwrap();
         assert_eq!(parsed, rows);
+    }
+
+    #[test]
+    fn a_leading_formula_character_is_neutralised() {
+        for field in ["=1+1", "+1", "-1", "@SUM(A1)"] {
+            assert_eq!(write_field(field, ','), format!("'{field}"));
+        }
+    }
+
+    #[test]
+    fn an_interior_formula_character_is_left_alone() {
+        assert_eq!(write_field("a=b", ','), "a=b");
+        assert_eq!(write_field("x-1", ','), "x-1");
+        assert_eq!(write_field("", ','), "");
+    }
+
+    #[test]
+    fn the_guard_sits_inside_the_quotes() {
+        assert_eq!(write_field("=1,2", ','), "\"'=1,2\"");
+        assert_eq!(write_field("=\"x\"", ','), "\"'=\"\"x\"\"\"");
+    }
+
+    #[test]
+    fn the_guard_round_trips_and_only_its_own_shape_is_stripped() {
+        let rows = vec![vec![
+            "=1+1".to_string(),
+            "'tis".to_string(),
+            "'".to_string(),
+        ]];
+        let parsed = parse_csv(&write_csv(&rows, ','), ',').unwrap();
+        assert_eq!(parsed[0][0], "'=1+1", "the parser stays byte-faithful");
+        assert_eq!(strip_formula_guard(&parsed[0][0]), "=1+1");
+        assert_eq!(
+            strip_formula_guard(&parsed[0][1]),
+            "'tis",
+            "not the guard shape"
+        );
+        assert_eq!(
+            strip_formula_guard(&parsed[0][2]),
+            "'",
+            "bare apostrophe kept"
+        );
     }
 
     #[test]

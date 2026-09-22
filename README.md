@@ -13,7 +13,7 @@ Everything happens on-device: the speech model, the voice synthesis, the grammar
 - **Grammar checking** — transcripts, or anything you type, are checked by a local offline linter with in-place suggestions.
 - **Text-to-speech** — hear correct pronunciation via a local neural voice (Piper).
 - **Spaced repetition** — review scheduled by FSRS-6, the memory model behind modern Anki, fitted to your own history. Daily caps, tags, suspend, bury and undo.
-- **Your data stays yours** — JSON export that round-trips full review history and FSRS state, CSV/TSV for Anki, and whole-database backup and restore.
+- **Your data stays yours** — JSON export that round-trips full review history and FSRS state, CSV/TSV for Anki, and whole-database backup and restore. In CSV/TSV, a card beginning with `=`, `+`, `-` or `@` gets a leading apostrophe so spreadsheets show it as text instead of running it as a formula; JSON export is unchanged.
 - **Fully offline** — the only network request the app ever makes is downloading the models. After that it works with the network off.
 
 ## Why this was interesting to build

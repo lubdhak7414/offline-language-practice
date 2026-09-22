@@ -25,6 +25,13 @@ Notable changes to this project. The format follows
   (x86_64). Intel Macs are not supported: the ONNX Runtime binding ships no
   prebuilt library for them.
 
+### Security
+
+- CSV/TSV export no longer hands spreadsheets a formula to run. A card that
+  begins with `=`, `+`, `-` or `@` is written with a leading apostrophe, so
+  Excel, LibreOffice and Sheets show it as text. Importing the file back
+  removes the apostrophe again. JSON export is unaffected.
+
 ## [0.1.0] — 2026-09-22
 
 First release. Speaking practice, pronunciation and fluency scoring, grammar
