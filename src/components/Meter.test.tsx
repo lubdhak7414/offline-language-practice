@@ -1,8 +1,14 @@
 import { render, screen } from "@testing-library/preact";
 import { describe, expect, it } from "vitest";
 
-import { LintedText, Meter, WordAlignmentView } from "./Meter";
-import type { WordOp } from "../ipc/types";
+import {
+  DeliveryNote,
+  LintedText,
+  Meter,
+  WordAlignmentView,
+  WordScoreView,
+} from "./Meter";
+import type { FluencyReport, WordOp, WordScore } from "../ipc/types";
 
 describe("Meter", () => {
   it("shows the score and a plain-English verdict", () => {
@@ -90,5 +96,83 @@ describe("LintedText", () => {
     );
     expect(container.querySelectorAll("mark")).toHaveLength(1);
     expect(container.textContent).toBe("one two three");
+  });
+});
+
+const word = (over: Partial<WordScore> = {}): WordScore => ({
+  word: "HELLO",
+  start_ms: 0,
+  end_ms: 400,
+  gop: -0.02,
+  score: 96,
+  verdict: "good",
+  ...over,
+});
+
+const fluency = (over: Partial<FluencyReport> = {}): FluencyReport => ({
+  wpm: 98,
+  articulation_wpm: 142,
+  longest_pause_ms: 1800,
+  pause_count: 2,
+  pauses: [],
+  filler_count: 3,
+  like_count: 0,
+  hesitation_count: 1,
+  speaking_ms: 4000,
+  method: "aligned",
+  score: 71,
+  ...over,
+});
+
+describe("WordScoreView", () => {
+  it("puts the number beside the word, not only a colour", () => {
+    render(<WordScoreView words={[word(), word({ word: "THERE", score: 12, verdict: "poor" })]} />);
+    expect(screen.getByText("96")).toBeInTheDocument();
+    expect(screen.getByText("12")).toBeInTheDocument();
+  });
+
+  it("gives each verdict its own class", () => {
+    const { container } = render(
+      <WordScoreView
+        words={[
+          word({ verdict: "good" }),
+          word({ word: "A", verdict: "unclear" }),
+          word({ word: "B", verdict: "poor" }),
+        ]}
+      />,
+    );
+    expect(container.querySelectorAll(".word-good")).toHaveLength(1);
+    expect(container.querySelectorAll(".word-unclear")).toHaveLength(1);
+    expect(container.querySelectorAll(".word-poor")).toHaveLength(1);
+  });
+});
+
+describe("DeliveryNote", () => {
+  it("reports the speaking rate, not the rate diluted by pauses", () => {
+    render(<DeliveryNote fluency={fluency()} />);
+    // 142 is articulation_wpm; 98 is wpm, which is not what a learner can act on.
+    expect(screen.getByText(/142 words a minute/)).toBeInTheDocument();
+    expect(screen.queryByText(/98 words a minute/)).not.toBeInTheDocument();
+  });
+
+  it("counts pauses and fillers together with the acoustic hesitations", () => {
+    render(<DeliveryNote fluency={fluency()} />);
+    expect(screen.getByText(/2 pauses, longest 1.8s/)).toBeInTheDocument();
+    expect(screen.getByText(/4 fillers/)).toBeInTheDocument();
+  });
+
+  it("says nothing about pauses or fillers when there were none", () => {
+    render(
+      <DeliveryNote
+        fluency={fluency({ pause_count: 0, filler_count: 0, hesitation_count: 0 })}
+      />,
+    );
+    expect(screen.queryByText(/pause/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/filler/)).not.toBeInTheDocument();
+  });
+
+  it("hedges on LIKE instead of counting it as a mistake", () => {
+    render(<DeliveryNote fluency={fluency({ like_count: 2 })} />);
+    expect(screen.getByText(/hint, not a\s+count/)).toBeInTheDocument();
   });
 });
