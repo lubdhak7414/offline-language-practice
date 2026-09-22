@@ -708,6 +708,274 @@ pub fn score_against_target(
 }
 
 #[cfg(test)]
+mod real_models {
+    //! End-to-end calibration against real weights.
+    //!
+    //! `#[ignore]`d: these are the only tests that need the ~456 MB of model
+    //! files on disk. Run them after fetching models:
+    //!
+    //!   ./scripts/download-models.sh
+    //!   OLP_MODELS_DIR=$PWD/models cargo test --manifest-path src-tauri/Cargo.toml \
+    //!       --lib real_models -- --ignored --nocapture
+    //!
+    //! They exist because every other pronunciation test is synthetic. The
+    //! CTC maths is proven by brute-force equivalence on a 3-frame toy
+    //! problem, which says the implementation matches the definition but
+    //! nothing about what the numbers mean on real audio.
+    //!
+    //! **What these tests do and do not settle.** They prove the pipeline
+    //! works end to end on real weights, that word alignments are sane, and
+    //! that the score discriminates — the right target scores 100 and a
+    //! wrong one scores 0 on the same audio. They do **not** calibrate
+    //! `TAU` for human speech: the on-device voice is unnaturally clean, so
+    //! every word comes back at exactly 100 with a GOP of ~0, and a
+    //! saturated metric cannot tell you where the interesting middle of the
+    //! range sits. `the_score_degrades_gradually_as_audio_gets_worse`
+    //! probes that middle by degrading the audio, which is the closest this
+    //! repo can get without a microphone and real speakers. Calibration
+    //! against actual learners remains open.
+
+    use super::*;
+
+    /// Absolute path to the repo's `models/` dir, whatever the test CWD is.
+    fn models_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri has a parent")
+            .join("models")
+    }
+
+    /// The loaded engines, created once and used under a lock.
+    ///
+    /// Not an optimisation. espeak-ng (under `piper-rs`) keeps global,
+    /// non-reentrant state: three tests each building a `TtsEngine` on its
+    /// own thread prints `maximum number 349 of (N_VOICES_LIST = 350 - 1)
+    /// reached` and then segfaults. Production never hits this because TTS
+    /// is confined to the single `neural-tts` worker thread — this lock is
+    /// the test-side equivalent of that thread, and loading the 380 MB ASR
+    /// model once instead of per test is just a bonus.
+    struct Engines {
+        tts: crate::tts::TtsEngine,
+        asr: crate::asr::AsrEngine,
+        vocab: std::sync::Arc<crate::asr::Vocab>,
+    }
+
+    fn engines() -> std::sync::MutexGuard<'static, Engines> {
+        static ENGINES: std::sync::OnceLock<std::sync::Mutex<Engines>> = std::sync::OnceLock::new();
+        ENGINES
+            .get_or_init(|| {
+                std::env::set_var("OLP_MODELS_DIR", models_root());
+                let (voice, config) = crate::tts::find_voice()
+                    .expect("no voice installed; run ./scripts/download-models.sh");
+                let model = crate::asr::find_model()
+                    .expect("no ASR model installed; run ./scripts/download-models.sh");
+                std::sync::Mutex::new(Engines {
+                    tts: crate::tts::TtsEngine::load(&voice, &config).expect("load voice"),
+                    asr: crate::asr::AsrEngine::load(&model).expect("load ASR"),
+                    vocab: crate::asr::load_vocab().expect("vocab"),
+                })
+            })
+            // A panic in one test must not hide the others behind a
+            // poisoned lock with no output.
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Linear resample to 16 kHz. Good enough for a calibration harness —
+    /// in the app the frontend resamples before audio reaches ASR.
+    fn to_16k(input: &[f32], rate: u32) -> Vec<f32> {
+        if rate == crate::asr::ASR_SAMPLE_RATE || input.is_empty() {
+            return input.to_vec();
+        }
+        let ratio = crate::asr::ASR_SAMPLE_RATE as f64 / rate as f64;
+        let out_len = ((input.len() as f64) * ratio).round() as usize;
+        (0..out_len)
+            .map(|i| {
+                let src = i as f64 / ratio;
+                let lo = src.floor() as usize;
+                let hi = (lo + 1).min(input.len() - 1);
+                let frac = (src - lo as f64) as f32;
+                let a = input.get(lo).copied().unwrap_or(0.0);
+                let b = input.get(hi).copied().unwrap_or(0.0);
+                a + (b - a) * frac
+            })
+            .collect()
+    }
+
+    /// Speak `text` with the installed voice, at 16 kHz mono.
+    fn speak(e: &Engines, text: &str) -> Vec<f32> {
+        let (pcm, rate) = e.tts.synthesize(text).expect("synthesize");
+        to_16k(&pcm, rate)
+    }
+
+    #[test]
+    #[ignore = "models"]
+    fn a_clearly_spoken_phrase_transcribes_and_scores_well() {
+        let e = engines();
+        let target = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG";
+
+        let pcm = speak(&e, target);
+        assert!(
+            pcm.len() > crate::asr::ASR_SAMPLE_RATE as usize,
+            "expected over a second of audio, got {} samples",
+            pcm.len()
+        );
+
+        let out = e.asr.transcribe_pcm_detailed(&pcm).expect("transcribe");
+
+        println!("transcript: {:?}", out.text);
+        println!(
+            "frames={} vocab={} stride={:.2}ms audio={:.0}ms",
+            out.frames,
+            out.vocab,
+            out.frame_stride_ms,
+            pcm.len() as f32 * 1000.0 / crate::asr::ASR_SAMPLE_RATE as f32
+        );
+
+        let score = score_against_target(&out, target, &e.vocab).expect("score");
+        println!(
+            "overall={} normalized_conf={:.3} target_logprob={:.1} free_logprob={:.1}",
+            score.overall, score.normalized_conf, score.target_logprob, score.free_logprob
+        );
+        for w in &score.words {
+            println!(
+                "  {:>6} {:>3}  gop={:+.3}  {:>7}  [{:>5}..{:>5}]ms",
+                w.word, w.score, w.gop, w.verdict, w.start_ms, w.end_ms
+            );
+        }
+
+        // The recognizer should hear roughly what was said. Exact equality
+        // is too brittle a bar for any acoustic model, so require that most
+        // words survive the round trip.
+        let said: Vec<&str> = out.text.split_whitespace().collect();
+        let want: Vec<&str> = target.split_whitespace().collect();
+        let matched = want.iter().filter(|w| said.contains(w)).count();
+        assert!(
+            matched * 2 >= want.len(),
+            "transcript {:?} shares only {matched}/{} words with the target",
+            out.text,
+            want.len()
+        );
+
+        // The calibration claim: clear speech lands in "good", not "needs
+        // work". If TAU ever drifts so that a clean reading scores like a
+        // struggling learner, this is what catches it.
+        assert!(
+            score.overall >= 70,
+            "clear speech scored {} — TAU ({TAU}) is mis-calibrated",
+            score.overall
+        );
+        assert!(
+            score.words.iter().filter(|w| w.verdict == "good").count() * 2 >= score.words.len(),
+            "most words in a clean reading should be 'good'"
+        );
+    }
+
+    /// Deterministic white-ish noise, so a run is reproducible.
+    fn noisy(pcm: &[f32], amount: f32) -> Vec<f32> {
+        let mut state: u32 = 0x1234_5678;
+        pcm.iter()
+            .map(|v| {
+                // xorshift32: no dependency, and the same sequence every run.
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let n = (state as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                (v + n * amount).clamp(-1.0, 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "models"]
+    fn the_score_degrades_gradually_as_audio_gets_worse() {
+        // The saturation in the test above is the reason this one exists.
+        // A metric that reads 100 on clean audio and 0 on the wrong words
+        // could still be a step function, which would be useless for
+        // telling a learner they are *nearly* there. Walk the audio from
+        // clean to badly degraded and watch the curve.
+        //
+        // OBSERVED, and worth knowing before trusting a displayed number:
+        // the curve is a cliff, not a ramp. A representative run gives
+        //
+        //     noise 0.00 -> 100      noise 0.10 -> 25
+        //     noise 0.05 ->  34      noise 0.20 ->  0
+        //
+        // so the whole interesting middle of the range is crossed between
+        // 0 and 0.05. Part of that is this test's own crudeness — additive
+        // white noise wrecks recognition itself, not just articulation, and
+        // by 0.05 the transcript is already garbage — but it does mean
+        // `TAU = 0.55` is a steep mapping, and a learner with a mediocre
+        // microphone could be told they are far worse than they are. The
+        // assertion below only demands monotonicity; tuning TAU needs real
+        // speakers, which this repo does not have.
+        let e = engines();
+        let target = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG";
+        let clean = speak(&e, target);
+
+        let mut scores = Vec::new();
+        for amount in [0.0f32, 0.05, 0.1, 0.2, 0.4] {
+            let pcm = if amount == 0.0 {
+                clean.clone()
+            } else {
+                noisy(&clean, amount)
+            };
+            let out = e.asr.transcribe_pcm_detailed(&pcm).expect("transcribe");
+            let s = score_against_target(&out, target, &e.vocab).expect("score");
+            println!(
+                "noise={amount:<5} overall={:<4} conf={:.3}  transcript={:?}",
+                s.overall,
+                s.normalized_conf,
+                out.text.trim()
+            );
+            scores.push(s.overall);
+        }
+
+        let first = scores.first().copied().unwrap_or(0);
+        let last = scores.last().copied().unwrap_or(0);
+        assert!(
+            first > last,
+            "adding noise did not lower the score: {scores:?}"
+        );
+        // Monotone within tolerance: an acoustic model is not obliged to be
+        // perfectly ordered, but a metric that bounces around is not
+        // measuring what it claims to.
+        for pair in scores.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(b <= a + 5, "score rose with more noise: {scores:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "models"]
+    fn a_wrong_target_scores_below_the_right_one() {
+        // The score has to discriminate, not just be high. Same audio,
+        // scored against what was said and against something else: if the
+        // wrong target does not score clearly worse, the number is
+        // measuring audio quality rather than pronunciation.
+        let e = engines();
+        let spoken = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG";
+        let wrong = "PLEASE SUBMIT THE QUARTERLY BUDGET BEFORE FRIDAY MORNING";
+
+        let pcm = speak(&e, spoken);
+        let out = e.asr.transcribe_pcm_detailed(&pcm).expect("transcribe");
+
+        let right = score_against_target(&out, spoken, &e.vocab).expect("score right");
+        let other = score_against_target(&out, wrong, &e.vocab).expect("score wrong");
+        println!(
+            "right={} wrong={} (conf {:.3} vs {:.3})",
+            right.overall, other.overall, right.normalized_conf, other.normalized_conf
+        );
+        assert!(
+            other.overall < right.overall,
+            "a wrong target scored {} against a right-target {}",
+            other.overall,
+            right.overall
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
