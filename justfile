@@ -34,6 +34,12 @@ test:
 test-net:
     cargo test --manifest-path {{manifest}} --lib network_ -- --ignored --nocapture
 
+# Backup -> restore -> restart against the real debug binary, on a private
+# headless compositor with a scratch XDG home. Linux only; needs weston.
+e2e-restore:
+    cargo build --manifest-path {{manifest}}
+    scripts/restore-e2e.sh
+
 # Dependency audit: advisories, licenses, duplicate crates, source origins.
 deny:
     cargo deny --manifest-path {{manifest}} check

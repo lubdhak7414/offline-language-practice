@@ -137,13 +137,22 @@ pub fn stage_restore(src: &Path, db_dir: &Path) -> Result<(), AppError> {
 /// `Vec` and calls `initialize_all` in registration order, so an earlier
 /// plugin's `setup` hook always finishes before a later one's starts.
 ///
-/// Rotation: any existing `app.db.bak` is removed (only the newest rotation
-/// is kept), the live `app.db` is renamed to `app.db.bak` (if it exists —
-/// a fresh install may have none yet), the WAL/SHM sidecars are dropped
-/// (they belong to the file just rotated away, not the one being
-/// installed), then the staged file is renamed onto `app.db`. If that final
-/// rename fails, the rotated file is renamed back so the original database
-/// is never left missing.
+/// Rotation, in order:
+///
+/// 1. The previous rotation is removed, **sidecars included** — only the
+///    newest rotation is kept, and a stale `app.db.bak-wal` left behind would
+///    be replayed onto the new `.bak` the next time anything opened it.
+/// 2. The live `app.db` is renamed to `app.db.bak` (if it exists — a fresh
+///    install may have none), and its WAL moves with it to `app.db.bak-wal`.
+///    SQLite names a database's WAL `<file>-wal`, so the pair stays a
+///    consistent database. The WAL has to travel: after a crash the newest
+///    rows exist only there, and deleting it would leave the safety net
+///    without them.
+/// 3. `app.db-shm` is dropped. It is only an index over the WAL and SQLite
+///    rebuilds it, and nothing named `app.db-wal` may survive beside the
+///    database being installed — it belongs to the file just rotated away.
+/// 4. The staged file is renamed onto `app.db`. If that fails, the rotated
+///    pair is renamed back, so the original database is never left missing.
 pub fn apply_pending_restore(db_dir: &Path) -> Result<bool, AppError> {
     let stage = db_dir.join(RESTORE_STAGE);
     if !stage.is_file() {
@@ -152,27 +161,45 @@ pub fn apply_pending_restore(db_dir: &Path) -> Result<bool, AppError> {
     let live = db_dir.join("app.db");
     let rotated = db_dir.join(ROTATED);
 
-    let _ = std::fs::remove_file(&rotated);
+    for stale in [
+        &rotated,
+        &sidecar(&rotated, "-wal"),
+        &sidecar(&rotated, "-shm"),
+    ] {
+        let _ = std::fs::remove_file(stale);
+    }
+
     let had_live = live.is_file();
     if had_live {
         std::fs::rename(&live, &rotated).map_err(|e| {
             AppError::BadInput(format!("restore failed: could not rotate current db: {e}"))
         })?;
+        // Best effort: a clean shutdown checkpoints and leaves no WAL at all.
+        let _ = std::fs::rename(sidecar(&live, "-wal"), sidecar(&rotated, "-wal"));
     }
-    let _ = std::fs::remove_file(db_dir.join("app.db-wal"));
-    let _ = std::fs::remove_file(db_dir.join("app.db-shm"));
+    // Unconditional: if the WAL could not travel, it still must not stay.
+    let _ = std::fs::remove_file(sidecar(&live, "-wal"));
+    let _ = std::fs::remove_file(sidecar(&live, "-shm"));
 
     if let Err(e) = std::fs::rename(&stage, &live) {
         if had_live {
             // Best-effort rollback: a failed install must not leave the
             // user with no database at all.
             let _ = std::fs::rename(&rotated, &live);
+            let _ = std::fs::rename(sidecar(&rotated, "-wal"), sidecar(&live, "-wal"));
         }
         return Err(AppError::BadInput(format!(
             "restore failed: could not install staged db: {e}"
         )));
     }
     Ok(true)
+}
+
+/// `db` with `suffix` appended to its file name: SQLite's sidecar naming.
+fn sidecar(db: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
 }
 
 #[cfg(test)]
@@ -258,6 +285,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `dir/app.db` in WAL mode with automatic checkpoints off, so rows
+    /// written through it stay in `app.db-wal` instead of reaching the main
+    /// file — the on-disk state a killed process leaves behind.
+    async fn wal_pool(dir: &std::path::Path) -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!(
+                "sqlite://{}?mode=rwc",
+                dir.join("app.db").display()
+            ))
+            .await
+            .expect("file-backed pool");
+        sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::db::testing::apply_range(&pool, 1..=7).await;
+        // The schema is checkpointed; from here on, writes stay in the WAL.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint=0;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn insert_card(pool: &sqlx::SqlitePool, id: &str, front: &str) {
+        sqlx::query(
+            "INSERT INTO cards (id, deck_id, content_front, content_back, created_at) \
+             VALUES (?, 'default', ?, 'B', 0)",
+        )
+        .bind(id)
+        .bind(front)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Card fronts in `db`, read through a fresh connection — the way the
+    /// next launch reads it. Migrations are not re-run: migration 3 is a bare
+    /// `ALTER TABLE` and not re-runnable.
+    async fn fronts(db: &std::path::Path) -> Vec<String> {
+        let mut conn =
+            sqlx::SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(db))
+                .await
+                .unwrap();
+        let rows = sqlx::query_scalar("SELECT content_front FROM cards ORDER BY content_front")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        rows
+    }
+
+    /// Copy a database and its sidecars as they are right now, open
+    /// connection and all: what is on disk after the process is killed.
+    fn snapshot(from: &std::path::Path, to: &std::path::Path) {
+        for name in ["app.db", "app.db-wal", "app.db-shm"] {
+            let src = from.join(name);
+            if src.exists() {
+                std::fs::copy(&src, to.join(name)).unwrap();
+            }
+        }
+    }
+
+    /// A crashed live database whose row `OLD` exists only in its WAL, with a
+    /// backup holding `NEW` staged beside it. Returns (crash dir, cleanup dirs).
+    async fn crashed_with_staged_restore(
+        tag: &str,
+    ) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let live_dir = temp_dir(&format!("{tag}-live"));
+        let crash = temp_dir(&format!("{tag}-crash"));
+        let src_dir = temp_dir(&format!("{tag}-src"));
+
+        let live = wal_pool(&live_dir).await;
+        insert_card(&live, "old", "OLD").await;
+        snapshot(&live_dir, &crash);
+        live.close().await;
+        let wal = std::fs::metadata(crash.join("app.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(wal > 0, "fixture must leave uncheckpointed WAL frames");
+
+        let src = file_pool(&src_dir).await;
+        insert_card(&src, "new", "NEW").await;
+        let backup = src_dir.join("backup.db");
+        backup_to(&src, &backup).await.unwrap();
+        src.close().await;
+        validate_backup(&backup).await.unwrap();
+        stage_restore(&backup, &crash).unwrap();
+        (crash.clone(), vec![live_dir, crash, src_dir])
+    }
+
+    #[tokio::test]
+    async fn a_restore_over_a_crashed_wal_installs_only_the_backup() {
+        let (crash, cleanup) = crashed_with_staged_restore("wal-install").await;
+
+        assert!(apply_pending_restore(&crash).unwrap());
+        assert!(
+            !crash.join("app.db-wal").exists(),
+            "old WAL beside the new db"
+        );
+        assert!(
+            !crash.join("app.db-shm").exists(),
+            "old SHM beside the new db"
+        );
+        assert_eq!(fronts(&crash.join("app.db")).await, vec!["NEW".to_string()]);
+
+        for d in cleanup {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rotated_backup_keeps_rows_that_were_only_in_its_wal() {
+        let (crash, cleanup) = crashed_with_staged_restore("wal-bak").await;
+
+        assert!(apply_pending_restore(&crash).unwrap());
+        // `.bak` is the safety net. After a crash, the newest rows exist only
+        // in the WAL; deleting it would leave a net with a hole in it.
+        assert_eq!(fronts(&crash.join(ROTATED)).await, vec!["OLD".to_string()]);
+
+        for d in cleanup {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_rotated_wal_is_not_replayed_onto_the_new_backup() {
+        let (crash, cleanup) = crashed_with_staged_restore("wal-stale").await;
+        // Leftovers from an earlier rotation: a WAL for a `.bak` that is
+        // about to be replaced. Replaying it would graft old pages onto the
+        // new `.bak`.
+        std::fs::write(crash.join(ROTATED), b"older rotation").unwrap();
+        std::fs::write(crash.join(format!("{ROTATED}-wal")), b"stale wal").unwrap();
+        std::fs::write(crash.join(format!("{ROTATED}-shm")), b"stale shm").unwrap();
+
+        assert!(apply_pending_restore(&crash).unwrap());
+        assert_eq!(fronts(&crash.join(ROTATED)).await, vec!["OLD".to_string()]);
+
+        for d in cleanup {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     #[test]
     fn apply_pending_restore_is_a_no_op_with_no_stage_file() {
         let dir = temp_dir("noop");
@@ -277,6 +452,11 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("app.db")).unwrap(), b"new staged db");
         assert_eq!(std::fs::read(dir.join(ROTATED)).unwrap(), b"old live db");
         assert!(!dir.join("app.db-wal").exists());
+        assert_eq!(
+            std::fs::read(dir.join(format!("{ROTATED}-wal"))).unwrap(),
+            b"wal",
+            "the WAL travels with its database"
+        );
         assert!(!dir.join(RESTORE_STAGE).exists());
 
         let _ = std::fs::remove_dir_all(&dir);

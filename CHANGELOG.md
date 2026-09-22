@@ -14,6 +14,11 @@ Notable changes to this project. The format follows
   reported as speaking slowly. Timings are now used only when what was said
   lines up word for word with the prompt; otherwise pauses are measured from
   the audio itself.
+- **Restoring a backup no longer loses the newest data from the safety
+  copy.** The database a restore replaces is kept as `app.db.bak`, but if the
+  app had not shut down cleanly, its most recent changes were still in a
+  side file that restore deleted. That file now moves with it, so the
+  safety copy is complete.
 - **Release builds are verifiable even when a platform fails to build.**
   Checksums and build provenance are now produced for whatever did build,
   and the release run is marked failed so an incomplete set is not published

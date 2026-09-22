@@ -1506,6 +1506,21 @@ pub fn run() {
         .plugin(
             tauri::plugin::Builder::new("db-restore")
                 .setup(|app, _api: tauri::plugin::PluginApi<_, ()>| {
+                    // The ordering above is the whole correctness argument, and
+                    // nothing else checks it: no test builds the app. The SQL
+                    // plugin manages `DbInstances` at the end of its own setup,
+                    // so finding it here means its pool is already open.
+                    // Checked on every launch, not only with a restore pending,
+                    // so a reordered registration fails the first dev run.
+                    if app.try_state::<DbInstances>().is_some() {
+                        let msg = "db-restore initialised after tauri-plugin-sql had \
+                                   opened its pool; register it first in run()";
+                        if cfg!(debug_assertions) {
+                            return Err(msg.into());
+                        }
+                        eprintln!("{msg}. Not applying any staged restore.");
+                        return Ok(());
+                    }
                     if let Ok(dir) = app.path().app_config_dir() {
                         match crate::backup::apply_pending_restore(&dir) {
                             Ok(true) => eprintln!("restored database from staged backup"),
