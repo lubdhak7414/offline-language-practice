@@ -122,9 +122,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04 rather than latest: it is the oldest glibc a release is
-          # expected to run on, and it is the build host that decides that.
-          - os: ubuntu-22.04
+          # 24.04 (glibc 2.39), not 22.04 (2.35). The glibc floor is not
+          # ours to choose: `ort`'s `download-binaries` fetches a prebuilt
+          # ONNX Runtime compiled against glibc >= 2.38, and linking it on
+          # 22.04 fails with `undefined symbol: __isoc23_strtoll`. Building
+          # ORT from source would move that floor; until something does,
+          # 24.04 is the oldest Linux this can be built on, and the release
+          # matrix inherits the same limit.
+          - os: ubuntu-24.04
             cargo_target_dir: /tmp/cargo-target
           - os: macos-14
             cargo_target_dir: /tmp/cargo-target
