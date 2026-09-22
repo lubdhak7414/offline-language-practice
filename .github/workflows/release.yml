@@ -146,10 +146,20 @@ jobs:
         shell: bash
         run: |
           mkdir -p staged
+          # Files only. macOS bundles include the .app *directory* as well
+          # as the .dmg that contains it; copying the directory would make
+          # the attestation step glob over thousands of inner files and
+          # would upload something nobody can verify with sha256sum.
           echo '${{ steps.tauri.outputs.artifactPaths }}' \
             | jq -r '.[]' \
             | while read -r p; do
-                [ -e "$p" ] && cp -R "$p" staged/ || echo "missing: $p"
+                if [ -f "$p" ]; then
+                  cp "$p" staged/
+                elif [ -d "$p" ]; then
+                  echo "skipping directory: $p"
+                else
+                  echo "missing: $p"
+                fi
               done
           ls -l staged
 
@@ -178,19 +188,21 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # Before SHA256SUMS is written, so the subjects are exactly the
+      # release binaries. Attesting the artifacts rather than only the
+      # checksum file matters: provenance over a list of hashes proves
+      # where the list came from, not where the binaries came from.
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "dist/*"
+
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
-          find . -type f ! -name 'SHA256SUMS' -printf '%P\n' \
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS' -printf '%P\n' \
             | sort \
             | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
-
-      - uses: actions/attest-build-provenance@v1
-        with:
-          # Attest the artifacts themselves, not just the checksum file:
-          # provenance over a list of hashes only proves the list's origin.
-          subject-path: "dist/**/*"
 
       - uses: softprops/action-gh-release@v2
         with:
