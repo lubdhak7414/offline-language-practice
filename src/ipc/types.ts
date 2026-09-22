@@ -245,6 +245,10 @@ export type Preferences = {
   new_per_day: number;
   review_per_day: number;
   bury_hours: number;
+  /** False until first-run onboarding completes. */
+  onboarded: boolean;
+  /** `everyday` | `interview` | `both`. */
+  goal: string;
 };
 
 export type DailyLimits = {
@@ -300,6 +304,38 @@ export type SetDailyLimitsArgs = {
   newPerDay: number;
   reviewPerDay: number;
 };
+
+/** A downloadable model group, as onboarding lists it. */
+export type ModelGroup = {
+  id: string;
+  label: string;
+  detail: string;
+  bytes: number;
+  installed: boolean;
+};
+
+/**
+ * Progress from `download_models`.
+ *
+ * Mirrors the Rust `DownloadEvent` enum, which serializes with a `kind`
+ * tag. Discriminated so a missing case is a type error rather than a
+ * silently ignored event.
+ */
+export type DownloadEvent =
+  | {
+      kind: "started";
+      id: string;
+      file: string;
+      total: number;
+      index: number;
+      count: number;
+    }
+  | { kind: "progress"; id: string; received: number; total: number }
+  | { kind: "verifying"; id: string }
+  | { kind: "installed"; id: string; file: string }
+  | { kind: "done"; installed: string[] }
+  | { kind: "failed"; id: string; message: string }
+  | { kind: "cancelled"; id: string };
 
 /**
  * Every backend command, in one place.
@@ -402,4 +438,20 @@ export type Ipc = {
   // --- diagnostics ---
   modelStatus(): Promise<ModelStatus>;
   epReport(): Promise<string>;
+
+  // --- model downloads ---
+  listModelCatalog(): Promise<ModelGroup[]>;
+  /** Absolute path where in-app downloads install models. */
+  modelsDir(): Promise<string>;
+  /**
+   * Download model groups by id (empty = everything missing). Progress
+   * arrives on `onEvent`; resolves with the installed file names.
+   */
+  downloadModels(
+    which: string[],
+    onEvent: (ev: DownloadEvent) => void,
+  ): Promise<string[]>;
+  pauseDownloads(): Promise<void>;
+  resumeDownloads(): Promise<void>;
+  cancelDownloads(): Promise<void>;
 };

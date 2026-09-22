@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
+import { ModelDownloads } from "../components/ModelDownloads";
 import type {
   BackupInfo,
   ModelStatus,
@@ -207,6 +208,15 @@ export function Settings(props: { announce: (msg: string) => void }) {
         </p>
       )}
       {notice && <p class="notice">{notice}</p>}
+
+      <section class="settings-section">
+        <h2>Models</h2>
+        <p class="muted">
+          Speech files live outside the app so the installer stays small.
+          This is also the way back if you skipped them on first run.
+        </p>
+        <ModelDownloads announce={announce} />
+      </section>
 
       <section class="settings-section">
         <h2>Voice</h2>

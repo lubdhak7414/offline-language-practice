@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { events } from "../ipc/events";
+import { ipc } from "../ipc/commands";
 import { globalKeyAction, goPrefix } from "../lib/globalKeys";
 import { navigate, route, startRouter, type Route } from "./router";
 import { KeyboardHelp } from "../components/KeyboardHelp";
@@ -9,6 +10,7 @@ import { Review } from "../routes/Review";
 import { Decks } from "../routes/Decks";
 import { Progress } from "../routes/Progress";
 import { Settings } from "../routes/Settings";
+import { Onboarding } from "../routes/Onboarding";
 
 const NAV: Array<{ id: Route; label: string; ready: boolean }> = [
   { id: "practice", label: "Practice", ready: true },
@@ -23,6 +25,13 @@ const TOAST_MS = 4000;
 
 export function App() {
   const [toast, setToast] = useState("");
+  /**
+   * `null` while we do not yet know. Rendering the main shell during that
+   * gap would flash Practice at a first-run user before replacing it with
+   * onboarding, and rendering onboarding would do the same to everyone
+   * else — so the shell renders nothing until preferences answer.
+   */
+  const [onboarded, setOnboarded] = useState<boolean | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const heading = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -41,6 +50,17 @@ export function App() {
   }, []);
 
   useEffect(() => startRouter(), []);
+
+  useEffect(() => {
+    void ipc()
+      .getPreferences()
+      .then((p) => setOnboarded(p.onboarded))
+      .catch(() => {
+        // No backend (tests, browser preview) or an unreadable database:
+        // show the app rather than trapping someone in onboarding.
+        setOnboarded(true);
+      });
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -99,6 +119,21 @@ export function App() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [helpOpen]);
+
+  if (onboarded === null) return <div class="shell" />;
+
+  if (!onboarded) {
+    return (
+      <div class="shell">
+        <main class="content" ref={heading}>
+          <Onboarding announce={announce} onFinish={() => setOnboarded(true)} />
+        </main>
+        <div class="toast" role="status" aria-live="polite">
+          {toast}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div class="shell">

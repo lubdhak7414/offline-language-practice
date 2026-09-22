@@ -20,6 +20,8 @@ pub enum AppError {
     Busy(String),
     #[error("bad input: {0}")]
     BadInput(String),
+    #[error("network error: {0}")]
+    Network(String),
 }
 
 impl From<AppError> for String {

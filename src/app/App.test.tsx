@@ -21,6 +21,24 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("opens on onboarding when the database says it has never been run", async () => {
+    // The whole point of the flag: a fresh install must not land on
+    // Practice, where every button needs models that are not there yet.
+    restore?.();
+    restore = setIpc(createMockIpc({ preferences: { onboarded: false } }));
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Welcome" })).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+  });
+
+  it("opens on the app proper once onboarding has been completed", async () => {
+    render(<App />);
+    expect(
+      await screen.findByRole("navigation", { name: "Main" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Welcome" })).toBeNull();
+  });
+
   it("shows the shortcut sheet on ? and closes it on Escape", async () => {
     render(<App />);
     fireEvent.keyDown(document, { key: "?" });

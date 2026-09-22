@@ -23,6 +23,15 @@ pub struct Preferences {
     pub new_per_day: i64,
     pub review_per_day: i64,
     pub bury_hours: i64,
+    /// Whether first-run onboarding has been completed. Its only job is to
+    /// decide whether the app opens on onboarding or on Practice, so a
+    /// fresh install and a user who dismissed onboarding are not the same
+    /// state.
+    pub onboarded: bool,
+    /// What the user said they are practising for: `everyday`, `interview`
+    /// or `both`. Chosen during onboarding, changeable in Settings, and
+    /// used to bias which prompt categories come up first.
+    pub goal: String,
 }
 
 impl Default for Preferences {
@@ -35,6 +44,8 @@ impl Default for Preferences {
             new_per_day: crate::scheduler::DEFAULT_NEW_PER_DAY,
             review_per_day: crate::scheduler::DEFAULT_REVIEW_PER_DAY,
             bury_hours: 20,
+            onboarded: false,
+            goal: "both".to_string(),
         }
     }
 }
@@ -52,6 +63,10 @@ pub fn sanitize(p: Preferences) -> Preferences {
         "american" | "british" | "canadian" | "australian" => p.dialect,
         _ => "american".to_string(),
     };
+    let goal = match p.goal.as_str() {
+        "everyday" | "interview" | "both" => p.goal,
+        _ => "both".to_string(),
+    };
     Preferences {
         dialect,
         theme,
@@ -60,13 +75,15 @@ pub fn sanitize(p: Preferences) -> Preferences {
         new_per_day: p.new_per_day.clamp(0, 9999),
         review_per_day: p.review_per_day.clamp(0, 9999),
         bury_hours: p.bury_hours.clamp(0, 168),
+        onboarded: p.onboarded,
+        goal,
     }
 }
 
 /// The seven `app_settings` keys this module owns, paired with the
 /// `Preferences` field each fills. Kept in one place so `load`/`save` cannot
 /// drift apart on which keys exist.
-const KEYS: [&str; 7] = [
+const KEYS: [&str; 9] = [
     "dialect",
     "theme",
     "day_cutoff_hour",
@@ -74,6 +91,8 @@ const KEYS: [&str; 7] = [
     "new_per_day",
     "review_per_day",
     "bury_hours",
+    "onboarded",
+    "goal",
 ];
 
 /// Load every preference from `app_settings`, falling back field-by-field to
@@ -114,6 +133,11 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
             .get("bury_hours")
             .and_then(|v| v.parse().ok())
             .unwrap_or(default.bury_hours),
+        // Stored as "1"/"0". An unreadable value means "not yet
+        // onboarded", which shows onboarding again — annoying but
+        // recoverable, unlike skipping it on a machine with no models.
+        onboarded: raw.get("onboarded").map(|v| v == "1").unwrap_or(false),
+        goal: raw.get("goal").cloned().unwrap_or(default.goal),
     };
     Ok(sanitize(parsed))
 }
@@ -122,7 +146,7 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
 /// save never reaches storage. Returns the sanitized value actually saved.
 pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preferences, AppError> {
     let p = sanitize(p.clone());
-    let pairs: [(&str, String); 7] = [
+    let pairs: [(&str, String); 9] = [
         ("dialect", p.dialect.clone()),
         ("theme", p.theme.clone()),
         ("day_cutoff_hour", p.day_cutoff_hour.to_string()),
@@ -130,6 +154,8 @@ pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preference
         ("new_per_day", p.new_per_day.to_string()),
         ("review_per_day", p.review_per_day.to_string()),
         ("bury_hours", p.bury_hours.to_string()),
+        ("onboarded", if p.onboarded { "1" } else { "0" }.to_string()),
+        ("goal", p.goal.clone()),
     ];
     let mut tx = pool.begin().await?;
     for (key, value) in pairs {
@@ -163,6 +189,48 @@ pub async fn cutoff_hour(pool: &sqlx::SqlitePool) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn onboarding_flags_round_trip() {
+        let pool = pool().await;
+        // A database that has never seen these keys reports "not onboarded",
+        // which is what makes onboarding show on a fresh install.
+        let fresh = load(&pool).await.unwrap();
+        assert!(!fresh.onboarded);
+        assert_eq!(fresh.goal, "both");
+
+        let saved = save(
+            &pool,
+            &Preferences {
+                onboarded: true,
+                goal: "interview".to_string(),
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(saved.onboarded);
+
+        let back = load(&pool).await.unwrap();
+        assert!(back.onboarded, "onboarded must survive a round trip");
+        assert_eq!(back.goal, "interview");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_goal_falls_back_instead_of_failing_the_save() {
+        let pool = pool().await;
+        let saved = save(
+            &pool,
+            &Preferences {
+                goal: "astronaut".to_string(),
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.goal, "both");
+        assert_eq!(load(&pool).await.unwrap().goal, "both");
+    }
 
     async fn pool() -> sqlx::SqlitePool {
         crate::db::testing::test_pool().await
@@ -198,6 +266,8 @@ mod tests {
             new_per_day: 15,
             review_per_day: 150,
             bury_hours: 24,
+            onboarded: true,
+            goal: "everyday".to_string(),
         };
         assert_eq!(sanitize(p.clone()), p);
     }
@@ -228,6 +298,8 @@ mod tests {
                 new_per_day: 10,
                 review_per_day: 50,
                 bury_hours: 12,
+                onboarded: true,
+                goal: "interview".to_string(),
             },
         )
         .await

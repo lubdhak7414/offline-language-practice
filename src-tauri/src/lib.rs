@@ -19,6 +19,7 @@ mod audio;
 mod backup;
 mod csvfmt;
 mod db;
+mod download;
 mod error;
 mod fluency;
 mod grammar;
@@ -116,6 +117,11 @@ pub struct AppState {
     /// handler so both use the same voice without re-reading `app_settings`
     /// on every request.
     pub voice: RwLock<Option<String>>,
+    /// Run-state for the single in-flight model download. Shared rather
+    /// than per-command so `pause`/`resume`/`cancel` — which arrive as
+    /// separate invokes while `download_models` is still awaiting — can
+    /// reach the job that is actually running.
+    pub downloads: Arc<crate::download::Control>,
 }
 
 /// Max `NeuralReq`s buffered per neural worker channel (see `run()`).
@@ -1052,6 +1058,92 @@ fn ep_report() -> String {
     crate::inference::describe_providers().to_string()
 }
 
+// ─── Model downloader (Phase 5) ─────────────────────────────────────────────
+
+/// Where downloaded weights are installed: `app_data_dir/models/`.
+///
+/// Deliberately not the resource dir — that lives inside the installed
+/// bundle, is read-only on macOS and for a system-wide install on Linux,
+/// and is wiped on upgrade. `paths::init` already registers this directory
+/// as a search root, so a file that lands here is found with no extra
+/// wiring; `$RESOURCE/models/` stays in the search path too, so a packager
+/// can still pre-seed the weights.
+fn models_install_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|d| d.join("models"))
+        .map_err(|e| format!("cannot resolve app data dir: {e}"))
+}
+
+/// Where downloaded models are installed, as a display string.
+///
+/// Onboarding shows this so someone who already has the weights — offline,
+/// on a metered connection, or packaging for a distro — knows exactly where
+/// to put them instead of guessing.
+#[tauri::command]
+fn models_dir(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(models_install_dir(&app)?.to_string_lossy().into_owned())
+}
+
+/// The downloadable model groups and whether each is already installed.
+#[tauri::command]
+fn list_model_catalog(app: tauri::AppHandle) -> Result<Vec<crate::download::GroupInfo>, String> {
+    Ok(crate::download::groups_in(&models_install_dir(&app)?))
+}
+
+/// Download model groups into the app data dir, streaming progress.
+///
+/// `which` holds group ids (`"asr"`, `"tts"`); empty means everything.
+/// Progress arrives on `channel` as tagged `DownloadEvent`s. One job at a
+/// time: a second concurrent call is refused rather than queued, because
+/// both would write the same `.part` files.
+#[tauri::command]
+async fn download_models(
+    which: Vec<String>,
+    channel: Channel<crate::download::DownloadEvent>,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    let dir = models_install_dir(&app)?;
+    let specs = crate::download::select(&which).map_err(String::from)?;
+
+    let ctl = state.downloads.clone();
+    let Some(_guard) = ctl.begin() else {
+        return Err("a download is already running".to_string());
+    };
+
+    let emit = move |ev: crate::download::DownloadEvent| {
+        // A closed channel means the window went away mid-download; the
+        // job itself is still worth finishing, so this is not an error.
+        let _ = channel.send(ev);
+    };
+    let out = crate::download::run(&specs, &dir, &ctl, &emit)
+        .await
+        .map_err(String::from);
+    // Model presence changed, so anything showing `model_status` is stale.
+    let _ = app.emit("system-status", "models-changed");
+    out
+}
+
+/// Pause the running download. Bytes already written are kept, so
+/// `resume_downloads` continues with a `Range` request instead of starting over.
+#[tauri::command]
+fn pause_downloads(state: State<'_, AppState>) {
+    state.downloads.pause();
+}
+
+/// Resume a paused download.
+#[tauri::command]
+fn resume_downloads(state: State<'_, AppState>) {
+    state.downloads.resume();
+}
+
+/// Cancel the running download and discard its partial file.
+#[tauri::command]
+fn cancel_downloads(state: State<'_, AppState>) {
+    state.downloads.cancel();
+}
+
 // ─── Data safety, stats, voice selection (Stream B2) ────────────────────────
 
 /// Result of `export_data`: where it wrote to, how many cards, and the
@@ -1391,6 +1483,7 @@ pub fn run() {
             params: RwLock::new(Vec::new()),
             retention: RwLock::new(crate::scheduler::DEFAULT_RETENTION),
             voice: RwLock::new(None),
+            downloads: Arc::new(crate::download::Control::default()),
         })
         .plugin(tauri_plugin_dialog::init())
         // Registered BEFORE the SQL plugin so its `setup` hook runs first:
@@ -1680,6 +1773,12 @@ pub fn run() {
             review_stats,
             model_status,
             list_voices,
+            list_model_catalog,
+            models_dir,
+            download_models,
+            pause_downloads,
+            resume_downloads,
+            cancel_downloads,
             list_tags,
             set_card_tags,
             suspend_card,

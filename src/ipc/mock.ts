@@ -28,6 +28,7 @@ import type {
   ImportSummary,
   Ipc,
   LintReport,
+  ModelGroup,
   ModelStatus,
   NextPromptArgs,
   Overview,
@@ -62,6 +63,7 @@ export type MockOptions = {
   cards?: MockCard[];
   due?: DueCard[];
   modelStatus?: ModelStatus;
+  catalog?: ModelGroup[];
   stats?: ReviewStats;
   voices?: VoiceInfo[];
   prompts?: PromptView[];
@@ -168,6 +170,10 @@ const DEFAULT_PREFERENCES: Preferences = {
   new_per_day: 20,
   review_per_day: 200,
   bury_hours: 20,
+  // Mirrors the backend default: a fresh database has not been onboarded.
+  // Tests that want the main shell pass `preferences: { onboarded: true }`.
+  onboarded: true,
+  goal: "both",
 };
 
 /** ~30 days of daily counts with a couple of gaps, so charts have to cope. */
@@ -228,6 +234,28 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
   // closely enough for the UI: grading pushes, undo pops.
   type UndoEntry = { review: RecentReview; card: DueCard | undefined; hadCard: boolean };
   const undoStack: UndoEntry[] = [];
+
+  // Model catalog state. Mutable so a download flips `installed`, which is
+  // what onboarding reads to decide the step is complete.
+  const catalog: ModelGroup[] = (
+    options.catalog ?? [
+      {
+        id: "asr",
+        label: "Speech recognition",
+        detail: "Listens to you and writes down what you said.",
+        bytes: 377_860_032,
+        installed: false,
+      },
+      {
+        id: "tts",
+        label: "Voice",
+        detail: "Reads prompts and answers out loud.",
+        bytes: 78_601_037,
+        installed: false,
+      },
+    ]
+  ).map((g) => ({ ...g }));
+  let downloadCancelled = false;
 
   const calls: MockIpc["calls"] = [];
   const record = <T>(name: keyof Ipc, args: unknown[], value: T): Promise<T> => {
@@ -667,6 +695,77 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
 
     epReport() {
       return record("epReport", [], "inference: cpu");
+    },
+
+    listModelCatalog() {
+      return record("listModelCatalog", [], catalog.map((g) => ({ ...g })));
+    },
+
+    modelsDir() {
+      return record("modelsDir", [], "/home/you/.local/share/com.offline.practice/models");
+    },
+
+    /**
+     * Replays the same event order the backend emits, so a UI test
+     * exercises the real state machine rather than a single "done".
+     * Groups it installs flip `installed` in `listModelCatalog`, because
+     * that is what onboarding checks to decide it can move on.
+     */
+    async downloadModels(which, onEvent) {
+      // A download that fails installs nothing, so reject before touching
+      // `installed` — otherwise a "failed" download would still leave the
+      // UI claiming the models are present.
+      if (options.fail && "downloadModels" in options.fail) {
+        return record("downloadModels", [which], [] as string[]);
+      }
+      const targets = catalog.filter(
+        (g) => which.length === 0 || which.includes(g.id),
+      );
+      downloadCancelled = false;
+      const installed: string[] = [];
+      let index = 0;
+      for (const group of targets) {
+        const file = `${group.id}.bin`;
+        if (downloadCancelled) {
+          onEvent({ kind: "cancelled", id: group.id });
+          throw new Error("download cancelled");
+        }
+        onEvent({
+          kind: "started",
+          id: group.id,
+          file,
+          total: group.bytes,
+          index,
+          count: targets.length,
+        });
+        onEvent({
+          kind: "progress",
+          id: group.id,
+          received: Math.floor(group.bytes / 2),
+          total: group.bytes,
+        });
+        onEvent({ kind: "progress", id: group.id, received: group.bytes, total: group.bytes });
+        onEvent({ kind: "verifying", id: group.id });
+        onEvent({ kind: "installed", id: group.id, file });
+        group.installed = true;
+        installed.push(file);
+        index += 1;
+      }
+      onEvent({ kind: "done", installed });
+      return record("downloadModels", [which], installed);
+    },
+
+    pauseDownloads() {
+      return record("pauseDownloads", [], undefined as void);
+    },
+
+    resumeDownloads() {
+      return record("resumeDownloads", [], undefined as void);
+    },
+
+    cancelDownloads() {
+      downloadCancelled = true;
+      return record("cancelDownloads", [], undefined as void);
     },
   };
 }

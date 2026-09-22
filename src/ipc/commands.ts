@@ -28,6 +28,8 @@ import type {
   LintDiagnostic,
   LintReport,
   DeckDeleteMode,
+  DownloadEvent,
+  ModelGroup,
   ModelStatus,
   NextPromptArgs,
   Overview,
@@ -201,6 +203,32 @@ export const tauriIpc: Ipc = {
 
   epReport() {
     return invoke<string>("ep_report");
+  },
+
+  listModelCatalog() {
+    return invoke<ModelGroup[]>("list_model_catalog", {});
+  },
+
+  modelsDir() {
+    return invoke<string>("models_dir", {});
+  },
+
+  async downloadModels(which, onEvent) {
+    const channel = new Channel<DownloadEvent>();
+    channel.onmessage = onEvent;
+    return invoke<string[]>("download_models", { which, channel });
+  },
+
+  pauseDownloads() {
+    return invoke<void>("pause_downloads", {});
+  },
+
+  resumeDownloads() {
+    return invoke<void>("resume_downloads", {});
+  },
+
+  cancelDownloads() {
+    return invoke<void>("cancel_downloads", {});
   },
 
   undoReview() {

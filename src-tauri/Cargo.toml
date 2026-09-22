@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Offline-first language practice: on-device ASR, TTS, FSRS, grammar, SQLite"
 edition = "2021"
 rust-version = "1.77"
+# Matches LICENSE at the repo root and `bundle.license` in tauri.conf.json.
+# Without it `cargo deny check licenses` reports the crate as unlicensed.
+license = "MIT"
+repository = "https://github.com/lubdhak7414/offline-language-practice"
 
 [lib]
 name = "offline_language_practice_lib"
@@ -53,6 +57,19 @@ harper-core = "=0.62.0"
 
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
+
+# Subsystem 6: in-app model downloader (Phase 5).
+# TLS: `default-tls` (native-tls) on purpose, not `rustls-tls`. reqwest's
+# rustls feature pulls aws-lc-rs, whose build needs NASM on Windows
+# x86_64 — a build dependency the release runners do not have and that
+# would only ever fail on the one platform this repo cannot test locally.
+# native-tls uses SChannel on Windows and Security.framework on macOS, and
+# OpenSSL on Linux, which the Tauri Linux build already requires.
+reqwest = { version = "0.12", default-features = false, features = [
+  "default-tls",
+  "http2",
+] }
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml"] }
