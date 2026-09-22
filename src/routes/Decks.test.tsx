@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
+import type { CardRow } from "../ipc/types";
 import { Decks } from "./Decks";
 
 let restore: (() => void) | undefined;
@@ -19,6 +20,41 @@ afterEach(() => {
 });
 
 describe("Decks", () => {
+  it("ignores a slow reply for a deck the user has already left", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({
+      decks: [{ id: "default", name: "Default" }, { id: "travel", name: "Travel" }],
+      cards: [
+        { id: "c1", deck_id: "default", front: "from-default", back: "B" },
+        { id: "c2", deck_id: "travel", front: "from-travel", back: "B" },
+      ],
+    });
+    // Every listCards call waits until the test releases it, so replies can
+    // be delivered out of order.
+    const pending: Array<{ deckId: string | undefined; release: () => Promise<void> }> = [];
+    const slow: MockIpc = {
+      ...mock,
+      listCards: (deckId?: string) =>
+        new Promise<CardRow[]>((resolve) => {
+          pending.push({ deckId, release: async () => resolve(await mock.listCards(deckId)) });
+        }),
+    };
+    mount(slow);
+
+    await user.click(await screen.findByRole("button", { name: /^Default/ }));
+    await user.click(screen.getByRole("button", { name: /^Travel/ }));
+    await waitFor(() => expect(pending.map((p) => p.deckId)).toEqual([undefined, "default", "travel"]));
+
+    // Travel (the current selection) answers first; Default arrives late.
+    await pending[2]!.release();
+    expect(await screen.findByText("from-travel")).toBeInTheDocument();
+    await pending[1]!.release();
+    await pending[0]!.release();
+
+    await waitFor(() => expect(screen.getByText("from-travel")).toBeInTheDocument());
+    expect(screen.queryByText("from-default")).not.toBeInTheDocument();
+  });
+
   it("lists decks with their counts", async () => {
     mount(
       createMockIpc({

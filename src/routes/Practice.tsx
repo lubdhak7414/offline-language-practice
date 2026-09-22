@@ -42,6 +42,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
   const [checkLint, setCheckLint] = useState<LintReport | null>(null);
   const [checking, setChecking] = useState(false);
   const checkingRef = useRef(false);
+  // Newest request wins: a double-click on Skip leaves two nextPrompt calls in
+  // flight, and the slower one must not bring back a prompt already replaced.
+  const promptSeq = useRef(0);
 
   const runCheck = useCallback(async () => {
     if (checkingRef.current || checkText.trim() === "") return;
@@ -60,6 +63,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
 
   const loadPrompt = useCallback(
     async (session: string | undefined, cat: string) => {
+      const seq = ++promptSeq.current;
       setError(null);
       setReport(null);
       setStage("prompt");
@@ -68,9 +72,11 @@ export function Practice(props: { announce: (msg: string) => void }) {
           ...(session === undefined ? {} : { sessionId: session }),
           category: cat,
         });
+        if (seq !== promptSeq.current) return;
         setPrompt(next);
         if (next) announce(next.prompt_text);
       } catch (e) {
+        if (seq !== promptSeq.current) return;
         setError(String(e));
       }
     },

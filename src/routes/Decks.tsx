@@ -30,6 +30,12 @@ export function Decks(props: { announce: (msg: string) => void }) {
   // live outside render. See the note in Review.tsx for the same pattern.
   const busy = useRef(false);
 
+  // Monotonic token for card loads. Clicking between decks leaves two
+  // listCards calls in flight, and the slower reply must not repaint the table
+  // for a deck the user has already left. `busy` is the wrong tool here: it
+  // drops the *newer* request, and for a read the newest is the one that wins.
+  const cardsSeq = useRef(0);
+
   const loadDecks = useCallback(async () => {
     try {
       const rows = await ipc().listDecks();
@@ -40,16 +46,20 @@ export function Decks(props: { announce: (msg: string) => void }) {
   }, []);
 
   const loadCards = useCallback(async (deckId: string | null) => {
+    const seq = ++cardsSeq.current;
     setLoading(true);
     setError(null);
     try {
       const rows = await ipc().listCards(deckId ?? undefined);
+      if (seq !== cardsSeq.current) return;
       setCards(rows);
       setChecked(new Set());
     } catch (e) {
+      if (seq !== cardsSeq.current) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      // Only the load still wanted may clear the spinner.
+      if (seq === cardsSeq.current) setLoading(false);
     }
   }, []);
 

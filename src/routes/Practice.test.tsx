@@ -60,6 +60,49 @@ describe("Practice", () => {
     );
   });
 
+  it("keeps the newest prompt when two Skips resolve out of order", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({
+      prompts: [
+        makePrompt({ id: "p1" }),
+        makePrompt({ id: "p2", prompt_text: "Stale prompt", target_text: null }),
+        makePrompt({ id: "p3", prompt_text: "Fresh prompt", target_text: null }),
+      ],
+    });
+    // The first prompt loads normally. Each later reply is decided when it is
+    // *requested* — so the first Skip's reply is "Stale", the second's "Fresh" —
+    // but is only delivered when the test releases it.
+    const held: Array<() => void> = [];
+    let served = 0;
+    const slow: MockIpc = {
+      ...mock,
+      nextPrompt: (args) => {
+        served += 1;
+        const reply = mock.nextPrompt(args);
+        if (served === 1) return reply;
+        return new Promise((resolve) => {
+          held.push(() => resolve(reply));
+        });
+      },
+    };
+    mount(slow);
+    await screen.findByText("Reply to a greeting:");
+
+    await user.click(screen.getByRole("button", { name: "Skip" }));
+    await user.click(screen.getByRole("button", { name: "Skip" }));
+    await waitFor(() => expect(held).toHaveLength(2));
+
+    // The newer request answers first; the older one's reply arrives late.
+    held[1]!();
+    expect(await screen.findByText("Fresh prompt")).toBeInTheDocument();
+    held[0]!();
+
+    // Give the late reply every chance to land before checking it did not.
+    await new Promise((r) => setTimeout(r, 0));
+    await waitFor(() => expect(screen.getByText("Fresh prompt")).toBeInTheDocument());
+    expect(screen.queryByText("Stale prompt")).not.toBeInTheDocument();
+  });
+
   it("switches the session when the category changes", async () => {
     const mock = createMockIpc();
     mount(mock);
