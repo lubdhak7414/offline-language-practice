@@ -82,6 +82,19 @@ jobs:
             target_dir: C:\ct
     env:
       CARGO_TARGET_DIR: ${{ matrix.target_dir }}
+      # AppImage only. linuxdeploy ships its own (old) binutils, and that
+      # `strip` cannot parse the `.relr.dyn` sections that modern toolchains
+      # emit for packed relative relocations:
+      #
+      #   strip: libzstd.so.1: unknown type [0x13] section `.relr.dyn'
+      #   failed to bundle project: `failed to run linuxdeploy`
+      #
+      # Reproduced locally against system libraries built that way; the deb
+      # and rpm bundle fine and only the AppImage step dies. Skipping the
+      # strip costs a few MB in an AppImage that is already ~116 MB and is
+      # the documented workaround. Harmless on a runner that would not have
+      # hit it.
+      NO_STRIP: "1"
     steps:
       - uses: actions/checkout@v4
         with:
