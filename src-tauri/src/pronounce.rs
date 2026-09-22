@@ -224,18 +224,68 @@ fn align_tokens(h: &[String], t: &[String]) -> Vec<WordOp> {
 // Acoustic scoring: CTC forward, forced alignment, Goodness of Pronunciation
 // ---------------------------------------------------------------------------
 
-/// Temperature mapping a mean log-posterior-ratio onto 0..=100.
+/// Where a word's GOP falls among words that expert raters scored as
+/// perfectly pronounced: `(gop, percentile)` knots, linearly interpolated.
 ///
-/// `score = 100 * exp(gop / TAU)`. At `TAU = 0.55` a word the model is ~half
-/// as sure about as its own best guess (`gop = -0.69`) lands near 28, and a
-/// word it is almost as sure about (`gop = -0.1`) lands near 83. One constant,
-/// documented here, rather than a table of thresholds nobody can justify.
-pub const TAU: f32 = 0.55;
+/// So a score of 10 means "this word's audio matched the target less well
+/// than 90% of correctly-said words do". It is a percentile, not a grade:
+/// about 64% of correctly-said words tie at GOP ~ 0, which is why the last
+/// knot jumps from 34 to 100.
+///
+/// Measured, not chosen. Built by `scripts/calibrate-gop.py` from the
+/// `corpus::corpus_dump_gop` run over speechocean762 (OpenSLR-101, CC BY 4.0:
+/// 5,000 read sentences by L1-Mandarin learners, half of them children, every
+/// word rated 0-10 by five experts). Fitted on the corpus's train split;
+/// every figure here is on its test split, as the table is interpolated:
+///
+/// * Flagging below [`FLAG_BELOW`] hits 10.2% of words the experts rated
+///   correct (>= 7) and catches 37% of the ones they rated mispronounced
+///   (<= 6). Discrimination is AUC 0.80 and no mapping can raise it; at any
+///   cutoff only ~20-28% of flagged words are actually mispronounced, so a
+///   flag is a hint to listen again, never a verdict.
+/// * The sentence score — the mean of these — tracks expert sentence
+///   accuracy at Pearson 0.47.
+///
+/// Scope: L1-Mandarin speakers only. Nothing here was validated against
+/// other first languages. This replaced `100 * exp(gop / 0.55)`, a
+/// hand-picked constant that on the same data called 28% of correctly-said
+/// words "poor".
+pub const GOP_PERCENTILE: [(f32, u8); 25] = [
+    (-14.3822, 0),
+    (-7.8743, 1),
+    (-6.5342, 1),
+    (-5.4974, 2),
+    (-4.9056, 3),
+    (-4.4019, 4),
+    (-4.0104, 5),
+    (-3.7124, 6),
+    (-3.4266, 7),
+    (-3.1950, 8),
+    (-2.9261, 9),
+    (-2.7203, 10),
+    (-2.2821, 12),
+    (-1.9404, 14),
+    (-1.6192, 16),
+    (-1.3679, 18),
+    (-1.1228, 20),
+    (-0.9198, 22),
+    (-0.7237, 24),
+    (-0.5557, 26),
+    (-0.4010, 28),
+    (-0.2566, 30),
+    (-0.1262, 32),
+    (-0.0158, 34),
+    (0.0000, 100),
+];
 
-/// At or above this a word reads as clearly said.
-pub const VERDICT_GOOD: u8 = 70;
-/// At or above this it is recognisable but muddy; below, it is wrong.
-pub const VERDICT_UNCLEAR: u8 = 40;
+/// Words scoring below this are flagged for a second listen ("unclear").
+///
+/// The 10th percentile of correctly-said words: a learner who says every
+/// word right still sees about one flag in ten words. Raising it catches more
+/// real mistakes at the cost of more false alarms — `calibrate-gop.py` prints
+/// the whole trade-off. Acoustic scoring never says "poor": with ~25%
+/// precision it can suggest a word deserves attention, not that it was wrong.
+pub const FLAG_BELOW: u8 = 10;
 
 /// Why a phrase could not be scored acoustically.
 ///
@@ -586,25 +636,38 @@ pub fn ctc_forced_align(
     Some(spans)
 }
 
-/// Map a mean log-posterior ratio onto 0..=100.
+/// Map a mean log-posterior ratio onto 0..=100 via [`GOP_PERCENTILE`].
 ///
-/// Monotone and clamped; `gop == 0` (the model's own best guess) is 100.
-/// Positive input cannot occur but is clamped rather than trusted.
+/// Monotone and clamped; `gop == 0` (the model's own best guess) is 100,
+/// and anything below the first knot is 0. Positive input cannot occur but
+/// is clamped rather than trusted. Non-finite input is 0, as before.
 pub fn gop_to_score(gop: f32) -> u8 {
     if !gop.is_finite() {
         return 0;
     }
-    let raw = 100.0 * (gop.min(0.0) / TAU).exp();
-    raw.round().clamp(0.0, 100.0) as u8
+    let (first, last) = (GOP_PERCENTILE[0], GOP_PERCENTILE[GOP_PERCENTILE.len() - 1]);
+    if gop <= first.0 {
+        return first.1;
+    }
+    if gop >= last.0 {
+        return last.1;
+    }
+    for pair in GOP_PERCENTILE.windows(2) {
+        let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+        if gop <= x1 {
+            let t = (gop - x0) / (x1 - x0);
+            let v = y0 as f32 + (y1 as f32 - y0 as f32) * t;
+            return v.round().clamp(0.0, 100.0) as u8;
+        }
+    }
+    last.1
 }
 
 fn verdict_for(score: u8) -> &'static str {
-    if score >= VERDICT_GOOD {
+    if score >= FLAG_BELOW {
         "good"
-    } else if score >= VERDICT_UNCLEAR {
-        "unclear"
     } else {
-        "poor"
+        "unclear"
     }
 }
 
@@ -895,8 +958,8 @@ mod real_models {
     //! **What these tests do and do not settle.** They prove the pipeline
     //! works end to end on real weights, that word alignments are sane, and
     //! that the score discriminates — the right target scores 100 and a
-    //! wrong one scores 0 on the same audio. They do **not** calibrate
-    //! `TAU` for human speech: the on-device voice is unnaturally clean, so
+    //! wrong one scores 0 on the same audio. They do **not** calibrate the
+    //! curve for human speech: the on-device voice is unnaturally clean, so
     //! every word comes back at exactly 100 with a GOP of ~0, and a
     //! saturated metric cannot tell you where the interesting middle of the
     //! range sits. `the_score_degrades_gradually_as_audio_gets_worse`
@@ -1029,12 +1092,12 @@ mod real_models {
             want.len()
         );
 
-        // The calibration claim: clear speech lands in "good", not "needs
-        // work". If TAU ever drifts so that a clean reading scores like a
+        // Clear speech must land high, not among the flagged. If the
+        // percentile table ever drifts so that a clean reading scores like a
         // struggling learner, this is what catches it.
         assert!(
             score.overall >= 70,
-            "clear speech scored {} — TAU ({TAU}) is mis-calibrated",
+            "clear speech scored {} — GOP_PERCENTILE is mis-built",
             score.overall
         );
         assert!(
@@ -1077,10 +1140,10 @@ mod real_models {
         // 0 and 0.05. Part of that is this test's own crudeness — additive
         // white noise wrecks recognition itself, not just articulation, and
         // by 0.05 the transcript is already garbage — but it does mean
-        // `TAU = 0.55` is a steep mapping, and a learner with a mediocre
-        // microphone could be told they are far worse than they are. The
-        // assertion below only demands monotonicity; tuning TAU needs real
-        // speakers, which this repo does not have.
+        // the old `TAU = 0.55` curve was a cliff. It has since been replaced by
+        // a percentile table measured against expert ratings (see
+        // `GOP_PERCENTILE`); this test still only demands monotonicity,
+        // because synthetic noise says nothing about real learners.
         let e = engines();
         let target = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG";
         let clean = speak(&e, target);
@@ -1612,6 +1675,42 @@ mod tests {
     }
 
     #[test]
+    fn the_percentile_table_is_well_formed() {
+        for pair in GOP_PERCENTILE.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "GOP knots must strictly increase: {pair:?}"
+            );
+            assert!(pair[0].1 <= pair[1].1, "scores must not decrease: {pair:?}");
+        }
+        assert_eq!(
+            GOP_PERCENTILE[GOP_PERCENTILE.len() - 1],
+            (0.0, 100),
+            "GOP 0 is perfect"
+        );
+        assert!(GOP_PERCENTILE.iter().all(|&(g, v)| g <= 0.0 && v <= 100));
+        // The flag threshold is a knot, so the cutoff is exactly where the
+        // measurement put it rather than an interpolation artefact.
+        assert!(GOP_PERCENTILE.iter().any(|&(_, v)| v == FLAG_BELOW));
+    }
+
+    #[test]
+    fn acoustic_scoring_flags_but_never_condemns() {
+        // ~25% of flags are right (see GOP_PERCENTILE): a hint, not "poor".
+        assert_eq!(verdict_for(0), "unclear");
+        assert_eq!(verdict_for(FLAG_BELOW - 1), "unclear");
+        assert_eq!(verdict_for(FLAG_BELOW), "good");
+        assert_eq!(verdict_for(100), "good");
+        let cut = GOP_PERCENTILE
+            .iter()
+            .find(|&&(_, v)| v == FLAG_BELOW)
+            .unwrap()
+            .0;
+        assert_eq!(verdict_for(gop_to_score(cut)), "good");
+        assert_eq!(verdict_for(gop_to_score(cut - 0.3)), "unclear");
+    }
+
+    #[test]
     fn gop_to_score_is_monotone_and_clamped() {
         assert_eq!(gop_to_score(0.0), 100);
         assert_eq!(
@@ -1712,7 +1811,11 @@ mod tests {
             "the mispronounced word must fall, got {}",
             sat.score
         );
-        assert_eq!(sat.verdict, "poor");
+        // Whether this synthetic word crosses the flag line is a fact about
+        // the calibration table, not about alignment; that is pinned in
+        // `acoustic_scoring_flags_but_never_condemns`. What matters here is
+        // that acoustic scoring never says "poor" — it can only hint.
+        assert_ne!(sat.verdict, "poor");
         assert!(sat.gop < cat.gop);
     }
 

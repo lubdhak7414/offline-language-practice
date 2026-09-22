@@ -355,15 +355,14 @@ button.primary.recording {
   font-size: var(--text-sm);
 }
 
-/* Acoustic verdicts. Same colour language as the alignment above, plus the
-   number itself, so the ranking survives both colour blindness and a
-   screenshot printed in grey. */
+/* Acoustic flags. Same colour language as the alignment above, plus the word
+   "check" itself, so a flag survives both colour blindness and a screenshot
+   printed in grey. There is deliberately no per-word number. */
 .word-gop {
   white-space: nowrap;
 }
-.word-score {
+.word-flag {
   font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
   margin-inline-start: 0.2em;
   vertical-align: super;
 }

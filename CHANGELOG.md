@@ -26,6 +26,16 @@ Notable changes to this project. The format follows
 
 ### Changed
 
+- **Pronunciation feedback is calibrated against expert ratings, and says
+  what it can and cannot tell.** The old per-word scores, checked against
+  speechocean762's expert ratings, called 28% of correctly pronounced words
+  "poor". The score now comes from a table measured against those ratings.
+  The pronunciation meter summarises the sentence; individual words are only
+  marked "check" when they are worth another listen — about one correctly
+  said word in ten — and never shown as wrong, because at best about one flag
+  in four is a real mistake. Calibrated on speakers whose first language is
+  Mandarin only.
+
 - Release builds cover Linux (x86_64), macOS (Apple Silicon) and Windows
   (x86_64). Intel Macs are not supported: the ONNX Runtime binding ships no
   prebuilt library for them.

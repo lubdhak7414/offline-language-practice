@@ -99,25 +99,47 @@ export function WordAlignmentView(props: { ops: WordOp[] }) {
 }
 
 /**
- * The target sentence again, this time with how clearly each word was said.
+ * The target sentence again, with the words worth a second listen marked.
  *
  * Shown only when acoustic scoring ran. It answers a different question from
  * the alignment above — that one says which word was wrong, this one says
- * which word was mumbled.
+ * which word did not come through clearly.
+ *
+ * No per-word number. Measured against expert raters, only about one flag in
+ * four marks a word they would call mispronounced (see GOP_PERCENTILE in
+ * pronounce.rs), so a two-digit score would claim a precision that is not
+ * there. A flag is a hint, and says so in text as well as colour.
  */
 export function WordScoreView(props: { words: WordScore[] }) {
   return (
     <p class="alignment" aria-label="Word by word pronunciation">
-      {props.words.map((w, i) => (
-        <span
-          key={i}
-          class={`word word-gop word-${w.verdict}`}
-          title={`${w.word}: ${w.score} out of 100`}
-        >
-          {w.word}
-          <span class="word-score">{w.score}</span>
-        </span>
-      ))}
+      {props.words.map((w, i) => {
+        const flagged = w.verdict !== "good";
+        return (
+          <span
+            key={i}
+            class={`word word-gop word-${w.verdict}`}
+            title={flagged ? `${w.word}: worth another listen` : `${w.word}: came through clearly`}
+          >
+            {w.word}
+            {flagged && <span class="word-flag">check</span>}
+          </span>
+        );
+      })}
+    </p>
+  );
+}
+
+/** One line under the word view: what a flag means, or that there are none. */
+export function FlagNote(props: { words: WordScore[] }) {
+  const flagged = props.words.filter((w) => w.verdict !== "good").length;
+  if (flagged === 0) {
+    return <p class="muted">Every word came through clearly.</p>;
+  }
+  return (
+    <p class="muted">
+      {flagged === 1 ? "One word is" : `${flagged} words are`} worth another listen. This
+      check often mistakes an accent for an error, so treat a flag as a hint, not a mistake.
     </p>
   );
 }

@@ -9,6 +9,7 @@ import { practiceKeyAction } from "../lib/keyboard";
 import {
   DeliveryNote,
   LintedText,
+  FlagNote,
   Meter,
   WordAlignmentView,
   WordScoreView,
@@ -328,6 +329,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
             <>
               <h2>How clearly you said it</h2>
               <WordScoreView words={report.pron.words} />
+              <FlagNote words={report.pron.words} />
             </>
           )}
 

@@ -34,7 +34,9 @@ Two different questions, kept apart in the report:
 import argparse
 import bisect
 import csv
+import json
 import math
+import os
 import sys
 
 KNOTS = 32
@@ -53,7 +55,7 @@ def load(path):
                 continue
             age = r["age"].strip()
             rows.append({
-                "split": r["split"], "gop": float(r["gop"]), "now": int(r["score_now"]),
+                "split": r["split"], "utt": r["utt"], "gop": float(r["gop"]), "now": int(r["score_now"]),
                 "human": human, "y": human * 10.0, "age": int(age) if age.isdigit() else None,
             })
     return rows
@@ -188,6 +190,8 @@ def reliability(name, rows, scores):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("tsv")
+    ap.add_argument("--rust", action="store_true",
+                    help="print the percentile table for pronounce.rs, and measure it")
     ap.add_argument("--cutoffs", type=float, nargs="*", default=[],
                     help="print the GOP value at these percentiles of correctly-rated words")
     args = ap.parse_args()
@@ -251,6 +255,60 @@ def main():
     for c in args.cutoffs:
         g = quantile(ref, c / 100.0)
         print(f"  GOP cutoff at the {c:g}th percentile of correctly-said words: {g:.4f}")
+
+    if args.rust:
+        emit_table(ref, test, args.tsv)
+
+
+# Percentile levels the shipped table is pinned at. Dense below the flag
+# cutoff, where the decision is made; sparse near the top, where ~60% of
+# correctly-said words sit at GOP ~ 0 and the curve is a near-vertical step.
+LEVELS = [0, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24,
+          26, 28, 30, 32, 34, 36, 38, 40, 60, 80, 100]
+FLAG_BELOW = 10  # pronounce.rs FLAG_BELOW
+
+
+def emit_table(ref, test, tsv_path):
+    # Each knot's value is the true percentile *at* its GOP — the share of
+    # correctly-said words at or below it — not the level it was requested at.
+    # Most correct words tie at GOP ~ 0, so several levels land on one GOP;
+    # taking the requested level there would score a perfect word at 36.
+    knots = []
+    for g in sorted({round(quantile(ref, lv / 100.0), 4) for lv in LEVELS}):
+        v = int(round(100.0 * bisect.bisect_right(ref, g) / len(ref)))
+        if knots and v <= knots[-1][1] and g > knots[-1][0]:
+            v = knots[-1][1]  # non-decreasing, never inventing a rise
+        knots.append((g, v))
+    score = lambda g: interp(knots, g)
+    ok = [r for r in test if r["human"] >= 7]
+    mis = [r for r in test if r["human"] <= MISPRONOUNCED_AT_OR_BELOW]
+    fa = sum(score(r["gop"]) < FLAG_BELOW for r in ok) / len(ok)
+    hit = sum(score(r["gop"]) < FLAG_BELOW for r in mis) / len(mis)
+    print(f"\nshipped table ({len(knots)} knots), measured on test as interpolated:")
+    print(f"  flags {100 * fa:.1f}% of correctly-said words, catches {100 * hit:.1f}% of mispronounced")
+
+    by = {}
+    for r in test:
+        by.setdefault(r["utt"], []).append(r)
+    sent = {u: sum(score(w["gop"]) for w in ws) / len(ws) for u, ws in by.items()}
+    print("  sentence score (mean of word scores) against expert sentence accuracy:")
+    print("  (needs scores.json next to the TSV; skipped if absent)")
+    sj = os.path.join(os.path.dirname(os.path.abspath(tsv_path)), "resource", "scores.json")
+    if os.path.exists(sj):
+        S = json.load(open(sj))
+        acc = [S[u]["accuracy"] for u in sent]
+        print(f"    pearson {pearson(list(sent.values()), acc):.3f}")
+        for lo, hi, name in ((90, 101, "Clear"), (75, 90, "Mostly clear"), (55, 75, "Understandable"),
+                             (30, 55, "Hard to follow"), (0, 30, "Needs work")):
+            a = [S[u]["accuracy"] for u, v in sent.items() if lo <= v < hi]
+            if a:
+                print(f"    {name:15} ({lo:3}-{min(hi, 100):3}): n={len(a):4}  expert sentence accuracy "
+                      f"mean {sum(a) / len(a):.2f}/10")
+    print("\n// ---- paste into pronounce.rs ----")
+    print(f"pub const GOP_PERCENTILE: [(f32, u8); {len(knots)}] = [")
+    for g, v in knots:
+        print(f"    ({g:.4f}, {v}),")
+    print("];")
 
 
 if __name__ == "__main__":

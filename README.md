@@ -8,7 +8,7 @@ Everything happens on-device: the speech model, the voice synthesis, the grammar
 
 ## Features
 
-- **Speaking practice** — pick a prompt, record yourself, and get scored: per-word pronunciation from CTC forced alignment, fluency (speaking rate, pauses, fillers), and grammar. About 120 built-in prompts across everyday conversation and job interviews.
+- **Speaking practice** — pick a prompt, record yourself, and get scored: a sentence-level pronunciation score from CTC forced alignment, with words worth another listen marked, plus fluency (speaking rate, pauses, fillers) and grammar. About 120 built-in prompts across everyday conversation and job interviews.
 - **Speech recognition** — transcription runs locally via a Wav2Vec2 ONNX model.
 - **Grammar checking** — transcripts, or anything you type, are checked by a local offline linter with in-place suggestions.
 - **Text-to-speech** — hear correct pronunciation via a local neural voice (Piper).
@@ -79,3 +79,5 @@ See CONTRIBUTING.md for the house rules, which exist because breaking them has a
 MIT. See LICENSE.
 
 The models are downloaded separately and carry their own licenses: the Wav2Vec2 ONNX export and the Piper LibriTTS-R voice are both MIT-licensed upstream.
+
+The pronunciation score is calibrated against [speechocean762](https://www.openslr.org/101/) (Zhang et al., "speechocean762: An Open-Source Non-native English Speech Corpus For Pronunciation Assessment", Interspeech 2021), used under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Only derived numbers — a 25-point lookup table in `src-tauri/src/pronounce.rs` — are included; the corpus itself is not. Its speakers all have Mandarin as a first language, so the calibration has not been checked against other first languages. `scripts/calibrate-gop.py` reproduces the table and prints what it does and does not measure.

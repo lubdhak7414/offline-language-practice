@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DeliveryNote,
+  FlagNote,
   LintedText,
   Meter,
   WordAlignmentView,
@@ -125,10 +126,24 @@ const fluency = (over: Partial<FluencyReport> = {}): FluencyReport => ({
 });
 
 describe("WordScoreView", () => {
-  it("puts the number beside the word, not only a colour", () => {
-    render(<WordScoreView words={[word(), word({ word: "THERE", score: 12, verdict: "poor" })]} />);
-    expect(screen.getByText("96")).toBeInTheDocument();
-    expect(screen.getByText("12")).toBeInTheDocument();
+  it("marks a flagged word in text, not only colour, and shows no number", () => {
+    render(
+      <WordScoreView
+        words={[word(), word({ word: "THERE", score: 7, verdict: "unclear" })]}
+      />,
+    );
+    expect(screen.getAllByText("check")).toHaveLength(1);
+    expect(screen.getByTitle("THERE: worth another listen")).toBeInTheDocument();
+    expect(screen.queryByText("96")).not.toBeInTheDocument();
+    expect(screen.queryByText("7")).not.toBeInTheDocument();
+  });
+
+  it("explains what a flag is worth, or that there are none", () => {
+    const { rerender } = render(<FlagNote words={[word()]} />);
+    expect(screen.getByText("Every word came through clearly.")).toBeInTheDocument();
+    rerender(<FlagNote words={[word(), word({ word: "A", verdict: "unclear" })]} />);
+    expect(screen.getByText(/One word is worth another listen/)).toBeInTheDocument();
+    expect(screen.getByText(/a hint, not a mistake/)).toBeInTheDocument();
   });
 
   it("gives each verdict its own class", () => {
