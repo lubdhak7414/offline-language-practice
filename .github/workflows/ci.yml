@@ -109,3 +109,52 @@ jobs:
       # --all-targets so integration tests under src-tauri/tests/ actually run;
       # --lib silently skipped them.
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets
+
+  # Cross-platform compile gate. The Linux `rust` job above is the one that
+  # runs fmt/clippy/tests; this one only answers "does it still build
+  # somewhere else", which is the question a Linux-only CI cannot answer and
+  # which the per-platform `ort` execution-provider features make real.
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest: it is the oldest glibc a release is
+          # expected to run on, and it is the build host that decides that.
+          - os: ubuntu-22.04
+            cargo_target_dir: /tmp/cargo-target
+          - os: macos-14
+            cargo_target_dir: /tmp/cargo-target
+          # espeak-ng's data compiler truncates paths through a fixed-size
+          # buffer, and the runner's default workspace path is already long.
+          - os: windows-latest
+            cargo_target_dir: C:\ct
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.cargo_target_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+      # espeak needs cmake; every hosted runner ships one, so this only
+      # fails loudly if that ever stops being true.
+      - run: cmake --version
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+          key: ${{ matrix.os }}
+      - run: cargo build --manifest-path src-tauri/Cargo.toml --locked

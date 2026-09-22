@@ -1,8 +1,14 @@
 //! Shared ONNX Runtime execution-provider probing.
 //!
 //! Priority per handoff spec: CUDA -> CoreML -> DirectML -> OpenVINO -> CPU.
-//! With all EP features enabled in Cargo.toml, `with_execution_providers` tries
-//! them in order and falls back to CPU automatically; a failure never crashes.
+//! `with_execution_providers` tries them in order and falls back to CPU
+//! automatically; a failure never crashes.
+//!
+//! The list is deliberately the same on every platform even though the EP
+//! *features* in Cargo.toml are per-target. An EP that was not compiled into
+//! this build fails to register and is skipped, which is the same path an EP
+//! whose hardware is absent takes — so there is one code path to reason
+//! about instead of one per operating system.
 
 use std::sync::OnceLock;
 

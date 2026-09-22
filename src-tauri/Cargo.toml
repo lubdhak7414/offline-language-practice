@@ -28,14 +28,17 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 # NOTE: pinned to rc.12 to unify with piper-rs 0.2.0 (pins ort rc.12 + ndarray 0.16).
 # orp (rc.9) intentionally NOT a dependency — incompatible ort pin; pipeline pattern
 # is implemented manually in asr.rs/tts.rs.
+# Execution-provider features are per-platform (see the target sections
+# below): `ort-sys` fetches a different prebuilt ONNX Runtime for each, and
+# asking a Linux build for CoreML or a macOS build for DirectML asks for a
+# binary that does not exist. The Rust EP types are not feature-gated, so
+# `inference.rs` needs no `cfg` — an EP that was not compiled in simply
+# fails to register and ORT falls back to CPU, which is already the
+# documented behaviour there.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = [
   "download-binaries",
   "ndarray",
   "half",
-  "coreml",
-  "cuda",
-  "directml",
-  "openvino",
 ] }
 ndarray = "0.16"
 piper-rs = "0.2.0"
@@ -48,6 +51,21 @@ harper-core = "=0.62.0"
 
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["coreml"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+  "directml",
+  "cuda",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+  "cuda",
+  "openvino",
+] }
 
 [features]
 default = []
