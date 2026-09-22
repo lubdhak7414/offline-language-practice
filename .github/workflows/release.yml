@@ -30,7 +30,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
@@ -96,7 +96,7 @@ jobs:
       # hit it.
       NO_STRIP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -114,7 +114,7 @@ jobs:
       # espeak needs cmake at build time; every hosted runner ships one.
       - run: cmake --version
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -128,7 +128,7 @@ jobs:
           workspaces: "src-tauri"
           key: release-${{ matrix.os }}
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -176,7 +176,7 @@ jobs:
               done
           ls -l staged
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bundles-${{ matrix.label }}
           path: staged/
@@ -195,7 +195,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: bundles-*
           merge-multiple: true
@@ -205,7 +205,7 @@ jobs:
       # release binaries. Attesting the artifacts rather than only the
       # checksum file matters: provenance over a list of hashes proves
       # where the list came from, not where the binaries came from.
-      - uses: actions/attest-build-provenance@v1
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*"
 
@@ -217,7 +217,7 @@ jobs:
             | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           draft: true
