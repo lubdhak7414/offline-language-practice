@@ -10,7 +10,7 @@ name = "offline_language_practice_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Subsystem 1: shell + IPC
