@@ -6,6 +6,15 @@ Notable changes to this project. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fluency feedback no longer times words that were not said.** Pause,
+  rate and hesitation figures used word timings aligned to the prompt even
+  when the recording said something else, so reading part of a prompt was
+  reported as speaking slowly. Timings are now used only when what was said
+  lines up word for word with the prompt; otherwise pauses are measured from
+  the audio itself.
+
 ## [0.1.0] — 2026-09-22
 
 First release. Speaking practice, pronunciation and fluency scoring, grammar

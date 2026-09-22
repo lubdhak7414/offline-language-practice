@@ -14,6 +14,11 @@
 //!   calibrated for digital silence and mistakes ordinary room noise —
 //!   a fan, a street outside — for continuous speech, which erases every
 //!   pause in the recording.
+//! * **Timings are only used when they belong to this recording.** Word spans
+//!   come from forced alignment against the target phrase, which succeeds
+//!   whether or not the learner said it. They are accepted only when the
+//!   transcript and the target line up one word to one word; otherwise the
+//!   energy envelope measures the pauses and `method` reports `"energy"`.
 //!
 //! # Caveat: text fillers under-count
 //!
@@ -255,6 +260,19 @@ pub fn count_hesitations(words: &[WordScore]) -> i64 {
         .count() as i64
 }
 
+/// Whether forced-alignment timings for `target` can be trusted to describe
+/// `transcript`.
+///
+/// A substitution is harmless: the learner said *something* in that slot, so
+/// the span still bounds real audio. An insertion or a deletion is not — a
+/// deleted target word has no audio behind its span, and an inserted spoken
+/// word has no span at all. Either breaks the one-to-one correspondence that
+/// makes a word timing mean anything, even when the word counts still agree.
+pub fn timings_describe(transcript: &str, target: &str) -> bool {
+    let a = crate::pronounce::align_words(transcript, target);
+    a.inserted == 0 && a.deleted == 0
+}
+
 /// 0..=100 for speaking rate: flat inside the comfortable band, falling
 /// linearly outside it.
 pub fn rate_score(articulation_wpm: f32) -> u8 {
@@ -303,7 +321,10 @@ pub fn filler_score(fillers: FillerCounts, hesitations: i64, word_count: usize) 
 /// speech to measure honestly.
 ///
 /// `words` are the forced-alignment word scores when acoustic scoring ran;
-/// without them pauses come from the energy envelope instead.
+/// without them — or when they do not describe this transcript — pauses come
+/// from the energy envelope instead. Callers should additionally gate on
+/// [`timings_describe`]: a length match alone cannot see a dropped word paid
+/// for by an added one.
 pub fn analyze(
     pcm: &[f32],
     sample_rate: u32,
@@ -315,6 +336,15 @@ pub fn analyze(
     if word_count < MIN_WORDS || duration_ms <= 0 {
         return None;
     }
+
+    // The word timings describe the *target* phrase, not the recording: forced
+    // alignment spells whatever it is asked to spell, whether or not the audio
+    // contains it. Timing a transcript against another utterance's spans
+    // reports pauses between words nobody said, and divides a real word count
+    // by a duration that was never spoken. One span per spoken word is the
+    // cheapest proof the two describe the same thing; when they disagree the
+    // energy envelope is the only self-consistent source left.
+    let words = words.filter(|w| w.len() == word_count);
 
     let (pauses, method, span_ms) = match words {
         Some(w) if w.len() >= 2 => {
@@ -606,6 +636,55 @@ mod tests {
             "the envelope sees no gap here; the timings do"
         );
         assert_eq!(report.longest_pause_ms, 900);
+    }
+
+    #[test]
+    fn timings_for_a_different_utterance_are_ignored() {
+        // Nine target words aligned across the clip; the learner said four.
+        let pcm = tone(16_000, &[(1200.0, 0.5), (600.0, 0.0), (1000.0, 0.5)]);
+        let words: Vec<WordScore> = (0..9)
+            .map(|i| word("W", i * 300, i * 300 + 200, 20))
+            .collect();
+        let report = analyze(&pcm, 16_000, "ONE TWO THREE FOUR", Some(&words), 2800)
+            .expect("four words is measurable");
+        assert_eq!(
+            report.method, "energy",
+            "nine spans cannot time four spoken words"
+        );
+        assert_eq!(report.hesitation_count, 0, "no trustworthy spans to count");
+    }
+
+    #[test]
+    fn a_substitution_keeps_the_timings_but_a_deletion_does_not() {
+        assert!(
+            timings_describe("THE HAT SAT", "THE CAT SAT"),
+            "sub keeps the slot"
+        );
+        assert!(
+            !timings_describe("THE SAT", "THE CAT SAT"),
+            "deleted word has no audio"
+        );
+        assert!(
+            !timings_describe("THE BIG CAT SAT", "THE CAT SAT"),
+            "inserted word has no span"
+        );
+        assert!(
+            timings_describe("THE CAT SAT", "the cat sat."),
+            "case and punctuation only"
+        );
+    }
+
+    #[test]
+    fn a_one_word_shift_is_rejected_although_the_counts_match() {
+        // Dropped the first word, added one at the end: five tokens against
+        // five, so `analyze`'s length check alone would accept it while every
+        // span is off by one word. This is the case that needs the caller gate.
+        let said = "TELL ME ABOUT YOURSELF NOW";
+        let target = "PLEASE TELL ME ABOUT YOURSELF";
+        assert_eq!(tokenize(said).len(), tokenize(target).len());
+        assert!(!timings_describe(said, target));
+        // Pure substitutions keep every slot, so they are not rejected.
+        assert!(timings_describe("THE CAT ON MAT", "THE BIG CAT SAT"));
     }
 
     #[test]

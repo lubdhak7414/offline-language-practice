@@ -599,7 +599,7 @@ async fn score_attempt(
     // own `spawn_blocking`.
     let lint = crate::grammar::lint_text_async(scored.text.clone(), dialect).await?;
 
-    let fluency = analyze_fluency(pcm, &scored, duration_ms).await?;
+    let fluency = analyze_fluency(pcm, &scored, target.as_deref(), duration_ms).await?;
 
     let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
     crate::practice::record_attempt(
@@ -623,12 +623,20 @@ async fn score_attempt(
 async fn analyze_fluency(
     pcm: Arc<Vec<f32>>,
     scored: &ScoredTranscript,
+    target: Option<&str>,
     duration_ms: i64,
 ) -> Result<Option<FluencyReport>, String> {
     let transcript = scored.text.clone();
-    // Word timings come from the forced alignment when acoustic scoring
-    // ran; without them the energy envelope finds the pauses instead.
-    let words = scored.pron.as_ref().map(|p| p.words.clone());
+    // Word timings come from the forced alignment when acoustic scoring ran —
+    // but that alignment spells the target whether or not it was said, so the
+    // timings are only used when the transcript lines up with the target word
+    // for word. Otherwise the energy envelope finds the pauses instead.
+    let words = match (scored.pron.as_ref(), target) {
+        (Some(p), Some(t)) if crate::fluency::timings_describe(&transcript, t) => {
+            Some(p.words.clone())
+        }
+        _ => None,
+    };
     tokio::task::spawn_blocking(move || {
         crate::fluency::analyze(
             &pcm,
