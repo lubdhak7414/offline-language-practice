@@ -45,6 +45,20 @@ jobs:
               exit 1
             fi
           done
+          # Windows MSI (WiX) packs the version into 16-bit fields, so a
+          # pre-release part must be a plain number <= 65535: 0.2.0-1, never
+          # 0.2.0-rc.1. The rehearsal for 0.1.0 found this the slow way — the
+          # Windows leg built for 15 minutes, then died at the MSI step with
+          # "optional pre-release identifier ... must be numeric-only".
+          case "$VERSION" in
+            *-*)
+              PRE="${VERSION#*-}"
+              if ! [[ "$PRE" =~ ^[0-9]+$ ]] || [ "$PRE" -gt 65535 ]; then
+                echo "::error::Pre-release '$PRE' cannot be packaged as an MSI. Use a number, e.g. ${VERSION%%-*}-1."
+                exit 1
+              fi
+              ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   build:
@@ -134,7 +148,6 @@ jobs:
           key: release-${{ matrix.os }}
 
       - uses: tauri-apps/tauri-action@v1
-        id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -162,36 +175,6 @@ jobs:
             Models are not bundled. The app downloads them on first run, or
             run `scripts/download-models.sh`.
 
-      # Keep the built bundles for the checksum/attestation job. The paths
-      # tauri-action reports are a JSON array of absolute paths.
-      - name: Stage artifacts
-        shell: bash
-        run: |
-          mkdir -p staged
-          # Files only. macOS bundles include the .app *directory* as well
-          # as the .dmg that contains it; copying the directory would make
-          # the attestation step glob over thousands of inner files and
-          # would upload something nobody can verify with sha256sum.
-          echo '${{ steps.tauri.outputs.artifactPaths }}' \
-            | jq -r '.[]' \
-            | while read -r p; do
-                if [ -f "$p" ]; then
-                  cp "$p" staged/
-                elif [ -d "$p" ]; then
-                  echo "skipping directory: $p"
-                else
-                  echo "missing: $p"
-                fi
-              done
-          ls -l staged
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bundles-${{ matrix.label }}
-          path: staged/
-          if-no-files-found: error
-          retention-days: 7
-
   # Checksums and provenance are the whole security story for an unsigned
   # release, so they are produced once, over every platform's output, rather
   # than per job where they could silently cover only part of the set.
@@ -211,11 +194,22 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: bundles-*
-          merge-multiple: true
-          path: dist
+      # Checksum and attest exactly what a user can download: the draft's
+      # own assets, not files handed over by the build jobs. tauri-action
+      # uploads things the build never reports — the rehearsal for 0.1.0
+      # found the macOS `.app.tar.gz`, tarred at upload time, sitting in the
+      # release with no checksum and no attestation, where
+      # `sha256sum -c --ignore-missing` would silently skip it.
+      - name: Download the draft's assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+          # A previous attempt's list; it is regenerated below, and it must
+          # not become a subject of its own attestation.
+          rm -f dist/SHA256SUMS
 
       # `subject-path` fails on a glob that matches nothing, with an error that
       # does not say why. Say why.
