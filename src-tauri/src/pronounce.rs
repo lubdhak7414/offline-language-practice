@@ -708,6 +708,175 @@ pub fn score_against_target(
 }
 
 #[cfg(test)]
+mod corpus {
+    //! Calibration data for [`gop_to_score`], from human ratings.
+    //!
+    //! `#[ignore]`d and needs two things off-repo: the model files, and
+    //! speechocean762 (OpenSLR-101, CC BY 4.0 — 5,000 read sentences by
+    //! non-native speakers, every word scored 0-10 by five experts):
+    //!
+    //!   curl -LO https://www.openslr.org/resources/101/speechocean762.tar.gz
+    //!   tar xzf speechocean762.tar.gz
+    //!   OLP_CORPUS_DIR=$PWD/speechocean762 OLP_MODELS_DIR=$PWD/models \
+    //!     cargo test --release --manifest-path src-tauri/Cargo.toml \
+    //!     --lib corpus_dump_gop -- --ignored --nocapture
+    //!   python3 scripts/calibrate-gop.py $OLP_CORPUS_DIR/gop_dump.tsv
+    //!
+    //! It writes one row per scored word: the raw GOP this module computes,
+    //! the score the current mapping gives it, and the human accuracy. The
+    //! fit itself happens in `scripts/calibrate-gop.py`, outside the build.
+    //! Only the ASR model is loaded — no TTS, so espeak's global state is
+    //! never touched.
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// 16-bit PCM mono WAV to samples in [-1, 1], plus its sample rate.
+    /// Walks the RIFF chunks rather than assuming a 44-byte header.
+    fn read_wav(path: &Path) -> (Vec<f32>, u32) {
+        let b = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE");
+        let (mut i, mut rate, mut bits, mut channels) = (12usize, 0u32, 0u16, 0u16);
+        while i + 8 <= b.len() {
+            let id = &b[i..i + 4];
+            let len = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
+            let body = &b[i + 8..(i + 8 + len).min(b.len())];
+            if id == b"fmt " && body.len() >= 16 {
+                channels = u16::from_le_bytes([body[2], body[3]]);
+                rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            } else if id == b"data" {
+                assert_eq!(
+                    (channels, bits),
+                    (1, 16),
+                    "{}: not 16-bit mono",
+                    path.display()
+                );
+                let pcm = body
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                    .collect();
+                return (pcm, rate);
+            }
+            i += 8 + len + (len & 1);
+        }
+        panic!("{}: no data chunk", path.display());
+    }
+
+    /// `key<TAB>value` lines, the Kaldi layout the corpus uses.
+    fn kaldi_map(path: &Path) -> HashMap<String, String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .lines()
+            .filter_map(|l| l.split_once(char::is_whitespace))
+            .map(|(k, v)| (k.to_string(), v.trim().to_string()))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "corpus"]
+    fn corpus_dump_gop() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("OLP_CORPUS_DIR")
+                .expect("set OLP_CORPUS_DIR to an extracted speechocean762; see module doc"),
+        );
+        if std::env::var_os("OLP_MODELS_DIR").is_none() {
+            let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models");
+            std::env::set_var("OLP_MODELS_DIR", models);
+        }
+        let model = crate::asr::find_model().expect("no ASR model; set OLP_MODELS_DIR");
+        let asr = crate::asr::AsrEngine::load(&model).expect("load ASR");
+        let vocab = crate::asr::load_vocab().expect("vocab");
+
+        let scores: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("resource/scores.json")).expect("scores.json"),
+        )
+        .expect("scores.json parses");
+
+        let out_path = root.join("gop_dump.tsv");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
+        writeln!(
+            out,
+            "split\tutt\tage\tword_index\tword\thuman\tgop\tscore_now\tstart_ms\tend_ms"
+        )
+        .unwrap();
+
+        let (mut utts, mut words, mut refused, mut mismatched) = (0usize, 0usize, 0usize, 0usize);
+        for split in ["train", "test"] {
+            let dir = root.join(split);
+            let wavs = kaldi_map(&dir.join("wav.scp"));
+            let utt2spk = kaldi_map(&dir.join("utt2spk"));
+            let spk2age = kaldi_map(&dir.join("spk2age"));
+            let mut ids: Vec<&String> = wavs.keys().collect();
+            ids.sort();
+            for utt in ids {
+                let entry = &scores[utt.as_str()];
+                let human: Vec<(String, i64)> = entry["words"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{utt}: no words"))
+                    .iter()
+                    .map(|w| {
+                        (
+                            w["text"].as_str().unwrap_or_default().to_string(),
+                            w["accuracy"].as_i64().unwrap_or(-1),
+                        )
+                    })
+                    .collect();
+                // Built from the per-word entries, which carry no punctuation,
+                // so word i of the score lines up with human score i.
+                let target = human
+                    .iter()
+                    .map(|(w, _)| w.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let (pcm, rate) = read_wav(&root.join(&wavs[utt]));
+                assert_eq!(rate, crate::asr::ASR_SAMPLE_RATE, "{utt}: resample first");
+
+                let asr_out = asr.transcribe_pcm_detailed(&pcm).expect("inference");
+                utts += 1;
+                let pron = match score_against_target(&asr_out, &target, &vocab) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        refused += 1;
+                        continue;
+                    }
+                };
+                if pron.words.len() != human.len() {
+                    mismatched += 1;
+                    continue;
+                }
+                let age = utt2spk
+                    .get(utt)
+                    .and_then(|spk| spk2age.get(spk))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                for (i, (w, (text, acc))) in pron.words.iter().zip(&human).enumerate() {
+                    writeln!(
+                        out,
+                        "{split}\t{utt}\t{age}\t{i}\t{text}\t{acc}\t{:.6}\t{}\t{}\t{}",
+                        w.gop, w.score, w.start_ms, w.end_ms
+                    )
+                    .unwrap();
+                    words += 1;
+                }
+                if utts % 250 == 0 {
+                    eprintln!("{utts} utterances, {words} words");
+                }
+            }
+        }
+        out.flush().unwrap();
+        eprintln!(
+            "done: {utts} utterances, {words} words written, {refused} refused by the \
+             scorer, {mismatched} with a word-count mismatch -> {}",
+            out_path.display()
+        );
+        assert!(words > 0);
+    }
+}
+
+#[cfg(test)]
 mod real_models {
     //! End-to-end calibration against real weights.
     //!
@@ -732,8 +901,11 @@ mod real_models {
     //! saturated metric cannot tell you where the interesting middle of the
     //! range sits. `the_score_degrades_gradually_as_audio_gets_worse`
     //! probes that middle by degrading the audio, which is the closest this
-    //! repo can get without a microphone and real speakers. Calibration
-    //! against actual learners remains open.
+    //! repo can get without a microphone and real speakers. For real
+    //! learners, see the `corpus` module and `scripts/calibrate-gop.py`:
+    //! against speechocean762's expert ratings, per-word GOP separates
+    //! mispronounced from correct words with AUC ~0.80, but at every cutoff
+    //! only ~20-28% of flagged words are actually mispronounced.
 
     use super::*;
 
