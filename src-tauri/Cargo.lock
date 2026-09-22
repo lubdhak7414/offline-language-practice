@@ -4646,7 +4646,7 @@ dependencies = [
  "fsrs",
  "harper-core",
  "http",
- "ndarray 0.16.1",
+ "ndarray 0.17.2",
  "ort",
  "piper-rs",
  "reqwest 0.12.28",
