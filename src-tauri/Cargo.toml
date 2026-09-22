@@ -26,7 +26,7 @@ http = "1"
 
 # Subsystem 5: persistence (WAL + declarative migrations)
 tauri-plugin-sql = { version = "2.4.1", features = ["sqlite"] }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio"] }
 # Native open/save file pickers for export/import/backup/restore (B2).
 tauri-plugin-dialog = "2"
 
