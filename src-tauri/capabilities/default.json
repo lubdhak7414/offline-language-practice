@@ -3,5 +3,5 @@
   "identifier": "main-capability",
   "windows": ["main"],
   "description": "Frontend needs core APIs plus event listening. It never calls the SQL plugin directly: every database access goes through the app's own Rust commands, so sql:* is deliberately not granted.",
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
 }

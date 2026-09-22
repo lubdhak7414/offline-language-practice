@@ -78,7 +78,7 @@ pub fn default_voice_path() -> Option<PathBuf> {
 /// loader, plus the startup-registered extra roots (`$RESOURCE/models/`).
 /// Relative entries resolve against the process CWD (same assumption as
 /// the loader).
-fn models_dirs() -> Vec<PathBuf> {
+pub(crate) fn models_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for (_, config) in VOICE_CANDIDATES {
         let parent = Path::new(config)
@@ -173,6 +173,29 @@ fn sample_rate_from_config(config_path: &Path) -> u32 {
         .unwrap_or(FALLBACK_SAMPLE_RATE)
 }
 
+/// Resolve a frontend-supplied voice id to its `(model, config)` paths.
+///
+/// `id` crosses the IPC boundary from JS and is concatenated straight into
+/// `<dir>/<id>.onnx` below — so it is validated as a plain file-name
+/// component first: empty, containing a path separator (`/` or `\`), or
+/// containing `..` are all rejected outright, before any directory is even
+/// scanned. Everything else is checked against every [`models_dirs`] root in
+/// priority order; `None` when no root has both files.
+pub fn resolve_voice(id: &str) -> Option<(PathBuf, PathBuf)> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    models_dirs().into_iter().find_map(|dir| {
+        let model = dir.join(format!("{id}.onnx"));
+        let config = dir.join(format!("{id}.onnx.json"));
+        if model.is_file() && config.is_file() {
+            Some((model, config))
+        } else {
+            None
+        }
+    })
+}
+
 pub struct TtsEngine {
     inner: std::sync::Mutex<piper_rs::Piper>,
     sample_rate: u32,
@@ -243,6 +266,52 @@ mod tests {
     #[test]
     fn default_voice_path_agrees_with_find_voice() {
         assert_eq!(default_voice_path(), find_voice().map(|(model, _)| model));
+    }
+
+    #[test]
+    fn resolve_voice_rejects_anything_that_is_not_a_plain_file_name() {
+        // The id is concatenated straight into a filesystem path, so every
+        // one of these must be rejected before any directory is scanned.
+        for bad in [
+            "",
+            "../secret",
+            "..",
+            "a/../b",
+            "sub/dir",
+            "sub\\dir",
+            "/etc/passwd",
+            "..\\windows",
+        ] {
+            assert_eq!(resolve_voice(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_voice_finds_an_installed_pair_in_a_search_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "olp-resolve-voice-test-{}-{}",
+            std::process::id(),
+            "unique"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test-voice.onnx"), b"fake").unwrap();
+        std::fs::write(dir.join("test-voice.onnx.json"), b"{}").unwrap();
+
+        std::env::set_var("OLP_MODELS_DIR", &dir);
+        let resolved = resolve_voice("test-voice");
+        std::env::remove_var("OLP_MODELS_DIR");
+
+        assert_eq!(
+            resolved,
+            Some((
+                dir.join("test-voice.onnx"),
+                dir.join("test-voice.onnx.json")
+            ))
+        );
+        assert_eq!(resolve_voice("no-such-voice"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

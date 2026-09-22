@@ -23,6 +23,8 @@ http = "1"
 # Subsystem 5: persistence (WAL + declarative migrations)
 tauri-plugin-sql = { version = "2.4.1", features = ["sqlite"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+# Native open/save file pickers for export/import/backup/restore (B2).
+tauri-plugin-dialog = "2"
 
 # Subsystem 2: neural speech (ort v2.0-rc series, no default zoo bloat)
 # NOTE: pinned to rc.12 to unify with piper-rs 0.2.0 (pins ort rc.12 + ndarray 0.16).

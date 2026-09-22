@@ -16,16 +16,21 @@
 
 mod asr;
 mod audio;
+mod backup;
+mod csvfmt;
 mod db;
 mod error;
 mod fluency;
 mod grammar;
 mod inference;
 mod paths;
+mod portable;
 mod practice;
+mod prefs;
 mod prompts_seed;
 mod pronounce;
 mod scheduler;
+mod stats;
 mod tts;
 
 use std::sync::{Arc, RwLock};
@@ -37,15 +42,19 @@ use tauri_plugin_sql::{Builder as SqlBuilder, DbInstances, Migration, MigrationK
 use tokio::sync::{mpsc, oneshot};
 
 use crate::asr::AsrEngine;
+use crate::backup::BackupInfo;
 use crate::db::{
     DB_URL, MIGRATION_1_SQL, MIGRATION_2_SQL, MIGRATION_3_SQL, MIGRATION_4_SQL, MIGRATION_5_SQL,
-    MIGRATION_6_SQL,
+    MIGRATION_6_SQL, MIGRATION_7_SQL,
 };
 use crate::fluency::FluencyReport;
 use crate::grammar::LintOutput;
+use crate::portable::{ExportEnvelope, ImportSummary};
 use crate::practice::AttemptInput;
+use crate::prefs::Preferences;
 use crate::pronounce::PronScore;
-use crate::scheduler::{CardRow, DeckRow, DueCardView, ReviewRow, ReviewStats};
+use crate::scheduler::{CardRow, DeckRow, DueCardView, ReviewRow, ReviewStats, TagRow, UndoResult};
+use crate::stats::{DayCount, ForecastDay, Overview, RetentionBucket};
 use crate::tts::TtsEngine;
 
 // ─── Neural workers (Domain 3) ───────────────────────────────────────────────
@@ -72,6 +81,13 @@ pub enum NeuralReq {
     },
     Synth {
         text: String,
+        /// Which installed voice to use. `None`/`Some("")` means the
+        /// default voice (whatever `find_voice` resolves). A non-empty id
+        /// is looked up via `tts::resolve_voice`, which also rejects
+        /// anything that is not a plain file-name component — this id
+        /// comes straight from the frontend by way of `set_voice`/the
+        /// `audiostream://` `?voice=` query param.
+        voice_id: Option<String>,
         reply: oneshot::Sender<Result<(Vec<u8>, u32), String>>,
     },
 }
@@ -94,6 +110,12 @@ pub struct AppState {
     pub fsrs: RwLock<FSRS>,
     pub params: RwLock<Vec<f32>>,
     pub retention: RwLock<f32>,
+    /// The active TTS voice id (`""`/`None` in storage means "default"),
+    /// mirrored from `prefs::Preferences::tts_voice` at startup and updated
+    /// by `set_voice`. Read by `synthesize_speech` and the `audiostream://`
+    /// handler so both use the same voice without re-reading `app_settings`
+    /// on every request.
+    pub voice: RwLock<Option<String>>,
 }
 
 /// Max `NeuralReq`s buffered per neural worker channel (see `run()`).
@@ -195,8 +217,15 @@ fn spawn_asr_worker(rx: mpsc::Receiver<NeuralReq>) {
         .expect("failed to spawn neural-asr thread");
 }
 
-/// Spawn the dedicated TTS thread: lazy-loads the voice on first request,
-/// then serves `Synth` in FIFO order until the channel closes.
+/// Spawn the dedicated TTS thread: lazy-loads a voice on first request that
+/// needs it, then serves `Synth` in FIFO order until the channel closes.
+///
+/// The cache is keyed by the requested voice id (`""` for "no id given",
+/// meaning the default voice), not just "loaded or not": a session that
+/// switches voices (`set_voice`, or a one-off `?voice=` override) must not
+/// keep serving audio from whatever voice happened to load first. Reloading
+/// only happens when the key actually changes, so the common case (every
+/// request using the same voice) pays the load cost exactly once.
 ///
 /// Misrouted `Transcribe` requests are rejected with `Err` (never dropped)
 /// so no `rx.await` hangs forever.
@@ -204,25 +233,40 @@ fn spawn_tts_worker(rx: mpsc::Receiver<NeuralReq>) {
     std::thread::Builder::new()
         .name("neural-tts".to_string())
         .spawn(move || {
-            let mut engine: Option<TtsEngine> = None;
+            let mut cache: Option<(String, TtsEngine)> = None;
             let mut rx = rx;
             while let Some(req) = rx.blocking_recv() {
                 match req {
-                    NeuralReq::Synth { text, reply } => {
+                    NeuralReq::Synth {
+                        text,
+                        voice_id,
+                        reply,
+                    } => {
+                        let key = voice_id.unwrap_or_default();
                         let res: Result<(Vec<u8>, u32), String> = (|| {
-                            if engine.is_none() {
-                                let (model, config) =
+                            // MSRV 1.77 predates `Option::is_none_or` (1.82).
+                            let stale = match cache.as_ref() {
+                                Some((k, _)) => k != &key,
+                                None => true,
+                            };
+                            if stale {
+                                let (model, config) = if key.is_empty() {
                                     crate::tts::find_voice().ok_or_else(|| {
                                         "TTS voice not installed; install voice to enable speech"
                                             .to_string()
-                                    })?;
+                                    })?
+                                } else {
+                                    crate::tts::resolve_voice(&key).ok_or_else(|| {
+                                        format!("TTS voice not installed: {key:?}")
+                                    })?
+                                };
                                 let eng =
                                     TtsEngine::load(&model, &config).map_err(|e| e.to_string())?;
-                                engine = Some(eng);
+                                cache = Some((key.clone(), eng));
                             }
-                            let eng = engine
-                                .as_ref()
-                                .ok_or_else(|| "TTS voice not installed".to_string())?;
+                            // `stale` guarantees the arm above ran when needed,
+                            // so the cache is always populated here.
+                            let (_, eng) = cache.as_ref().expect("cache populated above");
                             let wav = eng.synthesize_wav(&text).map_err(|e| e.to_string())?;
                             Ok((wav, eng.sample_rate()))
                         })();
@@ -384,6 +428,12 @@ async fn synthesize_speech(
         ));
     }
 
+    let voice_id = state
+        .voice
+        .read()
+        .map_err(|e| format!("voice lock poisoned: {e}"))?
+        .clone();
+
     let mut wavs: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
     let mut rate: Option<u32> = None;
     for chunk in chunks.iter() {
@@ -392,6 +442,7 @@ async fn synthesize_speech(
             .tts_tx
             .try_send(NeuralReq::Synth {
                 text: chunk.clone(),
+                voice_id: voice_id.clone(),
                 reply: tx,
             })
             .map_err(tts_busy_message)?;
@@ -639,11 +690,14 @@ async fn update_card(
 ///
 /// `deck_id` (`deckId` in JS) optionally restricts to one deck; `None`
 /// means every deck. The filter is applied in SQL — see
-/// [`crate::scheduler::DueOpts`].
+/// [`crate::scheduler::DueOpts`]. `tz_offset_minutes` (`tzOffsetMinutes`,
+/// default `0`) buckets "today" for the daily caps against the stored
+/// `day_cutoff_hour` — see `crate::db::day_index`.
 #[tauri::command]
 async fn due_cards(
     limit: u32,
     deck_id: Option<String>,
+    tz_offset_minutes: Option<i64>,
     db: State<'_, DbInstances>,
     state: State<'_, AppState>,
 ) -> Result<Vec<DueCardView>, String> {
@@ -655,6 +709,15 @@ async fn due_cards(
         .read()
         .map_err(|e| format!("fsrs lock poisoned: {e}"))?
         .clone();
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    let caps = crate::scheduler::daily_caps(
+        &pool,
+        deck_id.as_deref(),
+        tz_offset_minutes.unwrap_or(0),
+        cutoff,
+    )
+    .await
+    .map_err(String::from)?;
     crate::scheduler::fetch_due_cards(
         &pool,
         &fsrs,
@@ -664,6 +727,7 @@ async fn due_cards(
             limit: limit as i64,
             deck_id: deck_id.as_deref(),
             exclude_card_id: None,
+            caps: Some(caps),
         },
     )
     .await
@@ -671,10 +735,15 @@ async fn due_cards(
 }
 
 /// Grade a card, returning the next due view (if any).
+///
+/// `tz_offset_minutes` (`tzOffsetMinutes`, default `0`) is threaded into
+/// `grade_card_db` so the post-grade "next card" fetch respects today's
+/// daily caps using the caller's local day, not UTC.
 #[tauri::command]
 async fn grade_card(
     card_id: String,
     rating: u32,
+    tz_offset_minutes: Option<i64>,
     db: State<'_, DbInstances>,
     state: State<'_, AppState>,
 ) -> Result<Option<DueCardView>, String> {
@@ -686,7 +755,140 @@ async fn grade_card(
         .read()
         .map_err(|e| format!("fsrs lock poisoned: {e}"))?
         .clone();
-    crate::scheduler::grade_card_db(&pool, &fsrs, retention, decay, &card_id, rating)
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::scheduler::grade_card_db(
+        &pool,
+        &fsrs,
+        retention,
+        decay,
+        &card_id,
+        rating,
+        tz_offset_minutes.unwrap_or(0),
+        cutoff,
+    )
+    .await
+    .map_err(String::from)
+}
+
+/// All tags with their live card counts, ordered by name.
+#[tauri::command]
+async fn list_tags(db: State<'_, DbInstances>) -> Result<Vec<TagRow>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::list_tags(&pool)
+        .await
+        .map_err(String::from)
+}
+
+/// Replace a card's tags (`cardId` in JS), returning the normalized names
+/// actually stored.
+#[tauri::command]
+async fn set_card_tags(
+    card_id: String,
+    tags: Vec<String>,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<String>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::set_card_tags(&pool, &card_id, &tags)
+        .await
+        .map_err(String::from)
+}
+
+/// Suspend or unsuspend a card (`cardId` in JS).
+#[tauri::command]
+async fn suspend_card(
+    card_id: String,
+    suspended: bool,
+    db: State<'_, DbInstances>,
+) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::set_card_suspended(&pool, &card_id, suspended)
+        .await
+        .map_err(String::from)
+}
+
+/// Bury a card (`cardId` in JS) for `hours` from now. `Some(0)` clears the
+/// bury; omitting `hours` falls back to the saved `bury_hours` preference,
+/// so a plain "bury" button press does not need to know that default.
+/// Returns the resulting `buried_until` unix timestamp (`0` when cleared).
+#[tauri::command]
+async fn bury_card(
+    card_id: String,
+    hours: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<i64, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let hours = match hours {
+        Some(h) => h,
+        None => {
+            crate::prefs::load(&pool)
+                .await
+                .map_err(String::from)?
+                .bury_hours
+        }
+    };
+    let hours = hours.max(0);
+    let until = if hours == 0 {
+        0
+    } else {
+        crate::db::now_unix() + hours.saturating_mul(3600)
+    };
+    crate::scheduler::bury_card(&pool, &card_id, until)
+        .await
+        .map_err(String::from)
+}
+
+/// Undo the most recent review, if any.
+#[tauri::command]
+async fn undo_review(db: State<'_, DbInstances>) -> Result<Option<UndoResult>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::undo_last_review(&pool)
+        .await
+        .map_err(String::from)
+}
+
+/// Current user preferences, loaded from `app_settings`.
+#[tauri::command]
+async fn get_preferences(db: State<'_, DbInstances>) -> Result<Preferences, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::prefs::load(&pool).await.map_err(String::from)
+}
+
+/// Save preferences, returning the sanitized value actually stored.
+#[tauri::command]
+async fn set_preferences(
+    prefs: Preferences,
+    db: State<'_, DbInstances>,
+) -> Result<Preferences, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::prefs::save(&pool, &prefs)
+        .await
+        .map_err(String::from)
+}
+
+/// Daily new/review caps in effect for `deck_id` (`deckId` in JS), or the
+/// global defaults when omitted.
+#[tauri::command]
+async fn get_daily_limits(
+    deck_id: Option<String>,
+    db: State<'_, DbInstances>,
+) -> Result<crate::scheduler::DailyLimits, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::get_daily_limits(&pool, deck_id.as_deref())
+        .await
+        .map_err(String::from)
+}
+
+/// Persist new daily caps for `deck_id` (`deckId` in JS), or globally when
+/// omitted.
+#[tauri::command]
+async fn set_daily_limits(
+    deck_id: Option<String>,
+    new_per_day: i64,
+    review_per_day: i64,
+    db: State<'_, DbInstances>,
+) -> Result<crate::scheduler::DailyLimits, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::scheduler::set_daily_limits(&pool, deck_id.as_deref(), new_per_day, review_per_day)
         .await
         .map_err(String::from)
 }
@@ -850,6 +1052,227 @@ fn ep_report() -> String {
     crate::inference::describe_providers().to_string()
 }
 
+// ─── Data safety, stats, voice selection (Stream B2) ────────────────────────
+
+/// Result of `export_data`: where it wrote to, how many cards, and the
+/// resulting file size — enough for the frontend to show a confirmation
+/// without re-reading the file.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ExportResult {
+    path: String,
+    cards: i64,
+    bytes: u64,
+}
+
+/// Result of `backup_database`.
+#[derive(Clone, Debug, serde::Serialize)]
+struct BackupResult {
+    path: String,
+    bytes: u64,
+}
+
+/// Export a deck (`deckId`, or every deck when omitted) to `path` in
+/// `format` (`"json"`, `"csv"`, or `"tsv"`). All file I/O happens here, in
+/// Rust — the frontend only ever supplies a path chosen through the dialog
+/// plugin's save picker.
+#[tauri::command]
+async fn export_data(
+    deck_id: Option<String>,
+    path: String,
+    format: String,
+    db: State<'_, DbInstances>,
+) -> Result<ExportResult, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let env = crate::portable::export_json(&pool, deck_id.as_deref())
+        .await
+        .map_err(String::from)?;
+    let cards = env.cards.len() as i64;
+    let contents = match format.as_str() {
+        "json" => serde_json::to_string_pretty(&env)
+            .map_err(|e| format!("failed to serialize export: {e}"))?,
+        "csv" => crate::portable::export_csv(&env, ','),
+        "tsv" => crate::portable::export_csv(&env, '\t'),
+        other => {
+            return Err(format!(
+                "unknown export format {other:?}: expected \"json\", \"csv\", or \"tsv\""
+            ))
+        }
+    };
+    tokio::fs::write(&path, contents.as_bytes())
+        .await
+        .map_err(|e| format!("failed to write export file: {e}"))?;
+    Ok(ExportResult {
+        path,
+        cards,
+        bytes: contents.len() as u64,
+    })
+}
+
+/// Import cards from `path` into `deckId` (CSV/TSV only; ignored for a JSON
+/// envelope, which carries its own deck ids). Format is sniffed from the
+/// file's own content (a JSON envelope starts with `{`), not the extension,
+/// so a renamed file still imports correctly.
+#[tauri::command]
+async fn import_data(
+    path: String,
+    deck_id: Option<String>,
+    db: State<'_, DbInstances>,
+) -> Result<ImportSummary, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let contents = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("failed to read import file: {e}"))?;
+    if contents.trim_start().starts_with('{') {
+        let env: ExportEnvelope = serde_json::from_str(&contents)
+            .map_err(|e| format!("failed to parse import file as JSON: {e}"))?;
+        crate::portable::import_json(&pool, &env)
+            .await
+            .map_err(String::from)
+    } else {
+        let rows = crate::portable::parse_csv_cards(&contents)?;
+        let deck_id = deck_id.unwrap_or_else(|| crate::scheduler::DEFAULT_DECK_ID.to_string());
+        crate::portable::import_csv_cards(&pool, &deck_id, &rows)
+            .await
+            .map_err(String::from)
+    }
+}
+
+/// Snapshot the live database to `path` via `VACUUM INTO`.
+#[tauri::command]
+async fn backup_database(path: String, db: State<'_, DbInstances>) -> Result<BackupResult, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let dest = std::path::PathBuf::from(&path);
+    let bytes = crate::backup::backup_to(&pool, &dest)
+        .await
+        .map_err(String::from)?;
+    Ok(BackupResult { path, bytes })
+}
+
+/// Validate a backup file and stage it for restore on next launch.
+///
+/// Never touches the live database file — only [`apply_pending_restore`]
+/// (run from the `db-restore` plugin's `setup` hook, before the SQL plugin
+/// opens its pool) does that. The frontend is expected to tell the user a
+/// restart is required.
+#[tauri::command]
+async fn restore_database(path: String, app: tauri::AppHandle) -> Result<BackupInfo, String> {
+    let src = std::path::PathBuf::from(&path);
+    let info = crate::backup::validate_backup(&src)
+        .await
+        .map_err(String::from)?;
+    let db_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("could not resolve app config dir: {e}"))?;
+    crate::backup::stage_restore(&src, &db_dir).map_err(String::from)?;
+    Ok(info)
+}
+
+/// Overview tiles for the Progress screen.
+#[tauri::command]
+async fn stats_overview(
+    tz_offset_minutes: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Overview, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::stats::overview(&pool, tz_offset_minutes.unwrap_or(0), cutoff)
+        .await
+        .map_err(String::from)
+}
+
+/// Reviews-per-day series over the last `days` days.
+#[tauri::command]
+async fn stats_daily(
+    days: i64,
+    tz_offset_minutes: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<DayCount>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::stats::daily(&pool, days, tz_offset_minutes.unwrap_or(0), cutoff)
+        .await
+        .map_err(String::from)
+}
+
+/// Due-card forecast for the next `days` days.
+#[tauri::command]
+async fn stats_forecast(
+    days: i64,
+    tz_offset_minutes: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<ForecastDay>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::stats::forecast(&pool, days, tz_offset_minutes.unwrap_or(0), cutoff)
+        .await
+        .map_err(String::from)
+}
+
+/// Retention rate over the last `days` days, bucketed every `bucketDays`.
+#[tauri::command]
+async fn stats_retention(
+    days: i64,
+    bucket_days: i64,
+    tz_offset_minutes: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<RetentionBucket>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::stats::retention(
+        &pool,
+        days,
+        bucket_days,
+        tz_offset_minutes.unwrap_or(0),
+        cutoff,
+    )
+    .await
+    .map_err(String::from)
+}
+
+/// The active TTS voice id (`""` means the default voice).
+#[tauri::command]
+async fn get_voice(state: State<'_, AppState>) -> Result<String, String> {
+    let voice = state
+        .voice
+        .read()
+        .map_err(|e| format!("voice lock poisoned: {e}"))?
+        .clone()
+        .unwrap_or_default();
+    Ok(voice)
+}
+
+/// Set the active TTS voice (`""` clears back to the default), validated
+/// with [`crate::tts::resolve_voice`] — the same rejection rule the neural
+/// worker and the `audiostream://` handler apply, since this id ends up
+/// concatenated into a filesystem path in all three places. Persists
+/// through `prefs` and updates the live cache so the very next synthesis
+/// uses it. Returns the id actually stored.
+#[tauri::command]
+async fn set_voice(
+    voice_id: String,
+    db: State<'_, DbInstances>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let trimmed = voice_id.trim();
+    if !trimmed.is_empty() && crate::tts::resolve_voice(trimmed).is_none() {
+        return Err(format!("unknown voice id {voice_id:?}"));
+    }
+    let stored = trimmed.to_string();
+
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let mut prefs = crate::prefs::load(&pool).await.map_err(String::from)?;
+    prefs.tts_voice = stored.clone();
+    crate::prefs::save(&pool, &prefs)
+        .await
+        .map_err(String::from)?;
+
+    if let Ok(mut guard) = state.voice.write() {
+        *guard = Some(stored.clone());
+    }
+    Ok(stored)
+}
+
 // ─── audiostream Range support ───────────────────────────────────────────────
 
 /// Parse a single-range `Range` header (`bytes=S-E`, `bytes=S-`, `bytes=-N`).
@@ -952,6 +1375,12 @@ pub fn run() {
             sql: MIGRATION_6_SQL,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "tags-review-undo-daily-cap-defaults",
+            sql: MIGRATION_7_SQL,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -961,7 +1390,32 @@ pub fn run() {
             fsrs: RwLock::new(FSRS::default()),
             params: RwLock::new(Vec::new()),
             retention: RwLock::new(crate::scheduler::DEFAULT_RETENTION),
+            voice: RwLock::new(None),
         })
+        .plugin(tauri_plugin_dialog::init())
+        // Registered BEFORE the SQL plugin so its `setup` hook runs first:
+        // Tauri 2.11 stores plugins in a `Vec` and `initialize_all` iterates
+        // it in registration order, and `tauri-plugin-sql` 2.4.1 opens its
+        // pool from inside its own `setup` hook (see `path_mapper` in that
+        // crate: `sqlite:app.db` resolves to `app_config_dir()/app.db`,
+        // the same directory `apply_pending_restore` operates on). Applying
+        // a staged restore has to finish before that pool is opened, or the
+        // running app would keep using the file descriptor of the database
+        // that just got renamed out from under it.
+        .plugin(
+            tauri::plugin::Builder::new("db-restore")
+                .setup(|app, _api: tauri::plugin::PluginApi<_, ()>| {
+                    if let Ok(dir) = app.path().app_config_dir() {
+                        match crate::backup::apply_pending_restore(&dir) {
+                            Ok(true) => eprintln!("restored database from staged backup"),
+                            Ok(false) => {}
+                            Err(e) => eprintln!("restore failed, keeping current database: {e}"),
+                        }
+                    }
+                    Ok(())
+                })
+                .build(),
+        )
         .plugin(
             SqlBuilder::default()
                 .add_migrations(DB_URL, migrations)
@@ -1004,6 +1458,15 @@ pub fn run() {
                 let Some(pool) = pool else {
                     return;
                 };
+                // Best-effort: an unreadable preferences row just leaves the
+                // voice at its `RwLock::new(None)` default (the default
+                // voice), same failure mode as everything else in this task.
+                if let Ok(prefs) = crate::prefs::load(&pool).await {
+                    let st = handle.state::<AppState>();
+                    if let Ok(mut g) = st.voice.write() {
+                        *g = Some(prefs.tts_voice);
+                    };
+                }
                 match crate::scheduler::load_fsrs_params(&pool).await {
                     Ok(Some(params)) if params.len() == 21 => match FSRS::new(&params) {
                         Ok(fsrs) => {
@@ -1044,6 +1507,9 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("audiostream", |ctx, req, responder| {
             let uri_string = req.uri().to_string();
             let text = crate::audio::decode_query_param(&uri_string, "text").unwrap_or_default();
+            // `?voice=` overrides the stored voice for this one request;
+            // validated the same way `set_voice` validates it, below.
+            let voice_param = crate::audio::decode_query_param(&uri_string, "voice");
             let range = req
                 .headers()
                 .get(http::header::RANGE)
@@ -1071,6 +1537,18 @@ pub fn run() {
                         return Err("TTS: empty text".to_string());
                     }
                     let st = app.state::<AppState>();
+                    // `?voice=` wins when present and valid; an invalid id
+                    // is a hard error rather than a silent fallback to the
+                    // default, same as `set_voice`.
+                    let voice_id: Option<String> = match voice_param.as_deref() {
+                        Some(v) if !v.is_empty() => {
+                            if crate::tts::resolve_voice(v).is_none() {
+                                return Err(format!("unknown voice id {v:?}"));
+                            }
+                            Some(v.to_string())
+                        }
+                        _ => st.voice.read().ok().and_then(|g| g.clone()),
+                    };
                     let chunks = crate::audio::split_sentences(&text, 180);
                     let chunks = if chunks.is_empty() {
                         vec![text.clone()]
@@ -1094,6 +1572,7 @@ pub fn run() {
                         st.tts_tx
                             .try_send(NeuralReq::Synth {
                                 text: chunk,
+                                voice_id: voice_id.clone(),
                                 reply: tx,
                             })
                             .map_err(|_| "TTS_BUSY: engine busy, retry shortly".to_string())?;
@@ -1200,7 +1679,26 @@ pub fn run() {
             delete_card,
             review_stats,
             model_status,
-            list_voices
+            list_voices,
+            list_tags,
+            set_card_tags,
+            suspend_card,
+            bury_card,
+            undo_review,
+            get_preferences,
+            set_preferences,
+            get_daily_limits,
+            set_daily_limits,
+            export_data,
+            import_data,
+            backup_database,
+            restore_database,
+            stats_overview,
+            stats_daily,
+            stats_forecast,
+            stats_retention,
+            get_voice,
+            set_voice
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1218,6 +1716,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.try_send(NeuralReq::Synth {
             text: "hello".to_string(),
+            voice_id: None,
             reply: reply_tx,
         })
         .expect("send");
@@ -1273,6 +1772,7 @@ mod tests {
         let (dtx, _drx) = oneshot::channel();
         tx.try_send(NeuralReq::Synth {
             text: "x".to_string(),
+            voice_id: None,
             reply: dtx,
         })
         .unwrap();
@@ -1280,6 +1780,7 @@ mod tests {
         let err = tx
             .try_send(NeuralReq::Synth {
                 text: "y".to_string(),
+                voice_id: None,
                 reply: dtx2,
             })
             .expect_err("second send must be full");
