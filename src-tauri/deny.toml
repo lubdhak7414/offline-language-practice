@@ -1,0 +1,74 @@
+# cargo-deny: advisories, licenses, duplicate crates and source origins.
+#   cargo deny --manifest-path src-tauri/Cargo.toml check
+#
+# This is a desktop app that loads model files and talks to one HTTPS host,
+# so the questions worth asking are "is anything here known-vulnerable",
+# "can this be shipped under MIT", and "did a dependency quietly start
+# coming from somewhere other than crates.io".
+
+[graph]
+# Check every platform, not just the host: the execution-provider features
+# for `ort` are per-target, so a host-only graph misses most of Windows and
+# macOS.
+all-features = false
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# Fail on any known vulnerability. Unmaintained crates are a warning, not a
+# failure: a transitive unmaintained crate is not by itself a reason to
+# block a release, but it should be visible.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Every license actually present in the tree, and nothing else — a new
+# dependency under an unexpected license fails the build rather than
+# quietly shipping.
+#
+# `priority-queue` is LGPL-3.0-or-later OR MPL-2.0 and `r-efi` is
+# MIT OR Apache-2.0 OR LGPL-2.1-or-later; in both cases the permissive
+# option is taken, which is why no LGPL appears below.
+#
+# MPL-2.0 is allowed deliberately. It is file-level copyleft, so linking it
+# into an MIT binary is fine; modifying those files would mean publishing
+# the modifications, and this project does not vendor or patch them.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are normal in a tree this size (Tauri, ort and sqlx
+# each pull their own generations of the same utility crates). Surfacing
+# them is useful; failing on them would mean pinning transitive
+# dependencies this project does not control.
+multiple-versions = "warn"
+wildcards = "deny"
+# `ort` is pinned to =2.0.0-rc.12 to match piper-rs; two copies in one
+# binary would mean two ONNX Runtime bindings.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

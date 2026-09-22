@@ -1,0 +1,45 @@
+version: 2
+
+# Weekly, grouped, and deliberately conservative about the two pins that
+# are not ours to move:
+#
+#   * `ort` is pinned to =2.0.0-rc.12 to match piper-rs 0.2.0, which pins
+#     the same rc. Bumping one without the other gives two incompatible
+#     copies of the ONNX Runtime bindings in one binary.
+#   * `harper-core` is pinned exactly because its lint rule set changes
+#     between patch releases, which moves grammar output under the tests.
+#
+# Both are listed as ignored so Dependabot does not open a PR a human will
+# only ever close.
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: ort
+      - dependency-name: harper-core
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

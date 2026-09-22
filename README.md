@@ -8,11 +8,13 @@ Everything happens on-device: the speech model, the voice synthesis, the grammar
 
 ## Features
 
-- **Speech recognition** — record a phrase and get it transcribed locally via a Wav2Vec2 ONNX model.
-- **Grammar checking** — transcripts (or anything you type) get checked for grammar and style issues by a local, offline linter, no network round-trip.
+- **Speaking practice** — pick a prompt, record yourself, and get scored: per-word pronunciation from CTC forced alignment, fluency (speaking rate, pauses, fillers), and grammar. About 120 built-in prompts across everyday conversation and job interviews.
+- **Speech recognition** — transcription runs locally via a Wav2Vec2 ONNX model.
+- **Grammar checking** — transcripts, or anything you type, are checked by a local offline linter with in-place suggestions.
 - **Text-to-speech** — hear correct pronunciation via a local neural voice (Piper).
-- **Spaced repetition** — flashcard review scheduled by FSRS-6, the same memory-modeling algorithm behind modern Anki, tuned to your own review history rather than a fixed interval.
-- **Fully offline** — once the models are downloaded once, the app makes zero network calls.
+- **Spaced repetition** — review scheduled by FSRS-6, the memory model behind modern Anki, fitted to your own history. Daily caps, tags, suspend, bury and undo.
+- **Your data stays yours** — JSON export that round-trips full review history and FSRS state, CSV/TSV for Anki, and whole-database backup and restore.
+- **Fully offline** — the only network request the app ever makes is downloading the models. After that it works with the network off.
 
 ## Why this was interesting to build
 
@@ -26,14 +28,18 @@ Getting five separate subsystems (speech recognition, speech synthesis, grammar 
 
 ```bash
 npm install
-./scripts/download-models.sh          # fetches the ASR + TTS models from Hugging Face (~350 MB)
-
-# two terminals, since this project doesn't wire beforeDevCommand:
-npm run dev                           # terminal 1: Vite dev server
-npm run tauri dev                     # terminal 2: Tauri window
+npm run tauri dev
 ```
 
-`model_status` in the UI (and the Diagnostics-style output in dev tools) tells you whether the ASR/TTS models were found; without them the app still runs, it just can't transcribe or speak.
+One terminal is enough — `beforeDevCommand` starts Vite.
+
+The models are not in the repo and not in the installer. On first run the app walks you through downloading them (~456 MB), with progress, pause and resume; you can also get them from Settings later, or fetch them up front:
+
+```bash
+./scripts/download-models.sh
+```
+
+Either way the files are pinned to immutable upstream commits and verified by sha256 before being installed. Settings → Diagnostics tells you what was found. Without the models the app still runs, it just cannot listen or speak.
 
 **On Linux with an NVIDIA GPU + Wayland**, WebKitGTK's DMA-BUF renderer can crash the window on launch (`Error 71 (Protocol error) dispatching to Wayland display`, then repeated `WebKit encountered an internal error`). If that happens:
 
@@ -46,7 +52,7 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
 | Layer | Tech |
 |---|---|
 | Shell | Tauri v2 (Rust backend + WebView frontend) |
-| Frontend | TypeScript, Vite, no framework |
+| Frontend | Preact + `@preact/signals`, TypeScript, Vite |
 | Speech recognition | Wav2Vec2 via ONNX Runtime (`ort`) |
 | Speech synthesis | Piper neural TTS (`piper-rs`) |
 | Spaced repetition | FSRS-6 (`fsrs`) |
@@ -60,8 +66,14 @@ npm run build                    # tsc + vite build
 cd src-tauri && cargo build --release
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt`, `cargo clippy -D warnings`, and `cargo test` on every push, plus a version-consistency check across the three manifest files and a check that release icons exist.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt`, `cargo clippy -D warnings` and `cargo test` on every push, compiles on Linux, macOS and Windows, audits dependencies with `cargo-deny`, and checks that `package.json`, `tauri.conf.json` and `Cargo.toml` agree on the version and that the release icon set exists.
+
+Tagging `v*` builds every platform and opens a **draft** GitHub release with `SHA256SUMS` and build provenance attached (`.github/workflows/release.yml`). Binaries are not code-signed — SECURITY.md explains why and how to verify them instead.
+
+See CONTRIBUTING.md for the house rules, which exist because breaking them has already cost real debugging time.
 
 ## License
 
-MIT
+MIT. See LICENSE.
+
+The models are downloaded separately and carry their own licenses: the Wav2Vec2 ONNX export and the Piper LibriTTS-R voice are both MIT-licensed upstream.

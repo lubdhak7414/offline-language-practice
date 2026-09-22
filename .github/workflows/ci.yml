@@ -74,6 +74,23 @@ jobs:
             exit 1
           fi
 
+  # Dependency audit: known advisories, license policy, duplicate crates and
+  # source origins. Separate from `rust` so a new advisory is obvious at a
+  # glance rather than buried in a 40-minute build log.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          # `unmaintained` is a warning in deny.toml, so this stays green
+          # on an unmaintained transitive crate but fails on a real
+          # advisory, an unexpected license or an unknown source. The
+          # target list lives in deny.toml, not here.
+          command: check
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 45

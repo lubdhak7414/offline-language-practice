@@ -1,0 +1,199 @@
+name: Release
+
+# Tag-driven. `git tag v0.1.0 && git push origin v0.1.0` builds every
+# platform and leaves a DRAFT release: nothing is published until a human
+# opens it, checks the notes and presses the button.
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be rehearsed end to end without creating a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail in ten seconds rather than forty minutes if the tag and the three
+  # version fields disagree. A release whose artifacts say 0.1.0 while the
+  # tag says 0.2.0 is worse than no release.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          PKG_VER=$(jq -r .version package.json)
+          TAURI_VER=$(jq -r .version src-tauri/tauri.conf.json)
+          CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
+          echo "tag=$TAG version=$VERSION package=$PKG_VER tauri=$TAURI_VER cargo=$CARGO_VER"
+          for got in "$PKG_VER" "$TAURI_VER" "$CARGO_VER"; do
+            if [ "$got" != "$VERSION" ]; then
+              echo "::error::Tag $TAG implies version $VERSION, but a manifest says $got."
+              exit 1
+            fi
+          done
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    permissions:
+      contents: write
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      # One platform failing should not throw away three good builds; the
+      # release is a draft anyway, so a partial set can be completed by
+      # re-running the failed job.
+      fail-fast: false
+      matrix:
+        include:
+          # 24.04 (glibc 2.39), never 22.04 (2.35). `ort`'s prebuilt ONNX
+          # Runtime is compiled against glibc >= 2.38 and fails to link on
+          # 22.04 with `undefined symbol: __isoc23_strtoll`. That sets the
+          # oldest Linux this can be built on, and therefore the oldest it
+          # can be installed on.
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            target_dir: /tmp/cargo-target
+          - os: macos-14
+            label: macos-aarch64
+            target_dir: /tmp/cargo-target
+          - os: macos-13
+            label: macos-x86_64
+            target_dir: /tmp/cargo-target
+          # espeak-ng's data compiler truncates paths through a fixed-size
+          # buffer and the default workspace path is already long.
+          - os: windows-latest
+            label: windows-x86_64
+            target_dir: C:\ct
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.target_dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Tauri Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+      # espeak needs cmake at build time; every hosted runner ships one.
+      - run: cmake --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+          key: release-${{ matrix.os }}
+
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "v__VERSION__"
+          releaseDraft: true
+          prerelease: false
+          # Code signing is deliberately not configured — see SECURITY.md.
+          # Unsigned artifacts plus published checksums and build
+          # provenance is an honest position; a self-signed certificate
+          # pretending to be a trusted one is not.
+          releaseBody: |
+            See CHANGELOG.md for what changed.
+
+            These builds are **not code-signed**. Verify what you downloaded
+            against `SHA256SUMS`, which is attested to this workflow run:
+
+                sha256sum -c SHA256SUMS --ignore-missing
+                gh attestation verify <file> --repo ${{ github.repository }}
+
+            Models are not bundled. The app downloads them on first run, or
+            run `scripts/download-models.sh`.
+
+      # Keep the built bundles for the checksum/attestation job. The paths
+      # tauri-action reports are a JSON array of absolute paths.
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p staged
+          echo '${{ steps.tauri.outputs.artifactPaths }}' \
+            | jq -r '.[]' \
+            | while read -r p; do
+                [ -e "$p" ] && cp -R "$p" staged/ || echo "missing: $p"
+              done
+          ls -l staged
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.label }}
+          path: staged/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Checksums and provenance are the whole security story for an unsigned
+  # release, so they are produced once, over every platform's output, rather
+  # than per job where they could silently cover only part of the set.
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundles-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          find . -type f ! -name 'SHA256SUMS' -printf '%P\n' \
+            | sort \
+            | xargs -r sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v1
+        with:
+          # Attest the artifacts themselves, not just the checksum file:
+          # provenance over a list of hashes only proves the list's origin.
+          subject-path: "dist/**/*"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          files: dist/SHA256SUMS
