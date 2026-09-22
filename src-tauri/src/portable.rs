@@ -496,9 +496,18 @@ pub fn parse_csv_cards(text: &str) -> Result<Vec<(String, String, Vec<String>)>,
         if row.iter().all(|f| f.trim().is_empty()) {
             continue;
         }
+        // Only comma-separated input can carry our guard; in a TSV a leading
+        // apostrophe is the card's own text and stays.
+        let guarded = crate::csvfmt::guards_formulas(delimiter);
         let field = |i: usize| {
             row.get(i)
-                .map(|s| crate::csvfmt::strip_formula_guard(s).to_string())
+                .map(|s| {
+                    if guarded {
+                        crate::csvfmt::strip_formula_guard(s).to_string()
+                    } else {
+                        s.clone()
+                    }
+                })
                 .unwrap_or_default()
         };
         let front = field(0);
@@ -879,6 +888,37 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(fronts, vec!["=1+1".to_string()]);
+    }
+
+    #[test]
+    fn tsv_export_keeps_a_leading_dash_for_anki_and_a_leading_apostrophe_survives() {
+        let card = |front: &str| ExportCard {
+            id: "c".to_string(),
+            deck_id: "default".to_string(),
+            front: front.to_string(),
+            back: "B".to_string(),
+            created_at: 0,
+            tags: vec![],
+            suspended: false,
+            buried_until: 0,
+            memory: None,
+            reviews: vec![],
+        };
+        let env = ExportEnvelope {
+            schema: EXPORT_SCHEMA.to_string(),
+            exported_at: 0,
+            app_version: "0".to_string(),
+            decks: vec![],
+            cards: vec![card("-ing endings"), card("'=kept")],
+        };
+        let text = export_csv(&env, '\t');
+        assert!(
+            text.contains("\r\n-ing endings\t"),
+            "TSV must be verbatim: {text:?}"
+        );
+        let parsed = parse_csv_cards(&text).unwrap();
+        assert_eq!(parsed[0].0, "-ing endings");
+        assert_eq!(parsed[1].0, "'=kept", "no guard is stripped from a TSV");
     }
 
     #[tokio::test]

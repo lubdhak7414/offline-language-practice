@@ -1250,7 +1250,7 @@ async fn backup_database(path: String, db: State<'_, DbInstances>) -> Result<Bac
 
 /// Validate a backup file and stage it for restore on next launch.
 ///
-/// Never touches the live database file — only [`apply_pending_restore`]
+/// Never touches the live database file — only [`crate::backup::apply_pending_restore`]
 /// (run from the `db-restore` plugin's `setup` hook, before the SQL plugin
 /// opens its pool) does that. The frontend is expected to tell the user a
 /// restart is required.

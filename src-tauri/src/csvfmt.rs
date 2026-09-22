@@ -12,11 +12,14 @@
 //! row terminators, strips a leading UTF-8 BOM (Excel likes to add one), and
 //! understands a quoted field that itself contains embedded newlines.
 //!
-//! Formula guard (not RFC 4180 — spreadsheet safety): a field that begins
-//! with `=`, `+`, `-` or `@` is written with a leading apostrophe, because
-//! Excel, LibreOffice and Sheets evaluate such a cell as a formula even when
-//! it is quoted. [`strip_formula_guard`] undoes exactly that shape on import.
-//! The parser itself stays byte-faithful; stripping is the importer's choice.
+//! Formula guard (not RFC 4180 — spreadsheet safety), **comma-separated
+//! only**: a field that begins with `=`, `+`, `-`, `@`, tab or CR is written
+//! with a leading apostrophe, because Excel, LibreOffice and Sheets evaluate
+//! such a cell as a formula even when it is quoted. Tab-separated output is
+//! for Anki, which imports every field verbatim and would show the
+//! apostrophe on the card, so it is left alone — see [`guards_formulas`].
+//! [`strip_formula_guard`] undoes exactly that shape on import. The parser
+//! itself stays byte-faithful; stripping is the importer's choice.
 
 /// Serialize `rows` to CSV/TSV text using `delimiter` (`,` or `\t`).
 ///
@@ -42,12 +45,23 @@ fn needs_quoting(field: &str, delimiter: char) -> bool {
     field.contains(delimiter) || field.contains('"') || field.contains('\r') || field.contains('\n')
 }
 
-/// Leading characters a spreadsheet treats as the start of a formula.
+/// Leading characters a spreadsheet treats as the start of a formula — the
+/// OWASP CSV-injection list.
 ///
 /// Quoting is not enough: a quoted `"=1+1"` is evaluated too. Only changing
 /// the first character stops it, which is why Excel itself writes a leading
 /// apostrophe for a literal.
-const FORMULA_LEAD: [char; 4] = ['=', '+', '-', '@'];
+const FORMULA_LEAD: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+/// Whether output with this delimiter gets the formula guard.
+///
+/// Comma-separated is the spreadsheet format, where the guard is consumed and
+/// invisible. Tab-separated is what Anki imports, verbatim — a card reading
+/// `-ing endings` would arrive as `'-ing endings`. One rule, used by both the
+/// writer and the importer, so they cannot disagree.
+pub fn guards_formulas(delimiter: char) -> bool {
+    delimiter == ','
+}
 
 fn is_formula_lead(field: &str) -> bool {
     field
@@ -59,7 +73,7 @@ fn is_formula_lead(field: &str) -> bool {
 fn write_field(field: &str, delimiter: char) -> String {
     // The apostrophe is part of the value as far as CSV is concerned, so it
     // goes inside any quotes; the receiving spreadsheet is what consumes it.
-    let guarded = if is_formula_lead(field) {
+    let guarded = if guards_formulas(delimiter) && is_formula_lead(field) {
         format!("'{field}")
     } else {
         field.to_string()
@@ -186,6 +200,24 @@ mod tests {
         for field in ["=1+1", "+1", "-1", "@SUM(A1)"] {
             assert_eq!(write_field(field, ','), format!("'{field}"));
         }
+    }
+
+    #[test]
+    fn tab_and_carriage_return_leads_are_guarded_too() {
+        assert_eq!(write_field("\t=1+1", ','), "'\t=1+1");
+        assert_eq!(
+            write_field("\r=1", ','),
+            "\"'\r=1\"",
+            "CR also forces quoting"
+        );
+    }
+
+    #[test]
+    fn tab_separated_output_is_verbatim_for_anki() {
+        for field in ["=1+1", "-ing endings", "@home"] {
+            assert_eq!(write_field(field, '\t'), field);
+        }
+        assert!(!guards_formulas('\t'));
     }
 
     #[test]

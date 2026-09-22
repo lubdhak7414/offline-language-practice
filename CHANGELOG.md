@@ -42,10 +42,11 @@ Notable changes to this project. The format follows
 
 ### Security
 
-- CSV/TSV export no longer hands spreadsheets a formula to run. A card that
+- CSV export no longer hands spreadsheets a formula to run. A card that
   begins with `=`, `+`, `-` or `@` is written with a leading apostrophe, so
-  Excel, LibreOffice and Sheets show it as text. Importing the file back
-  removes the apostrophe again. JSON export is unaffected.
+  Excel, LibreOffice and Sheets show it as text; importing the file back
+  removes it. TSV export — the format for Anki, which imports text as-is —
+  and JSON export are written unchanged.
 
 ## [0.1.0] — 2026-09-22
 

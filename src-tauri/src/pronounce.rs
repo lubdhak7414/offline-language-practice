@@ -28,6 +28,14 @@
 //! model of roughly 300 MB-1.2 GB, which is not shipped; if one is ever
 //! added it should be an optional download surfaced as
 //! `model_status.asr_phoneme` rather than a silent change in meaning here.
+//!
+//! # What it has been measured to do
+//!
+//! Against expert ratings (speechocean762; see [`GOP_PERCENTILE`]) the
+//! per-word signal separates mispronounced words from correct ones at AUC
+//! ~0.80, but only about one flag in four is a real error. So a word is
+//! flagged for a second listen and never marked wrong, and the sentence mean
+//! (Pearson ~0.47 with expert sentence accuracy) is the number to trust more.
 
 use std::ops::Range;
 
