@@ -46,14 +46,24 @@ The same hashes appear in `src-tauri/src/download.rs` and
 Releases are **not code-signed**, on any platform. This is a deliberate,
 documented choice rather than an oversight:
 
-- **macOS.** Gatekeeper blocks unsigned and un-notarized `.dmg` files.
-  Notarization requires an Apple Developer account at $99/year. Until that
-  exists, macOS users should build from source, or knowingly accept the risk
-  with `xattr -d com.apple.quarantine /Applications/<app>.app`.
-- **Windows.** An OV or EV certificate runs $200–600/year, and SmartScreen
-  reputation still takes time to accumulate afterwards, so a fresh
-  certificate buys less than it costs. Expect a SmartScreen warning:
-  "More info" then "Run anyway".
+- **macOS.** Gatekeeper blocks unsigned and un-notarized apps. Notarization
+  requires an Apple Developer account at $99/year, with no fee waiver for
+  individuals. Until that exists, macOS users should build from source, or
+  knowingly accept the risk: since macOS 15 (Sequoia), Control-click → Open
+  no longer bypasses Gatekeeper; open the app once, then choose System
+  Settings → Privacy & Security → Open Anyway. The equivalent from a
+  terminal is `xattr -d com.apple.quarantine /Applications/<app>.app`.
+- **Windows.** Microsoft's own signing service (Artifact Signing, from
+  $9.99/month) accepts individual developers only in the United States and
+  Canada. A signature no longer buys an instant pass either: EV certificates
+  stopped bypassing SmartScreen, and signed files still warn until
+  reputation builds. Expect a SmartScreen warning: "More info" then "Run
+  anyway". On Windows 11 with Smart App Control turned on, unsigned files
+  are blocked outright and there is no "Run anyway". That check covers
+  every executable, not only downloads, so building from source does not
+  help either: those users cannot run the app until releases are signed. Free signing for open-source
+  projects (SignPath Foundation) is the planned route once releases have a
+  download history, which it requires.
 - **Linux.** Unsigned AppImage and `.deb` artifacts are normal.
 
 What is offered instead of a signature is verifiable provenance. Every release

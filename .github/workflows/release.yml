@@ -95,8 +95,12 @@ jobs:
             cat > notes.md <<'EOF'
           See CHANGELOG.md for what changed.
 
-          These builds are **not code-signed**. Verify what you downloaded
-          against `SHA256SUMS`, which is attested to this workflow run:
+          These builds are **not code-signed**. macOS: open the app once,
+          then System Settings -> Privacy & Security -> Open Anyway.
+          Windows: SmartScreen shows "More info" -> "Run anyway"; with Smart
+          App Control on, unsigned apps are blocked (see SECURITY.md).
+          Verify what you downloaded against `SHA256SUMS`, which is
+          attested to this workflow run:
 
               sha256sum -c SHA256SUMS --ignore-missing
               gh attestation verify <file> --repo ${{ github.repository }}
