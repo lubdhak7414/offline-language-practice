@@ -402,8 +402,10 @@ impl AsrEngine {
     /// Interpret LE f32 bytes as mono samples; ignore trailing partial chunk.
     pub fn bytes_to_f32_mono(bytes: &[u8]) -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 }

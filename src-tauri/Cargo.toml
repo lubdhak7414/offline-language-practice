@@ -3,7 +3,7 @@ name = "offline-language-practice"
 version = "0.1.0"
 description = "Offline-first language practice: on-device ASR, TTS, FSRS, grammar, SQLite"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 # Matches LICENSE at the repo root and `bundle.license` in tauri.conf.json.
 # Without it `cargo deny check licenses` reports the crate as unlicensed.
 # GPL because the binary statically links espeak-ng (GPL-3.0-or-later, via

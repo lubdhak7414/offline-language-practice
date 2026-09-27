@@ -16,7 +16,7 @@ model files from a pinned URL.
 
 ## Getting set up
 
-Requires Rust (stable, MSRV 1.77), Node 22.22.2 or newer, and `cmake` (the
+Requires Rust 1.90 or newer, Node 22.22.2 or newer, and `cmake` (the
 bundled espeak build needs it). On Linux also install the Tauri system
 dependencies listed in `.github/workflows/ci.yml`.
 
@@ -60,7 +60,9 @@ These exist because breaking them has already cost real debugging time.
 too, so an unreferenced `pub` item is a hard error, not a warning. A helper
 written "for the next commit" will fail the build.
 
-**MSRV is 1.77.** `#[allow(…, reason = "…")]` needs 1.81 and must not be used.
+**The minimum Rust version is 1.90**, the highest any dependency needs. CI
+builds on exactly that version, so a dependency bump that raises it fails
+until `rust-version` in `src-tauri/Cargo.toml` is raised too.
 
 **No `ALTER TABLE` after migration 4.** SQLite has no
 `ADD COLUMN IF NOT EXISTS`, and a partially-failed migration re-runs. Extend
