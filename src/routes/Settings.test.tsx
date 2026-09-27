@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/preact";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
-import { createMockIpc, type MockIpc } from "../ipc/mock";
+import { createMockIpc, makeUpdate, type MockIpc } from "../ipc/mock";
 import { Settings } from "./Settings";
 
 let restore: (() => void) | undefined;
@@ -130,6 +130,70 @@ describe("Settings", () => {
     expect(
       screen.getByRole("button", { name: "Optimize scheduling parameters" }),
     ).toBeDisabled();
+  });
+
+  it("saves the update opt-in, which starts off", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    const box = (await screen.findByLabelText(
+      "Check for a new version each time the app starts",
+    )) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    await waitFor(() => {
+      const saved = mock.calls.find((c) => c.name === "setPreferences");
+      expect((saved?.args[0] as { check_updates: boolean }).check_updates).toBe(true);
+    });
+    await waitFor(() => expect(box.checked).toBe(true));
+  });
+
+  it("checks on request, which needs no opt-in, and says when this is the newest", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    fireEvent.click(await screen.findByRole("button", { name: "Check now" }));
+    expect(await screen.findByText("You have the newest version (0.1.0).")).toBeInTheDocument();
+    expect(mock.calls.find((c) => c.name === "checkForUpdate")?.args).toEqual(["manual"]);
+  });
+
+  it("installs an update, streaming progress, then offers a restart", async () => {
+    const mock = createMockIpc({ update: { available: makeUpdate() } });
+    mount(mock);
+    fireEvent.click(await screen.findByRole("button", { name: "Check now" }));
+    expect(
+      await screen.findByText("Version 0.2.0 is available. You have 0.1.0."),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Download and install" }));
+    expect(
+      await screen.findByText("Installed. Restart to use version 0.2.0."),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Restart now" }));
+    await waitFor(() => expect(mock.calls.some((c) => c.name === "restartApp")).toBe(true));
+    expect(screen.queryByText(/Could not/)).toBeNull();
+  });
+
+  it("only tells a package install where to get the update", async () => {
+    mount(createMockIpc({ update: { mode: "notify", bundle: "deb", available: makeUpdate() } }));
+    fireEvent.click(await screen.findByRole("button", { name: "Check now" }));
+    expect(await screen.findByText(/your package manager owns it/)).toBeInTheDocument();
+    expect(
+      screen.getByText("https://github.com/lubdhak7414/offline-language-practice/releases"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Download and install" })).toBeNull();
+    expect(screen.getByText("Installed as: deb")).toBeInTheDocument();
+  });
+
+  it("shows a failed check instead of claiming there is nothing new", async () => {
+    mount(createMockIpc({ fail: { checkForUpdate: "update check failed: offline" } }));
+    fireEvent.click(await screen.findByRole("button", { name: "Check now" }));
+    expect(
+      await screen.findByText("Could not check for updates: update check failed: offline"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/newest version/)).toBeNull();
+  });
+
+  it("names a development build in Diagnostics", async () => {
+    mount(createMockIpc({ update: { mode: "notify", bundle: null } }));
+    expect(await screen.findByText("Installed as: development build")).toBeInTheDocument();
   });
 
   it("surfaces a restart notice after restoring", async () => {

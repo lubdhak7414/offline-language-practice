@@ -23,6 +23,12 @@ const NAV: Array<{ id: Route; label: string; ready: boolean }> = [
 /** How long a transient announcement stays on screen. */
 const TOAST_MS = 4000;
 
+/**
+ * The opt-in update check waits this long after launch, so it never
+ * competes with startup and a user who quits at once makes no request.
+ */
+const STARTUP_CHECK_DELAY_MS = 5000;
+
 export function App() {
   const [toast, setToast] = useState("");
   /**
@@ -52,15 +58,37 @@ export function App() {
   useEffect(() => startRouter(), []);
 
   useEffect(() => {
+    let alive = true;
+    let checkTimer: ReturnType<typeof setTimeout> | undefined;
     void ipc()
       .getPreferences()
-      .then((p) => setOnboarded(p.onboarded))
+      .then((p) => {
+        setOnboarded(p.onboarded);
+        // Once per launch, and only when the user opted in. The backend
+        // refuses a "startup" check with the preference off regardless.
+        if (!alive || !p.onboarded || !p.check_updates) return;
+        checkTimer = setTimeout(() => {
+          void ipc()
+            .checkForUpdate("startup")
+            .then((u) => {
+              if (u) announce(`Version ${u.version} is available. Open Settings to install it.`);
+            })
+            .catch(() => {
+              // A failed automatic check stays silent; "Check now" in
+              // Settings shows its error.
+            });
+        }, STARTUP_CHECK_DELAY_MS);
+      })
       .catch(() => {
         // No backend (tests, browser preview) or an unreadable database:
         // show the app rather than trapping someone in onboarding.
         setOnboarded(true);
       });
-  }, []);
+    return () => {
+      alive = false;
+      clearTimeout(checkTimer);
+    };
+  }, [announce]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

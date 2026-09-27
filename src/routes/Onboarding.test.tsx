@@ -116,6 +116,37 @@ describe("Onboarding", () => {
     });
   });
 
+  it("leaves update checks off unless the box is ticked", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({ preferences: { onboarded: false } });
+    mount(mock);
+    await toModelStep(user);
+    const box = (await screen.findByLabelText(
+      "Check for new versions when the app starts",
+    )) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Skip for now" }));
+    await user.click(await screen.findByRole("button", { name: "Finish" }));
+    await waitFor(() => {
+      const saved = mock.calls.find((c) => c.name === "setPreferences");
+      expect((saved?.args[0] as { check_updates: boolean }).check_updates).toBe(false);
+    });
+  });
+
+  it("saves the update opt-in when it is ticked", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({ preferences: { onboarded: false } });
+    mount(mock);
+    await toModelStep(user);
+    await user.click(await screen.findByLabelText("Check for new versions when the app starts"));
+    await user.click(screen.getByRole("button", { name: "Skip for now" }));
+    await user.click(await screen.findByRole("button", { name: "Finish" }));
+    await waitFor(() => {
+      const saved = mock.calls.find((c) => c.name === "setPreferences");
+      expect((saved?.args[0] as { check_updates: boolean }).check_updates).toBe(true);
+    });
+  });
+
   it("reports a failed download instead of silently doing nothing", async () => {
     const user = userEvent.setup();
     mount(

@@ -3,17 +3,31 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ipc } from "../ipc/commands";
 import { createClipPlayer, speak } from "../lib/audio/player";
 import { friendlyTtsError } from "../lib/errors";
-import { ModelDownloads } from "../components/ModelDownloads";
+import { ModelDownloads, formatBytes } from "../components/ModelDownloads";
 import type {
+  AvailableUpdate,
   BackupInfo,
   ModelStatus,
   Preferences,
   ReviewStats,
+  UpdateInfo,
   VoiceInfo,
 } from "../ipc/types";
 
 const DIALECTS = ["american", "british", "canadian", "australian"] as const;
 const THEMES = ["system", "light", "dark"] as const;
+
+/** Where the Updates section is. One at a time, like the backend's `UpdateState`. */
+type UpdateStatus =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "newest" }
+  | { kind: "available"; update: AvailableUpdate }
+  | { kind: "downloading"; version: string; received: number; total: number | null }
+  | { kind: "verifying" }
+  | { kind: "installing" }
+  | { kind: "installed"; version: string }
+  | { kind: "error"; message: string };
 
 /** "Remember about N out of 100" reads better than a bare decimal retention. */
 function retentionLabel(r: number): string {
@@ -32,11 +46,17 @@ export function Settings(props: { announce: (msg: string) => void }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [restoreInfo, setRestoreInfo] = useState<BackupInfo | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ kind: "idle" });
 
   const optimizing = useRef(false);
   const restoring = useRef(false);
   const player = useRef(createClipPlayer());
   const speaking = useRef(false);
+  // Both have a side effect (a request to github.com, an install), so a
+  // second click is dropped, not queued. The backend refuses it too.
+  const checkingUpdate = useRef(false);
+  const installing = useRef(false);
 
   useEffect(() => {
     const clips = player.current;
@@ -46,7 +66,7 @@ export function Settings(props: { announce: (msg: string) => void }) {
   useEffect(() => {
     void (async () => {
       try {
-        const [v, id, p, r, s, ms, ep] = await Promise.all([
+        const [v, id, p, r, s, ms, ep, ui] = await Promise.all([
           ipc().listVoices(),
           ipc().getVoice(),
           ipc().getPreferences(),
@@ -54,6 +74,7 @@ export function Settings(props: { announce: (msg: string) => void }) {
           ipc().reviewStats(),
           ipc().modelStatus(),
           ipc().epReport(),
+          ipc().updateInfo(),
         ]);
         setVoices(v);
         setVoiceState(id);
@@ -62,6 +83,7 @@ export function Settings(props: { announce: (msg: string) => void }) {
         setStats(s);
         setModelStatus(ms);
         setEpReport(ep);
+        setUpdateInfo(ui);
         applyTheme(p.theme);
       } catch (e) {
         setError(String(e));
@@ -188,6 +210,57 @@ export function Settings(props: { announce: (msg: string) => void }) {
       setError(String(e));
     } finally {
       restoring.current = false;
+    }
+  }, []);
+
+  const checkForUpdate = useCallback(async () => {
+    if (checkingUpdate.current || installing.current) return;
+    checkingUpdate.current = true;
+    setUpdateStatus({ kind: "checking" });
+    try {
+      const found = await ipc().checkForUpdate("manual");
+      setUpdateStatus(found ? { kind: "available", update: found } : { kind: "newest" });
+    } catch (e) {
+      setUpdateStatus({ kind: "error", message: `Could not check for updates: ${String(e)}` });
+    } finally {
+      checkingUpdate.current = false;
+    }
+  }, []);
+
+  const installUpdate = useCallback(async (version: string) => {
+    if (installing.current || checkingUpdate.current) return;
+    installing.current = true;
+    try {
+      await ipc().installUpdate((ev) => {
+        switch (ev.kind) {
+          case "started":
+            setUpdateStatus({ kind: "downloading", version, received: 0, total: ev.total });
+            return;
+          case "progress":
+            setUpdateStatus({ kind: "downloading", version, received: ev.received, total: ev.total });
+            return;
+          case "verifying":
+            setUpdateStatus({ kind: "verifying" });
+            return;
+          case "installing":
+            setUpdateStatus({ kind: "installing" });
+            return;
+          case "installed":
+            setUpdateStatus({ kind: "installed", version });
+        }
+      });
+    } catch (e) {
+      setUpdateStatus({ kind: "error", message: `Could not install the update: ${String(e)}` });
+    } finally {
+      installing.current = false;
+    }
+  }, []);
+
+  const restartApp = useCallback(async () => {
+    try {
+      await ipc().restartApp();
+    } catch (e) {
+      setUpdateStatus({ kind: "error", message: `Could not restart: ${String(e)}` });
     }
   }, []);
 
@@ -359,6 +432,55 @@ export function Settings(props: { announce: (msg: string) => void }) {
       </section>
 
       <section class="settings-section">
+        <h2>Updates</h2>
+        <p>
+          This app only goes online to download the speech models you ask for.
+          Checking for updates is off unless you turn it on.
+        </p>
+        <div class="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={prefs.check_updates}
+              onChange={(e) =>
+                void savePrefs({
+                  ...prefs,
+                  check_updates: (e.target as HTMLInputElement).checked,
+                })
+              }
+            />
+            Check for a new version each time the app starts
+          </label>
+        </div>
+        <p class="muted">
+          When this is on, the app asks github.com once per launch whether a
+          newer version has been published. The request contains nothing about
+          you or your practice. Like any connection, it shows GitHub your IP
+          address.
+        </p>
+        <div class="row">
+          <button
+            type="button"
+            disabled={
+              updateStatus.kind === "checking" ||
+              updateStatus.kind === "downloading" ||
+              updateStatus.kind === "verifying" ||
+              updateStatus.kind === "installing"
+            }
+            onClick={() => void checkForUpdate()}
+          >
+            Check now
+          </button>
+        </div>
+        <UpdateStatusView
+          status={updateStatus}
+          info={updateInfo}
+          onInstall={(version) => void installUpdate(version)}
+          onRestart={() => void restartApp()}
+        />
+      </section>
+
+      <section class="settings-section">
         <h2>Appearance</h2>
         <div class="row" role="radiogroup" aria-label="Theme">
           {THEMES.map((t) => (
@@ -382,12 +504,89 @@ export function Settings(props: { announce: (msg: string) => void }) {
             <li>ASR model: {modelStatus.asr_model ? "installed" : "missing"}</li>
             <li>ASR vocabulary: {modelStatus.asr_vocab ? "installed" : "missing"}</li>
             <li>TTS voice: {modelStatus.tts_voice ? "installed" : "missing"}</li>
+            {updateInfo && (
+              <li>Installed as: {updateInfo.bundle ?? "development build"}</li>
+            )}
           </ul>
         )}
         <pre class="output">{epReport}</pre>
       </section>
     </section>
   );
+}
+
+/** The Updates section's status line and whatever action goes with it. */
+function UpdateStatusView(props: {
+  status: UpdateStatus;
+  info: UpdateInfo | null;
+  onInstall: (version: string) => void;
+  onRestart: () => void;
+}) {
+  const { status, info, onInstall, onRestart } = props;
+  switch (status.kind) {
+    case "idle":
+      return null;
+    case "checking":
+      return <p class="muted">Checking github.com…</p>;
+    case "newest":
+      return <p>You have the newest version ({info?.current_version ?? "unknown"}).</p>;
+    case "available": {
+      const { update } = status;
+      return (
+        <>
+          <p>
+            Version {update.version} is available. You have {update.current_version}.
+          </p>
+          {update.can_install ? (
+            <>
+              <div class="row">
+                <button type="button" onClick={() => onInstall(update.version)}>
+                  Download and install
+                </button>
+              </div>
+              {(info?.bundle === "msi" || info?.bundle === "nsis") && (
+                <p class="muted">
+                  The app will close while the installer runs and reopen when it finishes.
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              {info?.reason && <p>{info.reason}</p>}
+              {/* Selectable text, not a link: the webview cannot open a browser. */}
+              <p>
+                Download it from <code>{info?.release_page}</code>
+              </p>
+            </>
+          )}
+        </>
+      );
+    }
+    case "downloading":
+      return (
+        <p>
+          Downloading {status.version}: {formatBytes(status.received)}
+          {status.total !== null && ` of ${formatBytes(status.total)}`}
+        </p>
+      );
+    case "verifying":
+      return <p>Checking the download's signature…</p>;
+    case "installing":
+      return <p>Installing…</p>;
+    case "installed":
+      return (
+        <>
+          <p>Installed. Restart to use version {status.version}.</p>
+          <div class="row">
+            <button type="button" onClick={onRestart}>
+              Restart now
+            </button>
+          </div>
+        </>
+      );
+    case "error":
+      return <p class="notice notice-error">{status.message}</p>;
+  }
 }
 
 function applyTheme(theme: string) {

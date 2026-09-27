@@ -49,6 +49,9 @@ export function Onboarding(props: {
   const { announce, onFinish } = props;
   const [step, setStep] = useState(0);
   const [goal, setGoal] = useState<string>("both");
+  // Off unless ticked: an update check is a request to github.com, and
+  // nothing leaves the machine without the user asking.
+  const [checkUpdates, setCheckUpdates] = useState(false);
   const [missing, setMissing] = useState(1);
   const [error, setError] = useState<string | null>(null);
 
@@ -101,7 +104,7 @@ export function Onboarding(props: {
   const finish = useCallback(async () => {
     try {
       const prefs = await ipc().getPreferences();
-      const next: Preferences = { ...prefs, goal, onboarded: true };
+      const next: Preferences = { ...prefs, goal, onboarded: true, check_updates: checkUpdates };
       await ipc().setPreferences(next);
     } catch (e) {
       // Persisting the flag is best-effort: failing to save it must not
@@ -110,7 +113,7 @@ export function Onboarding(props: {
     }
     recorder.current.cancel();
     onFinish();
-  }, [goal, onFinish]);
+  }, [goal, checkUpdates, onFinish]);
 
   return (
     <section class="route" aria-labelledby="onboarding-title">
@@ -177,6 +180,21 @@ export function Onboarding(props: {
       {step === 2 && (
         <div class="settings-section">
           <ModelDownloads announce={announce} onMissingChange={setMissing} />
+          <div class="row">
+            <label>
+              <input
+                type="checkbox"
+                checked={checkUpdates}
+                onChange={(e) => setCheckUpdates((e.target as HTMLInputElement).checked)}
+              />
+              Check for new versions when the app starts
+            </label>
+          </div>
+          <p class="muted">
+            Off unless you tick it. The app asks github.com whether a newer
+            version exists; nothing about you or your practice is sent. You can
+            change this in Settings.
+          </p>
           <div class="row">
             <button type="button" onClick={() => setStep(3)}>
               {missing === 0 ? "Continue" : "Skip for now"}
