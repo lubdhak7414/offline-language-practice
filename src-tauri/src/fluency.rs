@@ -31,9 +31,15 @@
 //! likely absorbed a filler. It needs word timings, which only exist for
 //! read-aloud prompts whose transcript matches the target; open-ended
 //! answers get no hesitation count at all.
+//!
+//! [`detect_held_sounds`] needs no target: it finds filled pauses and
+//! stretched words from pitch, level and the CTC path alone. It is not
+//! wired into [`analyze`] until it passes its measurement against AMI's
+//! hand-transcribed "um"/"uh".
 
 use serde::Serialize;
 
+use crate::asr::CtcFrames;
 use crate::pronounce::{tokenize, WordScore};
 
 /// Analysis window and hop for the energy envelope.
@@ -322,6 +328,489 @@ pub fn filler_score(fillers: FillerCounts, hesitations: i64, word_count: usize) 
     let per_100 = weighted * 100.0 / word_count as f32;
     let penalty = (per_100 - FILLERS_PER_100_OK).max(0.0) * 10.0;
     (100.0 - penalty).clamp(0.0, 100.0) as u8
+}
+
+// ---------------------------------------------------------------------------
+// Held sounds: filled pauses and lengthened words, from the audio itself.
+//
+// After Goto, Itou & Hayamizu (Eurospeech 1999): a speaker who says "uh" or
+// stretches "theee" holds the articulators still, so pitch barely moves and
+// the level barely changes. On top of those two cues sits the evidence the
+// CTC model already produces: voiced sound it did not spell. None of this is
+// wired into the app yet (Phase 7 Stage 5 step 5, gated on the AMI
+// measurement in `corpus`); every threshold below is provisional until then.
+// ---------------------------------------------------------------------------
+
+/// A hop must be this far above [`silence_floor_db`] before the pitch tracker
+/// looks at it, which keeps mains hum and fans at the floor out of it.
+const VOICED_MARGIN_DB: f32 = 10.0;
+/// Pitch search range. Covers adult and child voices, not singing.
+const F0_MIN_HZ: f32 = 70.0;
+const F0_MAX_HZ: f32 = 400.0;
+/// Autocorrelation window: at least two periods of the lowest pitch.
+const PITCH_WINDOW_MS: f32 = 40.0;
+/// Best normalised cross-correlation at or above this is voiced.
+const VOICING_NCCF: f32 = 0.6;
+/// Octave guard: the first correlation peak within this fraction of the best
+/// wins, so a period that also correlates at twice its length is not halved.
+const OCTAVE_GUARD: f32 = 0.9;
+/// Unvoiced hops a held sound may contain without ending (20 ms).
+const HELD_GAP_HOPS: usize = 2;
+/// How far pitch may wander (max - min, semitones) inside one candidate.
+/// Wider than [`HELD_SPREAD_ST`] so that threshold is a filter, not a cut.
+const SEGMENT_SPREAD_ST: f32 = 4.0;
+/// Candidates shorter than this are not even logged.
+const CANDIDATE_MIN_MS: i64 = 100;
+/// Pitch stability: p90 - p10 in semitones.
+const HELD_SPREAD_ST: f32 = 2.0;
+/// Level stability: words have consonant dips; a held "uh" does not.
+const HELD_ENERGY_SD_DB: f32 = 4.0;
+/// Filled pauses run about 200-600 ms, "um" longer. Past 1.5 s it is more
+/// likely a held tone than a hesitation.
+const HELD_MIN_MS: i64 = 200;
+const HELD_MAX_MS: i64 = 1500;
+/// A stretched word has to be held noticeably long to read as hesitation.
+const LENGTHENING_MIN_MS: i64 = 300;
+/// Letters the model spells a filled pause with when it does not swallow it
+/// ("A", "UM", "AH", "ER", "HM").
+const FILLER_LETTERS: &[u8] = b"AUMHER";
+/// A frame is blank-dominant when P(blank) > 0.5.
+const BLANK_DOMINANT_LOGP: f32 = -std::f32::consts::LN_2;
+/// Share of blank-dominant frames that makes a candidate "not spelled".
+const BLANK_FRAC_MIN: f32 = 0.7;
+/// A blank run this long ends a CTC word even without a `|`.
+const WORD_GAP_MS: f32 = 500.0;
+/// A CTC word counts as under a candidate when it covers this share of it.
+const WORD_OVERLAP_FRAC: f32 = 0.3;
+
+/// What a held sound most likely was.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5 wires detect_held_sounds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HeldKind {
+    /// "uh", "um": voiced, steady, and not spelled as a real word.
+    FilledPause,
+    /// A real word held unusually long ("theee", "aaand").
+    Lengthening,
+}
+
+/// One held sound, in milliseconds from the start of the recording.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HeldSound {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub kind: HeldKind,
+}
+
+/// A word on the greedy CTC path, with the span its letters occupy.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtcWord {
+    pub text: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// What the CTC path says lies under a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnderWord {
+    /// No word covers it: the model spelled nothing there.
+    None,
+    /// Only short words made of filler letters ("A", "AH", "HM"): a filled
+    /// pause the model bent into something word-shaped.
+    FillerShaped,
+    /// A filler the transcript already spelled, so `count_fillers` has it.
+    SpelledFiller,
+    /// A real word.
+    Real,
+}
+
+/// A steady voiced stretch, before any threshold but the segmentation one.
+///
+/// Carries every feature the classifier looks at, so the corpus harness can
+/// log candidates once and sweep thresholds outside the build.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HeldCandidate {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// p90 - p10 of F0 over the voiced hops, semitones.
+    pub f0_spread_st: f32,
+    /// Standard deviation of the hop level over the voiced hops, dB.
+    pub energy_sd_db: f32,
+    /// Share of CTC frames under it where P(blank) > 0.5.
+    pub blank_frac: f32,
+    /// Letters the greedy path emits under it, collapsed.
+    pub letters: String,
+    pub under: UnderWord,
+    /// The words counted in `under`, space-separated. Only the corpus
+    /// harness reads it; the classifier needs `under` alone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub words: String,
+}
+
+/// Pitch per [`HOP_MS`] hop, `None` where the hop is unvoiced or skipped.
+///
+/// Normalised cross-correlation over a [`PITCH_WINDOW_MS`] window at each
+/// hop, lags `sr/400 ..= sr/70`. `active` restricts the work to hops that
+/// passed an energy gate (`None` = every hop), which bounds the cost by
+/// speaking time rather than recording length.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5.
+pub fn f0_track(pcm: &[f32], sample_rate: u32, active: Option<&[bool]>) -> Vec<Option<f32>> {
+    if pcm.is_empty() || sample_rate == 0 {
+        return Vec::new();
+    }
+    let sr = sample_rate as f32;
+    let hop = ((HOP_MS / 1000.0) * sr).round().max(1.0) as usize;
+    let win = ((PITCH_WINDOW_MS / 1000.0) * sr).round().max(2.0) as usize;
+    let min_lag = (sr / F0_MAX_HZ).floor().max(1.0) as usize;
+    let max_lag = (sr / F0_MIN_HZ).ceil() as usize;
+    let x: Vec<f32> = pcm
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { 0.0 })
+        .collect();
+    // Prefix sums of squares make each lag's energy term O(1).
+    let mut sq = Vec::with_capacity(x.len() + 1);
+    sq.push(0.0f64);
+    for v in &x {
+        sq.push(sq[sq.len() - 1] + (*v as f64) * (*v as f64));
+    }
+    let energy = |a: usize, n: usize| sq[a + n] - sq[a];
+
+    let hops = x.len().div_ceil(hop);
+    let mut out = vec![None; hops];
+    let mut nccf = vec![0.0f32; max_lag + 2];
+    for (h, slot) in out.iter_mut().enumerate() {
+        if !active.is_none_or(|a| a.get(h).copied().unwrap_or(false)) {
+            continue;
+        }
+        let start = h * hop;
+        let avail = x.len() - start;
+        // Half a window is the least that still sees two low periods.
+        if avail < max_lag + 1 + win / 2 {
+            continue;
+        }
+        let n = win.min(avail - max_lag - 1);
+        let e0 = energy(start, n);
+        if e0 <= 1e-12 {
+            continue;
+        }
+        let a = &x[start..start + n];
+        let mut best = 0.0f32;
+        for lag in min_lag..=max_lag + 1 {
+            let e1 = energy(start + lag, n);
+            let num = dot(a, &x[start + lag..start + lag + n]);
+            nccf[lag] = if e1 > 1e-12 {
+                (num / (e0 * e1).sqrt()) as f32
+            } else {
+                0.0
+            };
+            if lag <= max_lag {
+                best = best.max(nccf[lag]);
+            }
+        }
+        if best < VOICING_NCCF {
+            continue;
+        }
+        // First interior peak near the best; an edge maximum means the true
+        // period lies outside the search range.
+        let Some(k) = (min_lag + 1..=max_lag).find(|&k| {
+            nccf[k] >= OCTAVE_GUARD * best && nccf[k] >= nccf[k - 1] && nccf[k] >= nccf[k + 1]
+        }) else {
+            continue;
+        };
+        // Parabolic interpolation around the peak: an integer lag alone is
+        // ~1% off at 300 Hz.
+        let (l, c, r) = (nccf[k - 1], nccf[k], nccf[k + 1]);
+        let denom = l - 2.0 * c + r;
+        let delta = if denom < 0.0 {
+            (0.5 * (l - r) / denom).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        *slot = Some(sr / (k as f32 + delta));
+    }
+    out
+}
+
+/// Dot product with eight partial sums, which lets the compiler vectorise
+/// what is otherwise a strictly ordered float reduction.
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    let mut acc = [0.0f32; 8];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+    acc.iter().map(|&v| v as f64).sum::<f64>() + tail as f64
+}
+
+/// Words on the greedy CTC path.
+///
+/// A word ends at a `|` or at a blank run of [`WORD_GAP_MS`]; repeated
+/// labels on adjacent frames collapse, as in decoding. The span runs from
+/// the first letter frame to the end of the last one, so the blanks a held
+/// vowel leaves *inside* a word still fall within it.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5.
+pub fn ctc_word_spans(ctc: &CtcFrames) -> Vec<CtcWord> {
+    let stride = ctc.stride_ms;
+    if stride <= 0.0 {
+        return Vec::new();
+    }
+    let gap_frames = (WORD_GAP_MS / stride).round().max(1.0) as usize;
+    let to_ms = |f: usize| (f as f32 * stride).round() as i64;
+    let mut out = Vec::new();
+    // (text, first letter frame, last letter frame)
+    let mut cur: Option<(String, usize, usize)> = None;
+    let mut blanks = 0usize;
+    let mut prev = 0u8;
+    let mut flush = |cur: &mut Option<(String, usize, usize)>| {
+        if let Some((text, first, last)) = cur.take() {
+            out.push(CtcWord {
+                text,
+                start_ms: to_ms(first),
+                end_ms: to_ms(last + 1),
+            });
+        }
+    };
+    for (t, &label) in ctc.label.iter().enumerate() {
+        match label {
+            0 => {
+                blanks += 1;
+                if blanks >= gap_frames {
+                    flush(&mut cur);
+                }
+            }
+            b' ' => flush(&mut cur),
+            _ => {
+                blanks = 0;
+                let word = cur.get_or_insert_with(|| (String::new(), t, t));
+                if label != prev && label != b'?' {
+                    word.0.push(label as char);
+                }
+                word.2 = t;
+            }
+        }
+        if label != 0 {
+            blanks = 0;
+        }
+        prev = label;
+    }
+    flush(&mut cur);
+    out
+}
+
+fn semitones(hz: f32) -> f32 {
+    12.0 * hz.log2()
+}
+
+/// `q`-quantile of `v` by nearest rank; `v` must be non-empty.
+fn quantile(v: &[f32], q: f32) -> f32 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[((s.len() - 1) as f32 * q).round() as usize]
+}
+
+/// Split the voiced hops into stretches whose pitch stays inside
+/// [`SEGMENT_SPREAD_ST`], tolerating [`HELD_GAP_HOPS`] unvoiced hops.
+///
+/// Greedy, but when a hop breaks the range the new stretch is grown
+/// *backwards* from it as far as the range allows and the old one is cut
+/// where the new one begins, so a held "uh" straight after a word starts
+/// where the pitch settled, not where the word happened to end.
+fn stable_runs(f0: &[Option<f32>]) -> Vec<(usize, usize)> {
+    let st: Vec<Option<f32>> = f0.iter().map(|f| f.map(semitones)).collect();
+    let mut out = Vec::new();
+    // (first hop, last voiced hop)
+    let mut cur: Option<(usize, usize)> = None;
+    for (i, s) in st.iter().enumerate() {
+        let Some(s) = *s else {
+            if let Some((a, l)) = cur {
+                if i - l > HELD_GAP_HOPS {
+                    out.push((a, l));
+                    cur = None;
+                }
+            }
+            continue;
+        };
+        let Some((a, _)) = cur else {
+            cur = Some((i, i));
+            continue;
+        };
+        let (lo, hi) = st[a..i]
+            .iter()
+            .flatten()
+            .fold((s, s), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        if hi - lo <= SEGMENT_SPREAD_ST {
+            cur = Some((a, i));
+            continue;
+        }
+        // Grow the new stretch backwards from i.
+        let (mut b, mut lo, mut hi) = (i, s, s);
+        let mut j = i;
+        while j > a {
+            j -= 1;
+            if let Some(v) = st[j] {
+                if hi.max(v) - lo.min(v) > SEGMENT_SPREAD_ST {
+                    break;
+                }
+                lo = lo.min(v);
+                hi = hi.max(v);
+                b = j;
+            }
+        }
+        if let Some(l) = (a..b).rev().find(|&k| st[k].is_some()) {
+            out.push((a, l));
+        }
+        cur = Some((b, i));
+    }
+    if let Some(run) = cur {
+        out.push(run);
+    }
+    out
+}
+
+/// Every steady voiced stretch of at least [`CANDIDATE_MIN_MS`], with the
+/// features [`classify_held`] needs. Pure.
+pub(crate) fn held_candidates(
+    pcm: &[f32],
+    sample_rate: u32,
+    ctc: &CtcFrames,
+) -> Vec<HeldCandidate> {
+    let db = frame_energy_db(pcm, sample_rate);
+    if db.is_empty() {
+        return Vec::new();
+    }
+    let gate = silence_floor_db(&db) + VOICED_MARGIN_DB;
+    let active: Vec<bool> = db.iter().map(|&v| v > gate).collect();
+    let f0 = f0_track(pcm, sample_rate, Some(&active));
+    let words = ctc_word_spans(ctc);
+    // A hop's pitch describes the middle of its window.
+    let centre = |h: usize| h as f32 * HOP_MS + PITCH_WINDOW_MS / 2.0;
+
+    let mut out = Vec::new();
+    for (a, b) in stable_runs(&f0) {
+        let start_ms = (centre(a) - HOP_MS / 2.0).round() as i64;
+        let end_ms = (centre(b) + HOP_MS / 2.0).round() as i64;
+        if end_ms - start_ms < CANDIDATE_MIN_MS {
+            continue;
+        }
+        let voiced: Vec<usize> = (a..=b).filter(|&h| f0[h].is_some()).collect();
+        let st: Vec<f32> = voiced
+            .iter()
+            .filter_map(|&h| f0[h].map(semitones))
+            .collect();
+        let lv: Vec<f32> = voiced.iter().filter_map(|&h| db.get(h).copied()).collect();
+        let mean = lv.iter().sum::<f32>() / lv.len().max(1) as f32;
+        let var = lv.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / lv.len().max(1) as f32;
+
+        let (mut blank, mut total, mut letters, mut prev) = (0usize, 0usize, String::new(), 0u8);
+        if ctc.stride_ms > 0.0 {
+            let f_from = (start_ms as f32 / ctc.stride_ms).floor() as usize;
+            let f_to = ((end_ms as f32 / ctc.stride_ms).ceil() as usize).min(ctc.label.len());
+            for f in f_from..f_to {
+                total += 1;
+                if ctc
+                    .blank_logp
+                    .get(f)
+                    .is_some_and(|&p| p > BLANK_DOMINANT_LOGP)
+                {
+                    blank += 1;
+                }
+                let l = ctc.label[f];
+                if l != 0 && l != b' ' && l != prev {
+                    letters.push(l as char);
+                }
+                prev = l;
+            }
+        }
+
+        let dur = (end_ms - start_ms) as f32;
+        let under_words: Vec<&CtcWord> = words
+            .iter()
+            .filter(|w| {
+                let ov = (w.end_ms.min(end_ms) - w.start_ms.max(start_ms)).max(0) as f32;
+                ov >= WORD_OVERLAP_FRAC * dur
+            })
+            .collect();
+        let filler_shaped =
+            |w: &CtcWord| w.text.len() <= 2 && w.text.bytes().all(|c| FILLER_LETTERS.contains(&c));
+        let under = if under_words.is_empty() {
+            UnderWord::None
+        } else if under_words
+            .iter()
+            .any(|w| count_fillers(&w.text).certain > 0)
+        {
+            UnderWord::SpelledFiller
+        } else if under_words.iter().all(|w| filler_shaped(w)) {
+            UnderWord::FillerShaped
+        } else {
+            UnderWord::Real
+        };
+
+        out.push(HeldCandidate {
+            start_ms,
+            end_ms,
+            f0_spread_st: quantile(&st, 0.9) - quantile(&st, 0.1),
+            energy_sd_db: var.sqrt(),
+            blank_frac: if total > 0 {
+                blank as f32 / total as f32
+            } else {
+                1.0
+            },
+            letters,
+            under,
+            words: under_words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        });
+    }
+    out
+}
+
+/// The provisional decision rule over one candidate's features.
+pub(crate) fn classify_held(c: &HeldCandidate) -> Option<HeldKind> {
+    let dur = c.end_ms - c.start_ms;
+    if !(HELD_MIN_MS..=HELD_MAX_MS).contains(&dur)
+        || c.f0_spread_st > HELD_SPREAD_ST
+        || c.energy_sd_db > HELD_ENERGY_SD_DB
+    {
+        return None;
+    }
+    match c.under {
+        // Already in the text filler count; counting it here would double it.
+        UnderWord::SpelledFiller => None,
+        UnderWord::Real => (dur >= LENGTHENING_MIN_MS).then_some(HeldKind::Lengthening),
+        UnderWord::None | UnderWord::FillerShaped => {
+            let filler_letters = c.letters.bytes().all(|l| FILLER_LETTERS.contains(&l));
+            (filler_letters && (c.blank_frac >= BLANK_FRAC_MIN || c.letters.len() <= 2))
+                .then_some(HeldKind::FilledPause)
+        }
+    }
+}
+
+/// Filled pauses and lengthened words in one recording. Pure.
+///
+/// `ctc` is the greedy path the transcript was decoded from, so its word
+/// spans carry the transcript's words with timings: a filler the model did
+/// spell ("I UM THINK") is left to [`count_fillers`] rather than counted
+/// twice.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5.
+pub fn detect_held_sounds(pcm: &[f32], sample_rate: u32, ctc: &CtcFrames) -> Vec<HeldSound> {
+    held_candidates(pcm, sample_rate, ctc)
+        .iter()
+        .filter_map(|c| {
+            classify_held(c).map(|kind| HeldSound {
+                start_ms: c.start_ms,
+                end_ms: c.end_ms,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// Delivery metrics for one attempt, or `None` when there is not enough
@@ -745,6 +1234,253 @@ mod tests {
             "hesitant {} should score below fluent {}",
             hesitant_report.score,
             fluent_report.score
+        );
+    }
+
+    // --- held sounds -------------------------------------------------------
+
+    /// `(duration_ms, f0_from, f0_to, amplitude)` segments of harmonics `ks`
+    /// at amplitude 1/k, continuous phase, linear pitch glide. A zero
+    /// amplitude is digital silence.
+    fn harmonics(
+        sr: u32,
+        segments: &[(f32, f32, f32, f32)],
+        ks: std::ops::RangeInclusive<u32>,
+    ) -> Vec<f32> {
+        let norm: f32 = ks.clone().map(|k| 1.0 / k as f32).sum();
+        let tau = std::f64::consts::TAU;
+        let mut out = Vec::new();
+        let mut phase = 0.0f64;
+        for &(ms, from, to, amp) in segments {
+            let n = ((ms / 1000.0) * sr as f32).round() as usize;
+            for i in 0..n {
+                let f = from + (to - from) * i as f32 / n as f32;
+                phase = (phase + tau * f as f64 / sr as f64) % tau;
+                let s: f32 = ks
+                    .clone()
+                    .map(|k| (k as f64 * phase).sin() as f32 / k as f32)
+                    .sum();
+                out.push(amp * s / norm);
+            }
+        }
+        out
+    }
+
+    /// A voice-like tone: harmonics 1-5.
+    fn voice(sr: u32, segments: &[(f32, f32, f32, f32)]) -> Vec<f32> {
+        harmonics(sr, segments, 1..=5)
+    }
+
+    /// 600 ms of "words": three 140 ms syllables whose pitch glides several
+    /// semitones, each followed by a 60 ms stop. Nothing in it is held.
+    const WORDS: [(f32, f32, f32, f32); 6] = [
+        (140.0, 130.0, 175.0, 0.3),
+        (60.0, 0.0, 0.0, 0.0),
+        (140.0, 190.0, 140.0, 0.25),
+        (60.0, 0.0, 0.0, 0.0),
+        (140.0, 120.0, 160.0, 0.3),
+        (60.0, 0.0, 0.0, 0.0),
+    ];
+
+    /// Words, 100 ms of silence, `held`, 100 ms of silence, words.
+    fn around(held: (f32, f32, f32, f32)) -> Vec<f32> {
+        let mut segs = WORDS.to_vec();
+        segs.push((100.0, 0.0, 0.0, 0.0));
+        segs.push(held);
+        segs.push((100.0, 0.0, 0.0, 0.0));
+        segs.extend(WORDS);
+        voice(16_000, &segs)
+    }
+
+    /// One 20 ms CTC frame per character: `.` blank, `|` delimiter,
+    /// anything else that letter.
+    fn ctc_pattern(s: &str, stride_ms: f32) -> CtcFrames {
+        let mut f = CtcFrames {
+            stride_ms,
+            ..CtcFrames::default()
+        };
+        for c in s.bytes() {
+            let (label, p_blank) = match c {
+                b'.' => (0, 0.9f32),
+                b'|' => (b' ', 0.05),
+                l => (l, 0.05),
+            };
+            f.label.push(label);
+            f.blank_logp.push(p_blank.ln());
+        }
+        f
+    }
+
+    /// `ms` worth of 20 ms frames with `chars` spread evenly, blanks between.
+    fn spell(ms: f32, chars: &str) -> String {
+        let n = (ms / 20.0).round() as usize;
+        let mut out = vec!['.'; n];
+        let c: Vec<char> = chars.chars().collect();
+        for (i, ch) in c.iter().enumerate() {
+            out[i * n / c.len()] = *ch;
+        }
+        out.into_iter().collect()
+    }
+
+    /// CTC for `around`: `a` over the first words, `held` over the held
+    /// sound, `b` over the last words, delimiters in the silences.
+    fn ctc_around(a: &str, held_ms: f32, held: &str, b: &str) -> CtcFrames {
+        let s = [
+            spell(600.0, a),
+            spell(100.0, "|"),
+            spell(held_ms, held),
+            spell(100.0, "|"),
+            spell(600.0, b),
+        ]
+        .concat();
+        ctc_pattern(&s, 20.0)
+    }
+
+    fn voiced_f0(pcm: &[f32]) -> Vec<f32> {
+        f0_track(pcm, 16_000, None).into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn f0_of_a_pure_tone_is_its_frequency() {
+        for hz in [100.0f32, 150.0, 220.0, 300.0] {
+            let pcm = harmonics(16_000, &[(500.0, hz, hz, 0.5)], 1..=1);
+            let track = f0_track(&pcm, 16_000, None);
+            let f0 = voiced_f0(&pcm);
+            assert!(
+                f0.len() * 10 >= track.len() * 8,
+                "{hz} Hz: only {} of {} hops voiced",
+                f0.len(),
+                track.len()
+            );
+            for f in f0 {
+                assert!((f - hz).abs() <= 0.02 * hz, "{hz} Hz tracked as {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn f0_is_not_fooled_by_a_missing_fundamental() {
+        // Harmonics 2-5 of 120 Hz: no energy at 120 Hz itself, but the
+        // waveform still repeats every 1/120 s, which is what a listener hears.
+        let pcm = harmonics(16_000, &[(500.0, 120.0, 120.0, 0.5)], 2..=5);
+        let f0 = voiced_f0(&pcm);
+        assert!(!f0.is_empty());
+        let median = quantile(&f0, 0.5);
+        assert!(
+            (median - 120.0).abs() <= 2.4,
+            "tracked {median} Hz, not the 120 Hz period"
+        );
+    }
+
+    #[test]
+    fn white_noise_is_not_voiced() {
+        let mut state = 0x2545_f491u32;
+        let pcm: Vec<f32> = (0..16_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.3
+            })
+            .collect();
+        assert!(voiced_f0(&pcm).is_empty(), "noise has no period");
+    }
+
+    #[test]
+    fn a_held_flat_vowel_between_words_is_a_filled_pause() {
+        let pcm = around((500.0, 110.0, 110.0, 0.3));
+        let ctc = ctc_around("SO|I", 500.0, "", "THINK");
+        let held = detect_held_sounds(&pcm, 16_000, &ctc);
+        let fp: Vec<&HeldSound> = held
+            .iter()
+            .filter(|h| h.kind == HeldKind::FilledPause)
+            .collect();
+        assert_eq!(fp.len(), 1, "expected one filled pause, got {held:?}");
+        assert!((fp[0].start_ms - 700).abs() <= 30, "{:?}", fp[0]);
+        assert!((fp[0].end_ms - 1200).abs() <= 30, "{:?}", fp[0]);
+    }
+
+    #[test]
+    fn a_pitch_glide_is_not_held() {
+        // 110 -> 180 Hz is 8.5 semitones in half a second: intonation, not a
+        // held sound, although the model spelled nothing there either.
+        let pcm = around((500.0, 110.0, 180.0, 0.3));
+        let ctc = ctc_around("SO|I", 500.0, "", "THINK");
+        let held = detect_held_sounds(&pcm, 16_000, &ctc);
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    #[test]
+    fn too_short_and_too_long_are_rejected() {
+        for ms in [120.0f32, 2500.0] {
+            let pcm = around((ms, 110.0, 110.0, 0.3));
+            let ctc = ctc_around("SO|I", ms, "", "THINK");
+            let held = detect_held_sounds(&pcm, 16_000, &ctc);
+            assert!(held.is_empty(), "{ms} ms: {held:?}");
+        }
+    }
+
+    #[test]
+    fn a_spelled_real_word_is_a_lengthening_not_a_filler() {
+        let pcm = around((400.0, 140.0, 140.0, 0.3));
+        let ctc = ctc_around("HELLO", 400.0, "WORLD", "AGAIN");
+        let held = detect_held_sounds(&pcm, 16_000, &ctc);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].kind, HeldKind::Lengthening);
+    }
+
+    #[test]
+    fn a_filler_the_transcript_already_spelled_is_not_counted_twice() {
+        // "I UM THINK": the model spelled the UM, so count_fillers has it.
+        let pcm = around((500.0, 110.0, 110.0, 0.3));
+        let ctc = ctc_around("I", 500.0, "UM", "THINK");
+        let words: Vec<String> = ctc_word_spans(&ctc).into_iter().map(|w| w.text).collect();
+        assert_eq!(words, ["I", "UM", "THINK"]);
+        let held = detect_held_sounds(&pcm, 16_000, &ctc);
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    #[test]
+    fn hum_at_the_room_floor_is_not_speech() {
+        // A steady -40 dBFS mains hum under the whole recording, alone for
+        // 600 ms twice: perfectly periodic and perfectly flat, so everything
+        // but the energy gate would call those stretches held vowels.
+        let mut segs = WORDS.to_vec();
+        segs.push((600.0, 0.0, 0.0, 0.0));
+        segs.extend(WORDS);
+        segs.push((600.0, 0.0, 0.0, 0.0));
+        segs.extend(WORDS);
+        let mut pcm = voice(16_000, &segs);
+        let hum = harmonics(16_000, &[(3000.0, 120.0, 120.0, 0.01)], 1..=1);
+        for (x, h) in pcm.iter_mut().zip(hum) {
+            *x += h;
+        }
+        let ctc = ctc_pattern(
+            &[
+                spell(600.0, "SO"),
+                spell(600.0, "|"),
+                spell(600.0, "I"),
+                spell(600.0, "|"),
+                spell(600.0, "THINK"),
+            ]
+            .concat(),
+            20.0,
+        );
+        let held = detect_held_sounds(&pcm, 16_000, &ctc);
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    #[test]
+    fn ctc_word_spans_split_on_delimiter_and_blank_runs() {
+        // Blanks between letters stay inside a word and doubled frames
+        // collapse; `|` ends a word, and so does a long enough blank run.
+        let s = format!(".HH.E.L.L.O|.W.O.R.L.D{}A.B", ".".repeat(30));
+        let words = ctc_word_spans(&ctc_pattern(&s, 20.0));
+        let got: Vec<(&str, i64, i64)> = words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start_ms, w.end_ms))
+            .collect();
+        assert_eq!(
+            got,
+            [("HELLO", 20, 220), ("WORLD", 260, 440), ("AB", 1040, 1100)]
         );
     }
 }
