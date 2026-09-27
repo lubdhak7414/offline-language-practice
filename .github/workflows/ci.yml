@@ -151,7 +151,7 @@ jobs:
           # matrix inherits the same limit.
           - os: ubuntu-24.04
             cargo_target_dir: /tmp/cargo-target
-          - os: macos-14
+          - os: macos-15
             cargo_target_dir: /tmp/cargo-target
           # espeak-ng's data compiler truncates paths through a fixed-size
           # buffer, and the runner's default workspace path is already long.

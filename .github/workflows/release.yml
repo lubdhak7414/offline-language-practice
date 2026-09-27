@@ -133,7 +133,7 @@ jobs:
           - os: ubuntu-24.04
             label: linux-x86_64
             target_dir: /tmp/cargo-target
-          - os: macos-14
+          - os: macos-15
             label: macos-aarch64
             target_dir: /tmp/cargo-target
           # No Intel macOS leg. `ort` publishes no prebuilt ONNX Runtime for
