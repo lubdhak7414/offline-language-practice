@@ -647,23 +647,30 @@ pub fn ctc_forced_align(
     Some(spans)
 }
 
-/// Map a mean log-posterior ratio onto 0..=100 via [`GOP_PERCENTILE`].
+/// Map a mean log-posterior ratio onto 0..=100 via a `(gop, percentile)`
+/// table — [`GOP_PERCENTILE`] for the shipped grapheme model.
 ///
 /// Monotone and clamped; `gop == 0` (the model's own best guess) is 100,
 /// and anything below the first knot is 0. Positive input cannot occur but
 /// is clamped rather than trusted. Non-finite input is 0, as before.
-pub fn gop_to_score(gop: f32) -> u8 {
+///
+/// A table belongs to one acoustic model and one GOP formula: a phone-level
+/// model needs its own, measured the same way. `table` must be non-empty
+/// with strictly increasing GOP knots; an empty one scores everything 0.
+pub fn gop_to_score_with(table: &[(f32, u8)], gop: f32) -> u8 {
     if !gop.is_finite() {
         return 0;
     }
-    let (first, last) = (GOP_PERCENTILE[0], GOP_PERCENTILE[GOP_PERCENTILE.len() - 1]);
+    let (Some(&first), Some(&last)) = (table.first(), table.last()) else {
+        return 0;
+    };
     if gop <= first.0 {
         return first.1;
     }
     if gop >= last.0 {
         return last.1;
     }
-    for pair in GOP_PERCENTILE.windows(2) {
+    for pair in table.windows(2) {
         let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
         if gop <= x1 {
             let t = (gop - x0) / (x1 - x0);
@@ -697,8 +704,49 @@ pub fn score_against_target(
 ) -> Result<PronScore, ScoreError> {
     let labels = text_to_labels(target, v)?;
     let blank = usize::try_from(v.blank).map_err(|_| ScoreError::BadVocab)?;
+    score_labels(out, &labels, blank, &GOP_PERCENTILE).map(|(pron, _)| pron)
+}
+
+/// One target label's share of a forced alignment.
+///
+/// For a phone model this is one phone; for the grapheme model, one letter
+/// (or a word delimiter).
+// Read by the phone-GOP corpus dump today; the app consumes it in Phase 7
+// Stage 6A A7 (phone-level scoring), gated on the E2 measurement.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabelScore {
+    /// Token id of the label.
+    pub label: usize,
+    /// Index into [`TargetLabels::words`] of the word this label spells,
+    /// or `None` for a label between words (the grapheme delimiter).
+    pub word_index: Option<usize>,
+    /// Frames the alignment gave this label; never 0.
+    pub frames: usize,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// Mean of `logp[t][label] - max_v logp[t][v]` over those frames.
+    pub gop: f32,
+}
+
+/// Score any label sequence against any percentile table.
+///
+/// The engine behind [`score_against_target`]: forced alignment, the
+/// per-frame GOP, word means over each word's frames, and the table lookup.
+/// It does not care what the labels are — letters with `|` between words,
+/// or phones with no delimiter at all — because `labels.words` carries the
+/// word structure. Returns the per-label detail alongside the word scores.
+pub fn score_labels(
+    out: &AsrOutput,
+    labels: &TargetLabels,
+    blank: usize,
+    table: &[(f32, u8)],
+) -> Result<(PronScore, Vec<LabelScore>), ScoreError> {
     if blank >= out.vocab {
         return Err(ScoreError::BadVocab);
+    }
+    if labels.words.is_empty() {
+        return Err(ScoreError::EmptyTarget);
     }
 
     let spans = ctc_forced_align(&out.logp, out.frames, out.vocab, &labels.ids, blank)
@@ -724,35 +772,58 @@ pub fn score_against_target(
     };
     let to_ms = |frame: usize| (frame as f32 * stride).round() as i64;
 
-    let mut words = Vec::with_capacity(labels.words.len());
-    for (word, range) in &labels.words {
-        // The word's labels sit at the odd extended indices `2k + 1`.
-        let first_ext = 2 * range.start + 1;
-        let last_ext = 2 * (range.end - 1) + 1;
+    // Which word owns label position k, if any.
+    let mut owner: Vec<Option<usize>> = vec![None; labels.ids.len()];
+    for (w, (_, range)) in labels.words.iter().enumerate() {
+        for slot in owner.iter_mut().take(range.end).skip(range.start) {
+            *slot = Some(w);
+        }
+    }
 
+    // One entry per non-blank span. Labels sit at the odd extended indices
+    // `2k + 1`, and the Viterbi path visits each of them in one contiguous
+    // run, so this is one entry per target label, in order.
+    let mut label_scores: Vec<LabelScore> = Vec::with_capacity(labels.ids.len());
+    // Per word: summed frame GOP and frame count, then first/last frame.
+    let mut word_sum = vec![(0.0f64, 0usize, usize::MAX, 0usize); labels.words.len()];
+    for span in spans.iter().filter(|s| s.label != blank) {
+        let word_index = owner.get(span.ext_index / 2).copied().flatten();
+        let frames = span.end - span.start;
         let mut sum = 0.0f64;
-        let mut count = 0usize;
-        let mut start = usize::MAX;
-        let mut end = 0usize;
-        for span in &spans {
-            if span.ext_index < first_ext || span.ext_index > last_ext || span.label == blank {
-                continue;
-            }
-            start = start.min(span.start);
-            end = end.max(span.end);
-            for (t, &best) in frame_max.iter().enumerate().take(span.end).skip(span.start) {
-                let p = out.logp[t * out.vocab + span.label];
-                sum += (p - best) as f64;
-                count += 1;
+        for (t, &best) in frame_max.iter().enumerate().take(span.end).skip(span.start) {
+            let d = (out.logp[t * out.vocab + span.label] - best) as f64;
+            sum += d;
+            // Accumulated frame by frame, in the same order as the word
+            // loop this replaced, so the word GOP is bit-for-bit unchanged.
+            if let Some(w) = word_index {
+                word_sum[w].0 += d;
             }
         }
+        if let Some(w) = word_index {
+            let acc = &mut word_sum[w];
+            acc.1 += frames;
+            acc.2 = acc.2.min(span.start);
+            acc.3 = acc.3.max(span.end);
+        }
+        label_scores.push(LabelScore {
+            label: span.label,
+            word_index,
+            frames,
+            start_ms: to_ms(span.start),
+            end_ms: to_ms(span.end),
+            gop: (sum / frames.max(1) as f64) as f32,
+        });
+    }
+
+    let mut words = Vec::with_capacity(labels.words.len());
+    for ((word, _), &(sum, count, start, end)) in labels.words.iter().zip(&word_sum) {
         // Every non-blank position is visited by any valid path, so this is
         // unreachable — but a fabricated zero would be worse than refusing.
         if count == 0 {
             return Err(ScoreError::NotAlignable);
         }
         let gop = (sum / count as f64) as f32;
-        let score = gop_to_score(gop);
+        let score = gop_to_score_with(table, gop);
         words.push(WordScore {
             word: word.clone(),
             start_ms: to_ms(start),
@@ -772,18 +843,21 @@ pub fn score_against_target(
         (((target_logprob as f64 - free_logprob) / out.frames as f64).exp() as f32).clamp(0.0, 1.0)
     };
 
-    Ok(PronScore {
-        overall,
-        words,
-        target_logprob,
-        free_logprob: free_logprob as f32,
-        normalized_conf,
-    })
+    Ok((
+        PronScore {
+            overall,
+            words,
+            target_logprob,
+            free_logprob: free_logprob as f32,
+            normalized_conf,
+        },
+        label_scores,
+    ))
 }
 
 #[cfg(test)]
 mod corpus {
-    //! Calibration data for [`gop_to_score`], from human ratings.
+    //! Calibration data for [`GOP_PERCENTILE`], from human ratings.
     //!
     //! `#[ignore]`d and needs two things off-repo: the model files, and
     //! speechocean762 (OpenSLR-101, CC BY 4.0 — 5,000 read sentences by
@@ -1368,6 +1442,11 @@ mod real_models {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped mapping.
+    fn gop_to_score(gop: f32) -> u8 {
+        gop_to_score_with(&GOP_PERCENTILE, gop)
+    }
 
     fn kinds(a: &WordAlignment) -> Vec<&'static str> {
         a.ops
@@ -1983,6 +2062,154 @@ mod tests {
         // Frames 0..3 at 20 ms each, then the delimiter, then frames 4..7.
         assert_eq!((score.words[0].start_ms, score.words[0].end_ms), (0, 60));
         assert_eq!((score.words[1].start_ms, score.words[1].end_ms), (80, 140));
+    }
+
+    /// `score_against_target` exactly as it was before `score_labels`
+    /// existed, kept as the oracle for the refactor.
+    fn legacy_score(out: &AsrOutput, target: &str, v: &Vocab) -> Result<PronScore, ScoreError> {
+        let labels = text_to_labels(target, v)?;
+        let blank = usize::try_from(v.blank).map_err(|_| ScoreError::BadVocab)?;
+        if blank >= out.vocab {
+            return Err(ScoreError::BadVocab);
+        }
+        let spans = ctc_forced_align(&out.logp, out.frames, out.vocab, &labels.ids, blank)
+            .ok_or(ScoreError::NotAlignable)?;
+        let target_logprob =
+            ctc_forward_logprob(&out.logp, out.frames, out.vocab, &labels.ids, blank)
+                .ok_or(ScoreError::NotAlignable)?;
+        let mut frame_max = vec![f32::NEG_INFINITY; out.frames];
+        let mut free_logprob = 0.0f64;
+        for (t, slot) in frame_max.iter_mut().enumerate() {
+            let row = &out.logp[t * out.vocab..t * out.vocab + out.vocab];
+            let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            *slot = m;
+            free_logprob += m as f64;
+        }
+        let stride = out.frame_stride_ms;
+        let to_ms = |frame: usize| (frame as f32 * stride).round() as i64;
+        let mut words = Vec::new();
+        for (word, range) in &labels.words {
+            let first_ext = 2 * range.start + 1;
+            let last_ext = 2 * (range.end - 1) + 1;
+            let (mut sum, mut count, mut start, mut end) = (0.0f64, 0usize, usize::MAX, 0usize);
+            for span in &spans {
+                if span.ext_index < first_ext || span.ext_index > last_ext || span.label == blank {
+                    continue;
+                }
+                start = start.min(span.start);
+                end = end.max(span.end);
+                for (t, &best) in frame_max.iter().enumerate().take(span.end).skip(span.start) {
+                    sum += (out.logp[t * out.vocab + span.label] - best) as f64;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return Err(ScoreError::NotAlignable);
+            }
+            let gop = (sum / count as f64) as f32;
+            let score = gop_to_score(gop);
+            words.push(WordScore {
+                word: word.clone(),
+                start_ms: to_ms(start),
+                end_ms: to_ms(end),
+                gop,
+                score,
+                verdict: verdict_for(score).to_string(),
+            });
+        }
+        let overall = (words.iter().map(|w| w.score as u32).sum::<u32>() as f32
+            / words.len() as f32)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let normalized_conf = (((target_logprob as f64 - free_logprob) / out.frames as f64).exp()
+            as f32)
+            .clamp(0.0, 1.0);
+        Ok(PronScore {
+            overall,
+            words,
+            target_logprob,
+            free_logprob: free_logprob as f32,
+            normalized_conf,
+        })
+    }
+
+    /// Deterministic random posteriors: `frames` rows of log-softmax.
+    fn random_logp(frames: usize, vocab: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.max(1);
+        let mut out: Vec<f32> = (0..frames * vocab)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state as f32 / u32::MAX as f32) * 8.0
+            })
+            .collect();
+        crate::asr::log_softmax_rows(&mut out, frames, vocab);
+        out
+    }
+
+    #[test]
+    fn score_labels_matches_score_against_target() {
+        // The refactor pin: every fixture, plus random posteriors of several
+        // lengths, gives a PronScore identical (bit for bit, `==` on f32) to
+        // the implementation `score_labels` replaced.
+        let v = test_vocab();
+        let mut sat_wrong = vec![2, 3, 4, 1, 5, 3, 4];
+        sat_wrong[4] = 2;
+        let mut cases = vec![
+            out_from(peaky(&[2, 3, 4, 1, 5, 3, 4], 6, 0.9), 7, 6),
+            out_from(peaky(&sat_wrong, 6, 0.9), 7, 6),
+            out_from(peaky(&[2, 3], 6, 0.9), 2, 6),
+        ];
+        for (seed, frames) in [(1u32, 7usize), (7, 12), (42, 30), (762, 64)] {
+            cases.push(out_from(random_logp(frames, 6, seed), frames, 6));
+        }
+        let mut scored = 0;
+        for (i, out) in cases.iter().enumerate() {
+            for target in ["cat sat", "sat", "cat cat sat", "tact"] {
+                let got = score_against_target(out, target, &v);
+                assert_eq!(
+                    got,
+                    legacy_score(out, target, &v),
+                    "case {i}, target {target:?}"
+                );
+                scored += usize::from(got.is_ok());
+            }
+        }
+        // Mostly real scores, not two matching refusals.
+        assert!(scored >= 20, "only {scored} of 28 cases scored");
+    }
+
+    #[test]
+    fn score_labels_reports_one_entry_per_label() {
+        let v = test_vocab();
+        let labels = text_to_labels("cat sat", &v).expect("spellable");
+        let out = out_from(peaky(&[2, 3, 4, 1, 5, 3, 4], 6, 0.9), 7, 6);
+        let (pron, per) = score_labels(&out, &labels, 0, &GOP_PERCENTILE).expect("scorable");
+        assert_eq!(pron.words.len(), 2);
+        assert_eq!(
+            per.iter().map(|l| l.label).collect::<Vec<_>>(),
+            labels.ids,
+            "one entry per target label, in order"
+        );
+        // The `|` between the words belongs to neither.
+        assert_eq!(
+            per.iter().map(|l| l.word_index).collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(0), None, Some(1), Some(1), Some(1)]
+        );
+        assert!(per.iter().all(|l| l.frames == 1 && l.gop <= 0.0));
+        assert_eq!((per[4].start_ms, per[4].end_ms), (80, 100));
+    }
+
+    #[test]
+    fn gop_to_score_with_uses_the_given_table() {
+        let table = [(-2.0f32, 0u8), (0.0, 50)];
+        assert_eq!(gop_to_score_with(&table, -3.0), 0);
+        assert_eq!(gop_to_score_with(&table, -1.0), 25);
+        assert_eq!(gop_to_score_with(&table, 0.0), 50);
+        assert_eq!(gop_to_score_with(&table, 1.0), 50);
+        assert_eq!(gop_to_score_with(&table, f32::NAN), 0);
+        assert_eq!(gop_to_score_with(&[], -1.0), 0);
     }
 
     #[test]
