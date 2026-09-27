@@ -136,6 +136,9 @@ export function sanitizePrefs(p: Preferences): Preferences {
     new_per_day: clamp(p.new_per_day, 0, 9999),
     review_per_day: clamp(p.review_per_day, 0, 9999),
     bury_hours: clamp(p.bury_hours, 0, 168),
+    // serde would refuse a non-boolean outright; anything but `true` is off,
+    // so a malformed save can never turn update checks on.
+    check_updates: p.check_updates === true,
   };
 }
 
@@ -197,6 +200,8 @@ const DEFAULT_PREFERENCES: Preferences = {
   // Tests that want the main shell pass `preferences: { onboarded: true }`.
   onboarded: true,
   goal: "both",
+  // Mirrors the backend default: update checks are opt-in.
+  check_updates: false,
 };
 
 /** ~30 days of daily counts with a couple of gaps, so charts have to cope. */

@@ -4,7 +4,7 @@
 //! Every field here already lives in `app_settings` as an individual key —
 //! `dialect`, `theme`, `tts_voice`, `day_cutoff_hour` since migration 5,
 //! `new_per_day`/`review_per_day`/`bury_hours` since migration 7. This
-//! module is the one place that reads and validates all seven together, so
+//! module is the one place that reads and validates all of them together, so
 //! `get_preferences`/`set_preferences` in `lib.rs` have a single source of
 //! truth instead of re-deriving the defaults and clamps at each call site.
 
@@ -32,6 +32,11 @@ pub struct Preferences {
     /// or `both`. Chosen during onboarding, changeable in Settings, and
     /// used to bias which prompt categories come up first.
     pub goal: String,
+    /// Opt-in: check github.com for a new version once per launch. Off by
+    /// default — see SECURITY.md "Automatic updates". `serde(default)` so a
+    /// webview that predates the field saves "off" instead of failing.
+    #[serde(default)]
+    pub check_updates: bool,
 }
 
 impl Default for Preferences {
@@ -46,6 +51,7 @@ impl Default for Preferences {
             bury_hours: 20,
             onboarded: false,
             goal: "both".to_string(),
+            check_updates: false,
         }
     }
 }
@@ -77,13 +83,14 @@ pub fn sanitize(p: Preferences) -> Preferences {
         bury_hours: p.bury_hours.clamp(0, 168),
         onboarded: p.onboarded,
         goal,
+        check_updates: p.check_updates,
     }
 }
 
-/// The seven `app_settings` keys this module owns, paired with the
+/// The `app_settings` keys this module owns, paired with the
 /// `Preferences` field each fills. Kept in one place so `load`/`save` cannot
 /// drift apart on which keys exist.
-const KEYS: [&str; 9] = [
+const KEYS: [&str; 10] = [
     "dialect",
     "theme",
     "day_cutoff_hour",
@@ -93,6 +100,7 @@ const KEYS: [&str; 9] = [
     "bury_hours",
     "onboarded",
     "goal",
+    "check_updates",
 ];
 
 /// Load every preference from `app_settings`, falling back field-by-field to
@@ -138,6 +146,9 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
         // recoverable, unlike skipping it on a machine with no models.
         onboarded: raw.get("onboarded").map(|v| v == "1").unwrap_or(false),
         goal: raw.get("goal").cloned().unwrap_or(default.goal),
+        // "1"/"0" like `onboarded`. Anything unreadable is off: the safe
+        // failure for a setting that makes a network request.
+        check_updates: raw.get("check_updates").map(|v| v == "1").unwrap_or(false),
     };
     Ok(sanitize(parsed))
 }
@@ -146,7 +157,7 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
 /// save never reaches storage. Returns the sanitized value actually saved.
 pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preferences, AppError> {
     let p = sanitize(p.clone());
-    let pairs: [(&str, String); 9] = [
+    let pairs: [(&str, String); 10] = [
         ("dialect", p.dialect.clone()),
         ("theme", p.theme.clone()),
         ("day_cutoff_hour", p.day_cutoff_hour.to_string()),
@@ -156,6 +167,10 @@ pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preference
         ("bury_hours", p.bury_hours.to_string()),
         ("onboarded", if p.onboarded { "1" } else { "0" }.to_string()),
         ("goal", p.goal.clone()),
+        (
+            "check_updates",
+            if p.check_updates { "1" } else { "0" }.to_string(),
+        ),
     ];
     let mut tx = pool.begin().await?;
     for (key, value) in pairs {
@@ -232,6 +247,45 @@ mod tests {
         assert_eq!(load(&pool).await.unwrap().goal, "both");
     }
 
+    #[tokio::test]
+    async fn check_updates_defaults_off_and_round_trips() {
+        let pool = pool().await;
+        // Off on a fresh database: the app must not contact github.com until
+        // the user opts in (SECURITY.md "Automatic updates").
+        assert!(!load(&pool).await.unwrap().check_updates);
+
+        let saved = save(
+            &pool,
+            &Preferences {
+                check_updates: true,
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(saved.check_updates);
+        assert!(load(&pool).await.unwrap().check_updates);
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'check_updates'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "1");
+    }
+
+    #[test]
+    fn a_frontend_without_check_updates_deserializes_to_off() {
+        // An older webview build that does not know the field must not be
+        // able to fail `set_preferences`, and must never turn checks on.
+        let p: Preferences = serde_json::from_value(serde_json::json!({
+            "dialect": "american", "theme": "system", "day_cutoff_hour": 4,
+            "tts_voice": "", "new_per_day": 20, "review_per_day": 200,
+            "bury_hours": 20, "onboarded": true, "goal": "both"
+        }))
+        .unwrap();
+        assert!(!p.check_updates);
+    }
+
     async fn pool() -> sqlx::SqlitePool {
         crate::db::testing::test_pool().await
     }
@@ -268,6 +322,7 @@ mod tests {
             bury_hours: 24,
             onboarded: true,
             goal: "everyday".to_string(),
+            check_updates: true,
         };
         assert_eq!(sanitize(p.clone()), p);
     }
@@ -300,6 +355,7 @@ mod tests {
                 bury_hours: 12,
                 onboarded: true,
                 goal: "interview".to_string(),
+                check_updates: false,
             },
         )
         .await

@@ -175,6 +175,13 @@ describe("mock fidelity", () => {
     expect(await mock.getPreferences()).toEqual(saved);
   });
 
+  it("sanitizePrefs keeps check_updates boolean (prefs.rs Preferences)", async () => {
+    const prefs = await createMockIpc().getPreferences();
+    expect(prefs.check_updates).toBe(false);
+    expect(sanitizePrefs({ ...prefs, check_updates: "yes" as never }).check_updates).toBe(false);
+    expect(sanitizePrefs({ ...prefs, check_updates: true }).check_updates).toBe(true);
+  });
+
   it("sanitizePrefs leaves valid values alone", async () => {
     const prefs = await createMockIpc().getPreferences();
     expect(sanitizePrefs(prefs)).toEqual(prefs);

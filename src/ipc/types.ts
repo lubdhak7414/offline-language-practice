@@ -249,6 +249,8 @@ export type Preferences = {
   onboarded: boolean;
   /** `everyday` | `interview` | `both`. */
   goal: string;
+  /** Opt-in once-per-launch update check. Off by default. */
+  check_updates: boolean;
 };
 
 export type DailyLimits = {
