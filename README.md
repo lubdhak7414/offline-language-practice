@@ -47,7 +47,15 @@ Either way the files are pinned to immutable upstream commits and verified by sh
 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
 ```
 
-**Intel Macs are not supported yet.** The ONNX Runtime binding ships no prebuilt library for `x86_64-apple-darwin`, so an Intel build needs ONNX Runtime compiled from source and linked in (see the `ort` linking guide). Apple Silicon Macs work.
+**Intel Macs are not supported, and no Intel build is planned.** ONNX Runtime stopped publishing Intel macOS binaries after 1.23.2, the `ort` binding this app uses needs a newer one, and macOS 26 is the last release for Intel Macs. Apple Silicon Macs work.
+
+To build for an Intel Mac yourself, compile a static ONNX Runtime 1.24.2 (the version `ort` 2.0.0-rc.12 expects) on that Mac, then point the build at it:
+
+```bash
+ORT_LIB_LOCATION=/path/to/onnxruntime/lib npm run tauri build
+```
+
+`ORT_LIB_LOCATION` must be the directory holding `libonnxruntime.a`; `ort`'s build script links from there instead of downloading. See the [`ort` linking guide](https://ort.pyke.io/setup/linking). CoreML acceleration is not needed; the app falls back to CPU.
 
 ## Tech stack
 
