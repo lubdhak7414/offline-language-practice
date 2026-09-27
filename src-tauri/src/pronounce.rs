@@ -254,8 +254,11 @@ fn align_tokens(h: &[String], t: &[String]) -> Vec<WordOp> {
 /// * The sentence score — the mean of these — tracks expert sentence
 ///   accuracy at Pearson 0.47.
 ///
-/// Scope: L1-Mandarin speakers only. Nothing here was validated against
-/// other first languages. This replaced `100 * exp(gop / 0.55)`, a
+/// Scope: fitted and validated on L1-Mandarin speakers only. Elsewhere only
+/// false alarms have been measured: CMU ARCTIC's seven native and
+/// near-native studio readers get 1.6-4.6% of words flagged (vs 10.2%
+/// here), and whether flags catch real mistakes by speakers of other first
+/// languages is unmeasured (`calibrate-gop.py --eval-on`). This replaced `100 * exp(gop / 0.55)`, a
 /// hand-picked constant that on the same data called 28% of correctly-said
 /// words "poor".
 pub const GOP_PERCENTILE: [(f32, u8); 25] = [
