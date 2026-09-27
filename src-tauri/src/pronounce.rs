@@ -1008,6 +1008,12 @@ mod real_models {
         ENGINES
             .get_or_init(|| {
                 std::env::set_var("OLP_MODELS_DIR", models_root());
+                // The shipped espeak data, not the build tree's copy, so
+                // these tests fail if the vendored subset stops working.
+                std::env::set_var(
+                    crate::paths::ESPEAK_DATA_ENV,
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources"),
+                );
                 let (voice, config) = crate::tts::find_voice()
                     .expect("no voice installed; run ./scripts/download-models.sh");
                 let model = crate::asr::find_model()

@@ -34,6 +34,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "resources/espeak-ng-data/": "espeak-ng-data/"
+    },
     "category": "Education",
     "copyright": "Copyright © 2026 Offline Language Practice",
     "createUpdaterArtifacts": false,

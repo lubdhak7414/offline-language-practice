@@ -1543,7 +1543,15 @@ pub fn run() {
             // app-data dir (user-installed voices). CWD relatives stay
             // as fallback inside the asr/tts loaders.
             let mut roots = Vec::new();
-            if let Ok(res) = app.path().resource_dir() {
+            let resource_dir = app.path().resource_dir().ok();
+            // Before any TTS request can arrive: espeak initializes lazily
+            // on the first synthesize, and without this it looks for its
+            // data in the build machine's OUT_DIR (see `paths`).
+            let env_set = std::env::var_os(crate::paths::ESPEAK_DATA_ENV).is_some();
+            if let Some(dir) = crate::paths::espeak_data_parent(resource_dir.as_deref(), env_set) {
+                std::env::set_var(crate::paths::ESPEAK_DATA_ENV, dir);
+            }
+            if let Some(res) = &resource_dir {
                 roots.push(res.join("models"));
             }
             if let Ok(data) = app.path().app_data_dir() {
