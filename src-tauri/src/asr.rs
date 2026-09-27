@@ -77,9 +77,11 @@ pub struct Vocab {
     /// what pronunciation scoring uses to turn a target phrase into labels.
     pub token_to_id: HashMap<String, i64>,
     pub id_to_token: HashMap<i64, String>,
-    /// CTC blank. wav2vec2 CTC checkpoints use `<pad>` for this; it is
-    /// conventionally id 0 but that is a convention, not a guarantee, so it
-    /// is read from the file and only falls back to 0 when absent.
+    /// CTC blank. wav2vec2 CTC checkpoints use `<pad>` for this, and
+    /// TIMIT-style phone vocabs `[PAD]`; it is conventionally id 0 but that
+    /// is a convention, not a guarantee (a `[PAD]` vocab puts the `|`
+    /// delimiter at 0), so it is read from the file and only falls back to
+    /// 0 when neither spelling is present.
     pub blank: i64,
 }
 
@@ -97,7 +99,11 @@ impl Vocab {
         for (tok, id) in token_to_id.iter() {
             id_to_token.entry(*id).or_insert_with(|| tok.clone());
         }
-        let blank = token_to_id.get("<pad>").copied().unwrap_or(0);
+        let blank = token_to_id
+            .get("<pad>")
+            .or_else(|| token_to_id.get("[PAD]"))
+            .copied()
+            .unwrap_or(0);
         Ok(Self {
             token_to_id,
             id_to_token,
@@ -639,6 +645,15 @@ mod tests {
         assert_eq!(v.blank, 3);
         assert_eq!(v.token_to_id["a"], 0);
         assert_eq!(v.id_to_token[&2], "|");
+    }
+
+    #[test]
+    fn vocab_reads_bracketed_pad_as_blank() {
+        // TIMIT-style phone vocabs spell the blank `[PAD]` and put the `|`
+        // word delimiter at 0; falling back to 0 there would make every
+        // word boundary the blank.
+        let v = Vocab::parse(r#"{"[PAD]": 41, "|": 0, "a": 1}"#).expect("parse");
+        assert_eq!(v.blank, 41);
     }
 
     #[test]
