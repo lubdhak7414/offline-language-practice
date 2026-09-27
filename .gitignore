@@ -33,6 +33,8 @@ playwright-report/
 # is intentionally trackable: a blanket *.md rule silently swallowed it.
 AGENTS.md
 CLAUDE.md
+# Agent worktrees and local session state.
+.claude/
 
 # Python bytecode from scripts/
 __pycache__/
