@@ -231,6 +231,9 @@ impl TtsEngine {
             .inner
             .lock()
             .map_err(|e| format!("TTS mutex poisoned: {e}"))?;
+        // `create` phonemizes through espeak-ng, whose state is global;
+        // the phonemizer takes the same lock (see `phonemize`).
+        let _espeak = crate::phonemize::espeak_lock();
         piper
             .create(text, false, None, None, None, None)
             .map_err(|e| format!("TTS synthesize failed: {e}"))

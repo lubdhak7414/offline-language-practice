@@ -51,6 +51,12 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
   "half",
 ] }
 piper-rs = "0.2.0"
+# Target text -> IPA phones for the optional phoneme model (Phase 7 Stage
+# 6A). The same crate and version piper-rs already links, so nothing new is
+# built; `default-features = false` is inert because piper-rs turns the
+# default (`compile-espeak-intonations`) on and features unify. espeak-ng is
+# GPL-3.0-or-later, which is why this crate is too.
+espeak-rs = { version = "=0.2.0", default-features = false }
 
 # Subsystem 3: cognitive scheduler (FSRS-6, 21 params; Rayon via fsrs)
 fsrs = "6.6.2"

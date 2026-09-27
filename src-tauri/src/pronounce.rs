@@ -442,6 +442,53 @@ pub fn text_to_labels(target: &str, v: &Vocab) -> Result<TargetLabels, ScoreErro
     Ok(TargetLabels { ids, words: spans })
 }
 
+/// Turn per-word phones into acoustic labels for a phone-level model.
+///
+/// No word delimiter: the phone vocab has none, and CTC does not need one —
+/// `words` ranges carry the structure, and [`score_labels`] reads word
+/// membership from them whatever the labels are. Phones are looked up
+/// verbatim (IPA is case-sensitive). Any phone the vocab lacks refuses the
+/// whole target, so the caller falls back to the grapheme path rather than
+/// scoring a target with holes in it.
+// Consumed by the phone-GOP corpus dump today and by the app in Phase 7
+// Stage 6A A7 (phone-level scoring), gated on the E2 measurement.
+#[allow(dead_code)]
+pub fn phones_to_labels(
+    words: &[crate::phonemize::WordPhones],
+    v: &Vocab,
+) -> Result<TargetLabels, ScoreError> {
+    let mut ids: Vec<usize> = Vec::new();
+    let mut spans: Vec<(String, Range<usize>)> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
+    for (word, phones) in words {
+        let start = ids.len();
+        for ph in phones {
+            match v
+                .token_to_id
+                .get(ph.as_str())
+                .and_then(|id| usize::try_from(*id).ok())
+            {
+                Some(id) => ids.push(id),
+                None => {
+                    if !unknown.contains(&ph.as_str()) {
+                        unknown.push(ph);
+                    }
+                }
+            }
+        }
+        if ids.len() > start {
+            spans.push((word.clone(), start..ids.len()));
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ScoreError::UnknownChars(unknown.join(" ")));
+    }
+    if spans.len() != words.len() || spans.is_empty() {
+        return Err(ScoreError::EmptyTarget);
+    }
+    Ok(TargetLabels { ids, words: spans })
+}
+
 /// The vocab's word-delimiter id. wav2vec2 CTC checkpoints spell it `|`.
 fn word_delimiter(v: &Vocab) -> Option<usize> {
     v.token_to_id
@@ -1211,7 +1258,8 @@ mod real_models {
     /// reached` and then segfaults. Production never hits this because TTS
     /// is confined to the single `neural-tts` worker thread — this lock is
     /// the test-side equivalent of that thread, and loading the 380 MB ASR
-    /// model once instead of per test is just a bonus.
+    /// model once instead of per test is just a bonus. Each synthesize also
+    /// takes `phonemize::ESPEAK`, the lock the phonemizer tests share.
     struct Engines {
         tts: crate::tts::TtsEngine,
         asr: crate::asr::AsrEngine,
@@ -1225,10 +1273,8 @@ mod real_models {
                 std::env::set_var("OLP_MODELS_DIR", models_root());
                 // The shipped espeak data, not the build tree's copy, so
                 // these tests fail if the vendored subset stops working.
-                std::env::set_var(
-                    crate::paths::ESPEAK_DATA_ENV,
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources"),
-                );
+                // Shared with the phonemizer tests, under the espeak lock.
+                crate::phonemize::testing::use_vendored_espeak_data();
                 let (voice, config) = crate::tts::find_voice()
                     .expect("no voice installed; run ./scripts/download-models.sh");
                 let model = crate::asr::find_model()
@@ -2210,6 +2256,73 @@ mod tests {
         assert_eq!(gop_to_score_with(&table, 1.0), 50);
         assert_eq!(gop_to_score_with(&table, f32::NAN), 0);
         assert_eq!(gop_to_score_with(&[], -1.0), 0);
+    }
+
+    /// A tiny phone vocab: blank 0, no word delimiter.
+    fn phone_vocab() -> Vocab {
+        Vocab::parse(r#"{"<pad>":0,"θ":1,"ɪ":2,"ŋ":3,"k":4,"t":5,"s":6,"æ":7}"#)
+            .expect("vocab parses")
+    }
+
+    fn wp(word: &str, phones: &[&str]) -> crate::phonemize::WordPhones {
+        (
+            word.to_string(),
+            phones.iter().map(|p| p.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn phones_to_labels_keeps_word_ranges_without_a_delimiter() {
+        let v = phone_vocab();
+        let labels = phones_to_labels(
+            &[wp("THINK", &["θ", "ɪ", "ŋ", "k"]), wp("IT", &["ɪ", "t"])],
+            &v,
+        )
+        .expect("known phones");
+        assert_eq!(labels.ids, vec![1, 2, 3, 4, 2, 5]);
+        assert_eq!(labels.words[0], ("THINK".to_string(), 0..4));
+        assert_eq!(labels.words[1], ("IT".to_string(), 4..6));
+    }
+
+    #[test]
+    fn phones_to_labels_refuses_unknown_phones() {
+        let v = phone_vocab();
+        assert_eq!(
+            phones_to_labels(&[wp("THINK", &["θ", "ʘ", "k"])], &v),
+            Err(ScoreError::UnknownChars("ʘ".to_string()))
+        );
+        assert_eq!(phones_to_labels(&[], &v), Err(ScoreError::EmptyTarget));
+        // A word with no phones would silently shift every later word.
+        assert_eq!(
+            phones_to_labels(&[wp("IT", &["ɪ", "t"]), wp("", &[])], &v),
+            Err(ScoreError::EmptyTarget)
+        );
+    }
+
+    #[test]
+    fn a_corrupted_phone_is_the_lowest_label_score() {
+        // "sat it": s æ t | ɪ t, one confident frame each, except that the
+        // frame meant to carry æ looks like θ instead.
+        let v = phone_vocab();
+        let labels = phones_to_labels(&[wp("SAT", &["s", "æ", "t"]), wp("IT", &["ɪ", "t"])], &v)
+            .expect("known phones");
+        let mut frames = labels.ids.clone();
+        frames[1] = 1;
+        let out = out_from(peaky(&frames, 8, 0.9), frames.len(), 8);
+        let (pron, per) = score_labels(&out, &labels, 0, &GOP_PERCENTILE).expect("scorable");
+        let worst = per
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.gop.total_cmp(&b.1.gop))
+            .map(|(i, _)| i);
+        assert_eq!(worst, Some(1), "the æ label must score lowest: {per:?}");
+        assert_eq!(per[1].word_index, Some(0));
+        assert!(
+            per.iter().all(|l| l.word_index.is_some()),
+            "no delimiter labels"
+        );
+        assert_eq!(pron.words[1].score, 100, "the untouched word must hold");
+        assert!(pron.words[0].score < pron.words[1].score);
     }
 
     #[test]

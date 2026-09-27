@@ -4643,6 +4643,7 @@ dependencies = [
 name = "offline-language-practice"
 version = "0.1.0"
 dependencies = [
+ "espeak-rs",
  "fsrs",
  "harper-core",
  "http",

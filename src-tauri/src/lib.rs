@@ -25,6 +25,7 @@ mod fluency;
 mod grammar;
 mod inference;
 mod paths;
+mod phonemize;
 mod portable;
 mod practice;
 mod prefs;
