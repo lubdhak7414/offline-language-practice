@@ -1207,6 +1207,298 @@ mod corpus {
         );
         assert!(words > 0);
     }
+    /// Corpus ARPAbet (with stress digits) to the espeak IPA the phoneme
+    /// model was trained on. Evaluation only: the "oracle" G2P, which says
+    /// how much of the phone score is lost to espeak disagreeing with the
+    /// corpus's canonical phones. Unstressed IY/ER/AH take their reduced
+    /// espeak forms.
+    fn arpa_to_ipa(arpa: &str) -> Option<&'static str> {
+        let reduced = arpa.ends_with('0');
+        let base = arpa.trim_end_matches(|c: char| c.is_ascii_digit());
+        Some(match base {
+            "AA" => "ɑː",
+            "AE" => "æ",
+            "AH" if reduced => "ə",
+            "AH" => "ʌ",
+            "AO" => "ɔː",
+            "AW" => "aʊ",
+            "AY" => "aɪ",
+            "EH" => "ɛ",
+            "ER" if reduced => "ɚ",
+            "ER" => "ɜː",
+            "EY" => "eɪ",
+            "IH" => "ɪ",
+            "IY" if reduced => "i",
+            "IY" => "iː",
+            "OW" => "oʊ",
+            "OY" => "ɔɪ",
+            "UH" => "ʊ",
+            "UW" => "uː",
+            "B" => "b",
+            "CH" => "tʃ",
+            "D" => "d",
+            "DH" => "ð",
+            "F" => "f",
+            "G" => "ɡ",
+            "HH" => "h",
+            "JH" => "dʒ",
+            "K" => "k",
+            "L" => "l",
+            "M" => "m",
+            "N" => "n",
+            "NG" => "ŋ",
+            "P" => "p",
+            "R" => "ɹ",
+            "S" => "s",
+            "SH" => "ʃ",
+            "T" => "t",
+            "TH" => "θ",
+            "V" => "v",
+            "W" => "w",
+            "Y" => "j",
+            "Z" => "z",
+            "ZH" => "ʒ",
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn arpa_to_ipa_covers_the_corpus_inventory() {
+        // Every phone speechocean762's canonical transcriptions use.
+        for p in [
+            "AA0", "AA1", "AE1", "AH0", "AH1", "AO2", "AW1", "AY0", "B", "CH", "D", "DH", "EH1",
+            "ER0", "ER1", "EY2", "F", "G", "HH", "IH", "IH0", "IY0", "IY1", "JH", "K", "L", "M",
+            "N", "NG", "OW1", "OY1", "P", "R", "S", "SH", "T", "TH", "UH", "UH0", "UW1", "V", "W",
+            "Y", "Z", "ZH",
+        ] {
+            let ipa = arpa_to_ipa(p).unwrap_or_else(|| panic!("{p} unmapped"));
+            assert!(
+                crate::phonemize::MODEL_EN_PHONES.contains(&ipa),
+                "{p} -> {ipa} is not a model phone"
+            );
+        }
+        assert_eq!(arpa_to_ipa("AH0"), Some("ə"));
+        assert_eq!(arpa_to_ipa("AH1"), Some("ʌ"));
+        assert_eq!(arpa_to_ipa("XX"), None);
+    }
+
+    /// A `/proc/self/status` size field (`VmHWM:` peak, `VmRSS:` current)
+    /// in MiB. Linux only; `None` elsewhere.
+    pub(super) fn proc_status_mib(field: &str) -> Option<f64> {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = text.lines().find(|l| l.starts_with(field))?;
+        let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb / 1024.0)
+    }
+
+    /// The optional phoneme model and its vocab, from `OLP_PHONEME_MODEL`
+    /// (and `OLP_PHONEME_VOCAB`, default `vocab.json` beside the model),
+    /// plus a tag for the dump's `model` column (`OLP_PHONEME_TAG`, default
+    /// the file stem).
+    pub(super) fn phoneme_engine() -> (crate::asr::AsrEngine, Vocab, String) {
+        let model = std::path::PathBuf::from(std::env::var_os("OLP_PHONEME_MODEL").expect(
+            "set OLP_PHONEME_MODEL to an onnx-community wav2vec2-lv-60-espeak-cv-ft ONNX file",
+        ));
+        let vocab_path = std::env::var_os("OLP_PHONEME_VOCAB")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| model.with_file_name("vocab.json"));
+        let vocab = Vocab::parse(
+            &std::fs::read_to_string(&vocab_path)
+                .unwrap_or_else(|e| panic!("{}: {e}", vocab_path.display())),
+        )
+        .expect("phone vocab parses");
+        let tag = std::env::var("OLP_PHONEME_TAG").unwrap_or_else(|_| {
+            model
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let engine = crate::asr::AsrEngine::load(&model)
+            .unwrap_or_else(|e| panic!("{}: load failed: {e}", model.display()));
+        (engine, vocab, tag)
+    }
+
+    fn joined(v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> Option<String>) -> String {
+        v.as_array()
+            .map(|a| a.iter().filter_map(&f).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    }
+
+    /// Phone-level GOP for speechocean762, for `scripts/calibrate-phone-gop.py`.
+    ///
+    ///   OLP_CORPUS_DIR=~/corpora/speechocean762 \
+    ///   OLP_PHONEME_MODEL=~/models-phoneme/model_quantized.onnx \
+    ///     cargo test --release --manifest-path src-tauri/Cargo.toml \
+    ///     --lib corpus_dump_phone_gop -- --ignored --nocapture
+    ///
+    /// One row per target phone, twice per utterance: once with espeak's
+    /// phones (`g2p = espeak`, the path the app would take) and once with the
+    /// corpus's own canonical phones mapped to IPA (`g2p = oracle`). The
+    /// expert per-phone scores are written per word (`canon_arpa`,
+    /// `canon_acc`); aligning espeak's phones to them is the script's job,
+    /// so that choice can change without re-running inference. `word_gop`
+    /// is the word's GOP exactly as `score_labels` computes it (mean over
+    /// the word's frames). A target that could not be scored gets one row
+    /// whose `status` says why (`phonemize`, `word_count`, `unknown_phone`,
+    /// `not_alignable`, …). `OLP_SPLITS` (default `train,test`) and
+    /// `OLP_DUMP_OUT` (default `phone_gop_dump.tsv` in the corpus dir) let
+    /// one split, or one model variant, run on its own; `OLP_MAX_UTTS`
+    /// caps utterances per split for a quick check.
+    #[test]
+    #[ignore = "corpus"]
+    fn corpus_dump_phone_gop() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("OLP_CORPUS_DIR")
+                .expect("set OLP_CORPUS_DIR to an extracted speechocean762; see module doc"),
+        );
+        crate::phonemize::testing::use_vendored_espeak_data();
+        let (engine, vocab, tag) = phoneme_engine();
+        let blank = usize::try_from(vocab.blank).expect("blank id");
+        let splits = std::env::var("OLP_SPLITS").unwrap_or_else(|_| "train,test".to_string());
+        let max_utts: usize = std::env::var("OLP_MAX_UTTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+
+        let scores: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("resource/scores.json")).expect("scores.json"),
+        )
+        .expect("scores.json parses");
+
+        let out_path = std::env::var_os("OLP_DUMP_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("phone_gop_dump.tsv"));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
+        writeln!(
+            out,
+            "split\tutt\tage\tspeaker\tword_index\tword\tphone_index\tphone\tg2p\tgop\tframes\
+             \tstart_ms\tend_ms\tword_gop\thuman_word\tcanon_arpa\tcanon_acc\tmodel\tstatus"
+        )
+        .unwrap();
+
+        let (mut utts, mut rows, mut refused) = (0usize, 0usize, 0usize);
+        let (mut audio_s, mut infer_s) = (0.0f64, 0.0f64);
+        for split in splits.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let dir = root.join(split);
+            let wavs = kaldi_map(&dir.join("wav.scp"));
+            let utt2spk = kaldi_map(&dir.join("utt2spk"));
+            let spk2age = kaldi_map(&dir.join("spk2age"));
+            let mut ids: Vec<&String> = wavs.keys().collect();
+            ids.sort();
+            ids.truncate(max_utts);
+            for utt in ids {
+                let human = scores[utt.as_str()]["words"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{utt}: no words"));
+                let target = human
+                    .iter()
+                    .map(|w| w["text"].as_str().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let speaker = utt2spk.get(utt).map(String::as_str).unwrap_or("");
+                let age = spk2age.get(speaker).map(String::as_str).unwrap_or("");
+                let (pcm, rate) = read_wav(&root.join(&wavs[utt]));
+                assert_eq!(rate, crate::asr::ASR_SAMPLE_RATE, "{utt}: resample first");
+
+                let t0 = std::time::Instant::now();
+                let post = engine.posteriors(&pcm).expect("inference");
+                infer_s += t0.elapsed().as_secs_f64();
+                audio_s += pcm.len() as f64 / crate::asr::ASR_SAMPLE_RATE as f64;
+                utts += 1;
+
+                let oracle: Option<Vec<crate::phonemize::WordPhones>> = human
+                    .iter()
+                    .map(|w| {
+                        let ipa = w["phones"]
+                            .as_array()?
+                            .iter()
+                            .map(|p| arpa_to_ipa(p.as_str()?).map(str::to_string))
+                            .collect::<Option<Vec<_>>>()?;
+                        Some((w["text"].as_str()?.to_string(), ipa))
+                    })
+                    .collect();
+                let espeak = crate::phonemize::phonemize(&target);
+
+                for g2p in ["espeak", "oracle"] {
+                    let words = match g2p {
+                        "espeak" => espeak.clone().map_err(|_| "phonemize"),
+                        _ => oracle.clone().ok_or("oracle_unmapped"),
+                    };
+                    let scored = words.and_then(|w| {
+                        if w.len() != human.len() {
+                            return Err("word_count");
+                        }
+                        let labels = phones_to_labels(&w, &vocab).map_err(|e| match e {
+                            ScoreError::UnknownChars(_) => "unknown_phone",
+                            _ => "empty_target",
+                        })?;
+                        let s = score_labels(&post, &labels, blank, &GOP_PERCENTILE)
+                            .map_err(|_| "not_alignable")?;
+                        Ok((labels, s))
+                    });
+                    let (labels, (pron, per)) = match scored {
+                        Ok(v) => v,
+                        Err(why) => {
+                            refused += 1;
+                            writeln!(
+                                out,
+                                "{split}\t{utt}\t{age}\t{speaker}\t-1\t\t-1\t\t{g2p}\t\t\t\t\t\
+                                 \t\t\t\t{tag}\t{why}"
+                            )
+                            .unwrap();
+                            continue;
+                        }
+                    };
+                    let mut phone_in_word = vec![0usize; labels.words.len()];
+                    for l in &per {
+                        let Some(w) = l.word_index else { continue };
+                        let k = phone_in_word[w];
+                        phone_in_word[w] += 1;
+                        let hw = &human[w];
+                        let arpa = joined(&hw["phones"], |p| p.as_str().map(str::to_string));
+                        let acc = joined(&hw["phones-accuracy"], |p| {
+                            p.as_f64().map(|x| format!("{x}"))
+                        });
+                        let phone = vocab
+                            .id_to_token
+                            .get(&(l.label as i64))
+                            .map(String::as_str)
+                            .unwrap_or("?");
+                        writeln!(
+                            out,
+                            "{split}\t{utt}\t{age}\t{speaker}\t{w}\t{}\t{k}\t{phone}\t{g2p}\t{:.6}\
+                             \t{}\t{}\t{}\t{:.6}\t{}\t{arpa}\t{acc}\t{tag}\tok",
+                            labels.words[w].0,
+                            l.gop,
+                            l.frames,
+                            l.start_ms,
+                            l.end_ms,
+                            pron.words[w].gop,
+                            hw["accuracy"].as_i64().unwrap_or(-1),
+                        )
+                        .unwrap();
+                        rows += 1;
+                    }
+                }
+                if utts % 250 == 0 {
+                    eprintln!(
+                        "{utts} utterances, {rows} phone rows, {refused} refusals, RTF {:.3}",
+                        infer_s / audio_s
+                    );
+                }
+            }
+        }
+        out.flush().unwrap();
+        eprintln!(
+            "done: {utts} utterances, {rows} phone rows, {refused} refused (of {} passes), \
+             RTF {:.3} over {audio_s:.0} s of audio, peak RSS {:.0} MiB -> {}",
+            2 * utts,
+            infer_s / audio_s,
+            proc_status_mib("VmHWM:").unwrap_or(f64::NAN),
+            out_path.display()
+        );
+        assert!(rows > 0);
+    }
 }
 
 #[cfg(test)]
@@ -1482,6 +1774,118 @@ mod real_models {
             other.overall,
             right.overall
         );
+    }
+    /// Greedy phone decode of posteriors, blank and repeats collapsed.
+    fn greedy_phones(out: &crate::asr::AsrOutput, v: &Vocab) -> Vec<String> {
+        crate::asr::ctc_collapse_argmax(&out.logp, out.frames, out.vocab, v.blank)
+            .into_iter()
+            .filter_map(|id| v.id_to_token.get(&id).cloned())
+            .collect()
+    }
+
+    fn edit_distance(a: &[String], b: &[String]) -> usize {
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        for (i, x) in a.iter().enumerate() {
+            let mut cur = vec![i + 1; b.len() + 1];
+            for (j, y) in b.iter().enumerate() {
+                cur[j + 1] = (prev[j] + usize::from(x != y))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1);
+            }
+            prev = cur;
+        }
+        prev[b.len()]
+    }
+
+    /// E0 of the phoneme-model experiment: does this ONNX variant load and
+    /// run under ort rc.12 on CPU, and what does it cost?
+    ///
+    ///   OLP_PHONEME_MODEL=~/models-phoneme/model_quantized.onnx \
+    ///     cargo test --release --manifest-path src-tauri/Cargo.toml \
+    ///     --lib phoneme_variant_loads_and_runs -- --ignored --nocapture
+    ///
+    /// One variant per process, because peak RSS (`VmHWM`) is per process.
+    /// Prints one `E0` line: load time, peak RSS added over the loaded
+    /// grapheme+TTS baseline, p50/p95 latency and RTF on 10 s of TTS audio,
+    /// and the greedy phone error rate against espeak's phones for the text.
+    #[test]
+    #[ignore = "models"]
+    fn phoneme_variant_loads_and_runs() {
+        let e = engines();
+        let text = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG. PLEASE CALL STELLA AND ASK \
+                    HER TO BRING THESE THINGS WITH HER FROM THE STORE.";
+        let mut pcm = speak(&e, text);
+        let ten_s = 10 * crate::asr::ASR_SAMPLE_RATE as usize;
+        let spoken = pcm.len();
+        while pcm.len() < ten_s {
+            pcm.extend_from_within(..spoken.min(ten_s - pcm.len()));
+        }
+        pcm.truncate(ten_s);
+        // Baseline: both app models loaded and the grapheme model run once.
+        e.asr.transcribe_pcm_detailed(&pcm).expect("grapheme run");
+        let base_hwm = super::corpus::proc_status_mib("VmHWM:").unwrap_or(f64::NAN);
+
+        let t0 = std::time::Instant::now();
+        let (engine, vocab, tag) = super::corpus::phoneme_engine();
+        let load_ms = t0.elapsed().as_millis();
+
+        let mut times = Vec::new();
+        let mut last = None;
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            let out = engine.posteriors(&pcm).expect("phoneme model runs");
+            times.push(t.elapsed().as_secs_f64());
+            last = Some(out);
+        }
+        let out = last.expect("ran");
+        times.sort_by(f64::total_cmp);
+        let p50 = times[times.len() / 2];
+        let p95 = times[(times.len() * 95).div_ceil(100) - 1];
+        let hwm = super::corpus::proc_status_mib("VmHWM:").unwrap_or(f64::NAN);
+        assert!(out.frames > 0 && out.vocab == vocab.id_to_token.len());
+
+        // Phone error rate on one clean reading (not repeated audio).
+        let clean = speak(&e, text);
+        let clean_out = engine.posteriors(&clean).expect("phoneme model runs");
+        let heard = greedy_phones(&clean_out, &vocab);
+        let want: Vec<String> = crate::phonemize::phonemize(text)
+            .expect("phonemize")
+            .into_iter()
+            .flat_map(|(_, p)| p)
+            .collect();
+        let per = edit_distance(&heard, &want) as f64 / want.len() as f64;
+
+        // Discrimination on the phone path: audio of "sink", target "think".
+        let sink = speak(&e, "SINK");
+        let sink_out = engine.posteriors(&sink).expect("runs");
+        let blank = usize::try_from(vocab.blank).expect("blank");
+        let lowest = |target: &str| {
+            let words = crate::phonemize::phonemize(target).expect("phonemize");
+            let labels = phones_to_labels(&words, &vocab).expect("labels");
+            let (pron, per) =
+                score_labels(&sink_out, &labels, blank, &GOP_PERCENTILE).expect("score");
+            let worst = per
+                .iter()
+                .min_by(|a, b| a.gop.total_cmp(&b.gop))
+                .map(|l| vocab.id_to_token[&(l.label as i64)].clone());
+            (pron.words[0].gop, worst)
+        };
+        let (gop_sink, _) = lowest("SINK");
+        let (gop_think, worst_think) = lowest("THINK");
+
+        println!(
+            "E0 {tag}: load {load_ms} ms, peak RSS +{:.0} MiB (baseline {base_hwm:.0}), \
+             10 s audio p50 {p50:.3} s p95 {p95:.3} s, RTF {:.3}, PER {:.3} \
+             ({} heard vs {} espeak), \"sink\" audio: GOP sink {gop_sink:.3} think \
+             {gop_think:.3} (lowest phone {worst_think:?})",
+            hwm - base_hwm,
+            p50 / 10.0,
+            per,
+            heard.len(),
+            want.len()
+        );
+        println!("  heard: {}", heard.join(" "));
+        println!("  want:  {}", want.join(" "));
     }
 }
 

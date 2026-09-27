@@ -441,6 +441,33 @@ impl AsrEngine {
         })
     }
 
+    /// Frame posteriors only, with no transcript (`text` is empty).
+    ///
+    /// For a second model whose vocab is not the grapheme `vocab.json` —
+    /// the optional phoneme model — where [`Self::transcribe_pcm_detailed`]
+    /// would decode against the wrong vocab. Same validation, normalization
+    /// and log-softmax. With a 392-token phone vocab the posteriors reach
+    /// about 9.4 MB at the 120 s cap; like the grapheme ones they are scored
+    /// inside the worker and never cross a channel.
+    // Used by the phone-GOP corpus dump and E0 smoke test today; the app
+    // consumes it in Phase 7 Stage 6A A7, gated on the E2 measurement.
+    #[allow(dead_code)]
+    pub fn posteriors(&self, pcm_f32: &[f32]) -> ort::Result<AsrOutput> {
+        let audio_samples = pcm_f32.len();
+        self.with_logits(pcm_f32, |data, frames, n_vocab| {
+            let len = frames.saturating_mul(n_vocab).min(data.len());
+            let mut logp = data[..len].to_vec();
+            log_softmax_rows(&mut logp, frames, n_vocab);
+            Ok(AsrOutput {
+                text: String::new(),
+                logp,
+                frames,
+                vocab: n_vocab,
+                frame_stride_ms: frame_stride_ms(audio_samples, frames),
+            })
+        })
+    }
+
     /// Transcribe and also return the compact [`CtcFrames`] summary.
     ///
     /// For callers that need to know *where* the model spelled nothing
