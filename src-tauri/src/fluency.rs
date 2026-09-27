@@ -26,9 +26,11 @@
 //! almost no disfluencies, so it rarely emits `UM` or `UH` even when they
 //! were clearly said — it tends to swallow them or bend them into a real
 //! word. The text filler count is therefore a floor, not a measurement. The
-//! acoustic `hesitation_count` compensates: a word that occupies an
-//! unusually long span while scoring badly is where the model most likely
-//! absorbed a filler.
+//! acoustic `hesitation_count` compensates partly: a word that occupies an
+//! unusually long span while flagged as unclear is where the model most
+//! likely absorbed a filler. It needs word timings, which only exist for
+//! read-aloud prompts whose transcript matches the target; open-ended
+//! answers get no hesitation count at all.
 
 use serde::Serialize;
 
@@ -41,10 +43,13 @@ pub const HOP_MS: f32 = 10.0;
 /// Silence shorter than this is normal articulation, not a pause.
 pub const PAUSE_MIN_MS: i64 = 400;
 
-/// A word span at least this long, scored below [`HESITATION_SCORE`], is
-/// counted as a hesitation the transcript did not spell out.
+/// A word span at least this long whose score is below
+/// [`crate::pronounce::FLAG_BELOW`] is counted as a hesitation the
+/// transcript did not spell out. Tied to the flag cutoff rather than a
+/// number of its own: scores are percentiles (`GOP_PERCENTILE`), and every
+/// GOP below 0 maps to 34 or less, so any fixed cutoff above that counts
+/// ordinary correct words.
 pub const HESITATION_MS: i64 = 600;
-pub const HESITATION_SCORE: u8 = 40;
 
 /// Below this many words, rate and pause counts are noise, so nothing is
 /// reported at all rather than reporting a number nobody should read.
@@ -256,7 +261,9 @@ pub fn count_fillers(text: &str) -> FillerCounts {
 pub fn count_hesitations(words: &[WordScore]) -> i64 {
     words
         .iter()
-        .filter(|w| (w.end_ms - w.start_ms) >= HESITATION_MS && w.score < HESITATION_SCORE)
+        .filter(|w| {
+            (w.end_ms - w.start_ms) >= HESITATION_MS && w.score < crate::pronounce::FLAG_BELOW
+        })
         .count() as i64
 }
 
@@ -535,10 +542,20 @@ mod tests {
     }
 
     #[test]
+    fn a_long_correct_word_is_not_a_hesitation() {
+        // Scores are percentiles among words experts rated perfect
+        // (`GOP_PERCENTILE`), so 28 is an ordinary correct word. Any GOP
+        // below 0 maps to 34 or less; a cutoff above that counts every long
+        // word that was not a perfect GOP-0 match.
+        let words = [word("UNFORTUNATELY", 0, 800, 28)];
+        assert_eq!(count_hesitations(&words), 0);
+    }
+
+    #[test]
     fn hesitations_are_long_words_the_model_scored_badly() {
         let words = [
             word("I", 0, 200, 95),
-            word("SUPPOSE", 300, 1100, 20),
+            word("SUPPOSE", 300, 1100, 5),
             word("SO", 1100, 1300, 95),
         ];
         assert_eq!(count_hesitations(&words), 1);
@@ -714,7 +731,7 @@ mod tests {
         // badly over a long span, which is what an absorbed filler looks like.
         let hesitant: Vec<WordScore> = (0..12)
             .map(|i| {
-                let score = if i % 2 == 0 { 20 } else { 90 };
+                let score = if i % 2 == 0 { 5 } else { 90 };
                 word("WORD", i * 1200, i * 1200 + 700, score)
             })
             .collect();
