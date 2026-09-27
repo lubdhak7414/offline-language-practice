@@ -798,6 +798,21 @@ mod corpus {
     //! fit itself happens in `scripts/calibrate-gop.py`, outside the build.
     //! Only the ASR model is loaded — no TTS, so espeak's global state is
     //! never touched.
+    //!
+    //! Any other corpus goes through a manifest instead (one row per
+    //! utterance, built by `scripts/manifest-*.py`; columns in
+    //! `scripts/olp_manifest.py`), which `corpus_dump_gop_manifest` dumps
+    //! with the same columns plus `corpus l1 speaker label_kind`:
+    //!
+    //!   OLP_MANIFEST=~/corpora/cmu_arctic/manifest.tsv OLP_MODELS_DIR=$PWD/models \
+    //!     cargo test --release --manifest-path src-tauri/Cargo.toml \
+    //!     --lib corpus_dump_gop_manifest -- --ignored --nocapture
+    //!   python3 scripts/calibrate-gop.py $OLP_CORPUS_DIR/gop_dump.tsv \
+    //!     --eval-on ~/corpora/cmu_arctic/gop_dump.tsv --by l1
+    //!
+    //! The dump lands next to the manifest as `gop_dump.tsv` unless
+    //! `OLP_DUMP_OUT` names another path. `corpus_dump_gop` is kept as it
+    //! is so the shipped table stays reproducible from the same command.
 
     use super::*;
     use std::collections::HashMap;
@@ -937,6 +952,127 @@ mod corpus {
                 if utts % 250 == 0 {
                     eprintln!("{utts} utterances, {words} words");
                 }
+            }
+        }
+        out.flush().unwrap();
+        eprintln!(
+            "done: {utts} utterances, {words} words written, {refused} refused by the \
+             scorer, {mismatched} with a word-count mismatch -> {}",
+            out_path.display()
+        );
+        assert!(words > 0);
+    }
+
+    #[test]
+    #[ignore = "corpus"]
+    fn corpus_dump_gop_manifest() {
+        let manifest = std::path::PathBuf::from(
+            std::env::var_os("OLP_MANIFEST")
+                .expect("set OLP_MANIFEST to a scripts/manifest-*.py TSV; see module doc"),
+        );
+        // `wav` paths are relative to the manifest (an absolute one wins in `join`).
+        let base = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
+        if std::env::var_os("OLP_MODELS_DIR").is_none() {
+            let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models");
+            std::env::set_var("OLP_MODELS_DIR", models);
+        }
+        let model = crate::asr::find_model().expect("no ASR model; set OLP_MODELS_DIR");
+        let asr = crate::asr::AsrEngine::load(&model).expect("load ASR");
+        let vocab = crate::asr::load_vocab().expect("vocab");
+
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+        let mut lines = text.lines();
+        let header: Vec<&str> = lines.next().expect("empty manifest").split('\t').collect();
+        let col = |name: &str| header.iter().position(|h| *h == name);
+        let need =
+            |name: &str| col(name).unwrap_or_else(|| panic!("manifest has no {name} column"));
+        let [corpus, l1, speaker, utt, wav, target, labels, kind] = [
+            "corpus",
+            "l1",
+            "speaker",
+            "utt",
+            "wav",
+            "target",
+            "labels",
+            "label_kind",
+        ]
+        .map(need);
+        let (split, age) = (col("split"), col("age"));
+
+        let out_path = std::env::var_os("OLP_DUMP_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| base.join("gop_dump.tsv"));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
+        writeln!(
+            out,
+            "split\tutt\tage\tword_index\tword\thuman\tgop\tscore_now\tstart_ms\tend_ms\
+             \tcorpus\tl1\tspeaker\tlabel_kind"
+        )
+        .unwrap();
+
+        let (mut utts, mut words, mut refused, mut mismatched) = (0usize, 0usize, 0usize, 0usize);
+        for (n, line) in lines.enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                f.len(),
+                header.len(),
+                "manifest line {}: field count",
+                n + 2
+            );
+            let human: Vec<i64> = f[labels]
+                .split_whitespace()
+                .map(|x| {
+                    x.parse()
+                        .unwrap_or_else(|_| panic!("line {}: label {x}", n + 2))
+                })
+                .collect();
+            let path = base.join(f[wav]);
+            let (pcm, rate) = read_wav(&path);
+            assert_eq!(
+                rate,
+                crate::asr::ASR_SAMPLE_RATE,
+                "{}: resample to 16 kHz first",
+                path.display()
+            );
+
+            let asr_out = asr.transcribe_pcm_detailed(&pcm).expect("inference");
+            utts += 1;
+            let pron = match score_against_target(&asr_out, f[target], &vocab) {
+                Ok(p) => p,
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            // The manifest builders tokenize the way `tokenize` does, so a
+            // mismatch means a word the scorer could not spell was dropped.
+            if pron.words.len() != human.len() {
+                mismatched += 1;
+                continue;
+            }
+            let split = split.map_or("eval", |c| f[c]);
+            let age = age.map_or("", |c| f[c]);
+            for (i, (w, h)) in pron.words.iter().zip(&human).enumerate() {
+                writeln!(
+                    out,
+                    "{split}\t{}\t{age}\t{i}\t{}\t{h}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    f[utt],
+                    w.word,
+                    w.gop,
+                    w.score,
+                    w.start_ms,
+                    w.end_ms,
+                    f[corpus],
+                    f[l1],
+                    f[speaker],
+                    f[kind]
+                )
+                .unwrap();
+                words += 1;
+            }
+            if utts % 250 == 0 {
+                eprintln!("{utts} utterances, {words} words");
             }
         }
         out.flush().unwrap();
