@@ -95,6 +95,13 @@ if you re-pin a revision, update both and run `just test-net`, which is the
 only check that the pinned URLs still resolve to the bytes the catalog
 expects. See SECURITY.md for why this is strict.
 
+## License
+
+The project is GPL-3.0-or-later (see LICENSE and the README's License
+section for why). By contributing you agree that your contribution is
+licensed the same way. A new dependency must be under a GPL-3.0-compatible
+license; `cargo deny` enforces the list in `src-tauri/deny.toml`.
+
 ## Commits and pull requests
 
 Conventional-style subjects (`feat(srs):`, `fix(ui):`, `ci:`) in the

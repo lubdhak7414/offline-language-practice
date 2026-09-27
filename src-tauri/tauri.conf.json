@@ -40,7 +40,7 @@
     "category": "Education",
     "copyright": "Copyright © 2026 Offline Language Practice",
     "createUpdaterArtifacts": false,
-    "license": "MIT",
+    "license": "GPL-3.0-or-later",
     "publisher": "Offline Language Practice",
     "shortDescription": "Offline-first language practice: on-device ASR, TTS, FSRS, grammar, SQLite"
   },

@@ -6,7 +6,9 @@ edition = "2021"
 rust-version = "1.77"
 # Matches LICENSE at the repo root and `bundle.license` in tauri.conf.json.
 # Without it `cargo deny check licenses` reports the crate as unlicensed.
-license = "MIT"
+# GPL because the binary statically links espeak-ng (GPL-3.0-or-later, via
+# piper-rs -> espeak-rs-sys, whose crate metadata says MIT).
+license = "GPL-3.0-or-later"
 repository = "https://github.com/lubdhak7414/offline-language-practice"
 
 [lib]

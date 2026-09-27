@@ -76,7 +76,11 @@ See CONTRIBUTING.md for the house rules, which exist because breaking them has a
 
 ## License
 
-MIT. See LICENSE.
+GPL-3.0-or-later. See LICENSE.
+
+Copyright © 2026 Safwan Usaid Lubdhak. This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but without any warranty; without even the implied warranty of merchantability or fitness for a particular purpose.
+
+The app is GPL because its binary statically links [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0-or-later), which the Piper voice uses to turn text into phonemes. espeak-ng's compiled English data ships inside the app, in `src-tauri/resources/espeak-ng-data/`; `scripts/vendor-espeak-data.sh` regenerates it from the espeak-ng sources that `espeak-rs-sys` vendors. Every other dependency is under a GPL-compatible permissive license, checked in CI by `cargo-deny`.
 
 The models are downloaded separately and carry their own licenses: the Wav2Vec2 ONNX export and the Piper LibriTTS-R voice are both MIT-licensed upstream.
 

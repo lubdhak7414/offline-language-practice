@@ -39,6 +39,11 @@ feedback and spaced repetition, running entirely on-device.
 - **Offline by construction.** No account, no telemetry, no cloud calls. The
   only network request the app makes is fetching model files.
 
+### License
+
+- GPL-3.0-or-later. The app statically links espeak-ng, which is
+  GPL-3.0-or-later, for the voice's text-to-phoneme step.
+
 ### Security
 
 - Content Security Policy enforced in dev and release builds; the webview has

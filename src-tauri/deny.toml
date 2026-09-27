@@ -3,7 +3,7 @@
 #
 # This is a desktop app that loads model files and talks to one HTTPS host,
 # so the questions worth asking are "is anything here known-vulnerable",
-# "can this be shipped under MIT", and "did a dependency quietly start
+# "can this be shipped under GPL-3.0-or-later", and "did a dependency quietly start
 # coming from somewhere other than crates.io".
 
 [graph]
@@ -35,8 +35,13 @@ ignore = []
 # MIT OR Apache-2.0 OR LGPL-2.1-or-later; in both cases the permissive
 # option is taken, which is why no LGPL appears below.
 #
+# The project is GPL-3.0-or-later because the binary statically links
+# espeak-ng (GPL-3.0-or-later). cargo-deny cannot see that: espeak-rs-sys's
+# crate metadata says MIT, but it vendors and builds espeak-ng's C sources.
+# Every license below is GPL-3.0-compatible; keep it that way.
+#
 # MPL-2.0 is allowed deliberately. It is file-level copyleft, so linking it
-# into an MIT binary is fine; modifying those files would mean publishing
+# into a GPL binary is fine; modifying those files would mean publishing
 # the modifications, and this project does not vendor or patch them.
 allow = [
     "0BSD",
@@ -47,6 +52,7 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
     "ISC",
     "MIT",
     "MIT-0",
