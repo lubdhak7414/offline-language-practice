@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { normalizeLint, setIpc, ipc, tauriIpc } from "./commands";
-import { createMockIpc, sanitizePrefs } from "./mock";
-import type { DownloadEvent, Ipc } from "./types";
+import { createMockIpc, makeUpdate, sanitizePrefs } from "./mock";
+import type { DownloadEvent, Ipc, UpdateEvent } from "./types";
 
 describe("lint normalization", () => {
   const diag = { start: 0, end: 3, message: "m", suggestions: [] };
@@ -50,6 +50,7 @@ describe("Ipc implementations", () => {
         "backupDatabase",
         "buryCard",
         "cancelDownloads",
+        "checkForUpdate",
         "createDeck",
         "deleteCard",
         "deleteDeck",
@@ -64,6 +65,7 @@ describe("Ipc implementations", () => {
         "getVoice",
         "gradeCard",
         "importData",
+        "installUpdate",
         "lintText",
         "listAttempts",
         "listCards",
@@ -80,6 +82,7 @@ describe("Ipc implementations", () => {
         "pickSavePath",
         "recentReviews",
         "renameDeck",
+        "restartApp",
         "restoreDatabase",
         "resumeDownloads",
         "reviewStats",
@@ -101,6 +104,7 @@ describe("Ipc implementations", () => {
         "transcribePcm",
         "undoReview",
         "updateCard",
+        "updateInfo",
       ].sort(),
     );
   });
@@ -229,6 +233,61 @@ describe("mock fidelity", () => {
     await expect(run).rejects.toThrow("download cancelled");
     expect(events[events.length - 1]?.kind).toBe("cancelled");
     expect((await mock.listModelCatalog()).every((g) => !g.installed)).toBe(true);
+  });
+
+  it("a startup check is refused while update checks are off (updates.rs may_check)", async () => {
+    const mock = createMockIpc({ update: { available: makeUpdate() } });
+    await expect(mock.checkForUpdate("startup")).rejects.toBe(
+      "UPDATE_REFUSED: update checks are turned off",
+    );
+    // The call is still recorded, as the backend still receives it.
+    expect(mock.calls.map((c) => c.name)).toContain("checkForUpdate");
+    // A click is consent on its own.
+    expect(await mock.checkForUpdate("manual")).toMatchObject({ version: "0.2.0" });
+
+    const optedIn = createMockIpc({
+      preferences: { check_updates: true },
+      update: { available: makeUpdate() },
+    });
+    expect(await optedIn.checkForUpdate("startup")).toMatchObject({ version: "0.2.0" });
+  });
+
+  it("a check reports can_install from the install mode (lib.rs check_for_update)", async () => {
+    const notify = createMockIpc({ update: { mode: "notify", available: makeUpdate() } });
+    expect((await notify.checkForUpdate("manual"))?.can_install).toBe(false);
+    expect(await createMockIpc().checkForUpdate("manual")).toBeNull();
+  });
+
+  it("install refuses in notify mode, then when busy, then with nothing pending — in that order (lib.rs install_update)", async () => {
+    const notify = createMockIpc({ update: { mode: "notify", available: makeUpdate() } });
+    await notify.checkForUpdate("manual");
+    await expect(notify.installUpdate(() => {})).rejects.toMatch(/^UPDATE_NOT_SUPPORTED: /);
+
+    const mock = createMockIpc({ update: { available: makeUpdate() } });
+    // Nothing pending yet.
+    await expect(mock.installUpdate(() => {})).rejects.toMatch(/^UPDATE_NONE: /);
+    await mock.checkForUpdate("manual");
+    const events: UpdateEvent[] = [];
+    const first = mock.installUpdate((e) => events.push(e));
+    // Busy wins over "nothing pending": a second install while one runs.
+    await expect(mock.installUpdate(() => {})).rejects.toMatch(/^UPDATE_BUSY: /);
+    await expect(mock.checkForUpdate("manual")).rejects.toMatch(/^UPDATE_BUSY: /);
+    await first;
+    expect(events.map((e) => e.kind)).toEqual([
+      "started",
+      "progress",
+      "verifying",
+      "installing",
+      "installed",
+    ]);
+  });
+
+  it("restartApp before an install is refused (lib.rs restart_app)", async () => {
+    const mock = createMockIpc({ update: { available: makeUpdate() } });
+    await expect(mock.restartApp()).rejects.toMatch(/^UPDATE_NONE: /);
+    await mock.checkForUpdate("manual");
+    await mock.installUpdate(() => {});
+    await expect(mock.restartApp()).resolves.toBeUndefined();
   });
 
   it("refuses a second download while one is running", async () => {

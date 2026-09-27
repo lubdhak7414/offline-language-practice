@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
   "windows": ["main"],
-  "description": "Frontend needs core APIs plus event listening. It never calls the SQL plugin directly: every database access goes through the app's own Rust commands, so sql:* is deliberately not granted.",
+  "description": "Frontend needs core APIs plus event listening. It never calls the SQL plugin directly: every database access goes through the app's own Rust commands, so sql:* is deliberately not granted. The updater plugin's own commands are not granted either: update checks go through the app's Rust commands, which enforce the user's opt-in.",
   "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
 }

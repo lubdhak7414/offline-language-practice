@@ -47,6 +47,16 @@
   "plugins": {
     "sql": {
       "preload": ["sqlite:app.db"]
+    },
+    "updater": {
+      "pubkey": "PLACEHOLDER-replace-with-the-owner-minisign-public-key",
+      "endpoints": [
+        "https://github.com/lubdhak7414/offline-language-practice/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

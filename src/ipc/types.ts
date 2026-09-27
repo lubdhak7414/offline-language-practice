@@ -339,6 +339,40 @@ export type DownloadEvent =
   | { kind: "failed"; id: string; message: string }
   | { kind: "cancelled"; id: string };
 
+// ─── Updates (Phase 7) ─────────────────────────────────────────────────
+
+/** Who asked: a click on "Check now", or the once-per-launch opt-in check. */
+export type UpdateTrigger = "manual" | "startup";
+
+/** Mirrors Rust `UpdateInfo` (lib.rs). No network is involved. */
+export type UpdateInfo = {
+  current_version: string;
+  /** `install`: this copy can replace itself. `notify`: it can only say so. */
+  mode: "install" | "notify";
+  /** Why, in notify mode. */
+  reason: string | null;
+  /** `AppImage` | `deb` | `rpm` | `app` | `msi` | `nsis`; null = development build. */
+  bundle: string | null;
+  release_page: string;
+};
+
+/** Mirrors Rust `AvailableUpdate` (lib.rs). */
+export type AvailableUpdate = {
+  version: string;
+  current_version: string;
+  notes: string | null;
+  date: string | null;
+  can_install: boolean;
+};
+
+/** Mirrors Rust `updates::UpdateEvent` (tag "kind"). */
+export type UpdateEvent =
+  | { kind: "started"; total: number | null }
+  | { kind: "progress"; received: number; total: number | null }
+  | { kind: "verifying" }
+  | { kind: "installing" }
+  | { kind: "installed" };
+
 /**
  * Every backend command, in one place.
  *
@@ -460,4 +494,17 @@ export type Ipc = {
   pauseDownloads(): Promise<void>;
   resumeDownloads(): Promise<void>;
   cancelDownloads(): Promise<void>;
+
+  // --- updates (Phase 7) ---
+  /** What this copy is and whether it can install updates itself. */
+  updateInfo(): Promise<UpdateInfo>;
+  /**
+   * Ask github.com for a newer version; null = this is the newest. A
+   * `startup` check rejects with `UPDATE_REFUSED:` unless the user opted in.
+   */
+  checkForUpdate(trigger: UpdateTrigger): Promise<AvailableUpdate | null>;
+  /** Download, verify and install the update the last check found. */
+  installUpdate(onEvent: (ev: UpdateEvent) => void): Promise<void>;
+  /** Relaunch into the installed update. Refused before an install. */
+  restartApp(): Promise<void>;
 };

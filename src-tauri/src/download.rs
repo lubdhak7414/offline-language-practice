@@ -340,7 +340,7 @@ pub fn sha256_file(path: &Path) -> Result<String, AppError> {
 
 /// How often progress is emitted. Fast enough to look live, slow enough
 /// that a 380 MB file does not push ~100k messages through the IPC channel.
-const PROGRESS_EVERY: Duration = Duration::from_millis(200);
+pub(crate) const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
 /// Fetch `specs` into `dir`, reporting through `emit`.
 ///

@@ -31,6 +31,15 @@ tauri-plugin-sql = { version = "2.4.1", features = ["sqlite"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 # Native open/save file pickers for export/import/backup/restore (B2).
 tauri-plugin-dialog = "2"
+# Self-update from GitHub Releases (Phase 7). `~2.12`: 2.13 needs tauri
+# ^2.12, a separate upgrade. native-tls, not the plugin's default rustls,
+# for the same reason as reqwest below: one TLS stack, no aws-lc. No
+# `system-proxy`, like reqwest below. No `zip`: that only unpacks v1-style
+# .zip/.tar.gz updater bundles, which this app never produces (macOS's
+# .app.tar.gz is unpacked with flate2/tar regardless of the feature).
+tauri-plugin-updater = { version = "~2.12.0", default-features = false, features = [
+  "native-tls",
+] }
 
 # Subsystem 2: neural speech (ort v2.0-rc series, no default zoo bloat)
 # NOTE: pinned to rc.12 to unify with piper-rs 0.2.0, which pins ort =2.0.0-rc.12.

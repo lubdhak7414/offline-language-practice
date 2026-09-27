@@ -12,6 +12,7 @@
 import type {
   AttemptReport,
   AttemptRow,
+  AvailableUpdate,
   BackupInfo,
   BackupResult,
   CardRow,
@@ -44,6 +45,8 @@ import type {
   ReviewStats,
   TagRow,
   UndoResult,
+  UpdateEvent,
+  UpdateInfo,
   VoiceInfo,
 } from "./types";
 
@@ -84,6 +87,15 @@ export type MockOptions = {
   pickSavePath?: string | null;
   /** Command names that should reject, mapped to the error thrown. */
   fail?: Partial<Record<keyof Ipc, unknown>>;
+  /**
+   * What the updater sees. `mode` defaults to "install" (an AppImage);
+   * `available` defaults to null, meaning "you have the newest version".
+   */
+  update?: {
+    mode?: "install" | "notify";
+    available?: AvailableUpdate | null;
+    bundle?: string | null;
+  };
 };
 
 export type MockIpc = Ipc & {
@@ -102,6 +114,24 @@ export function makePrompt(over: Partial<PromptView> = {}): PromptView {
     ...over,
   };
 }
+
+/** A newer release, as `check_for_update` reports it. */
+export function makeUpdate(over: Partial<AvailableUpdate> = {}): AvailableUpdate {
+  return {
+    version: "0.2.0",
+    current_version: "0.1.0",
+    notes: "https://github.com/lubdhak7414/offline-language-practice/releases/tag/v0.2.0",
+    date: "2026-10-01T12:00:00Z",
+    can_install: true,
+    ...over,
+  };
+}
+
+/** updates.rs `PACKAGE_REASON` / `UNBUNDLED_REASON`, verbatim. */
+const PACKAGE_REASON =
+  "This copy was installed from a Linux package, so your package manager owns it. " +
+  "Install the new version the same way you installed this one.";
+const UNBUNDLED_REASON = "This copy was not installed from a release, so it cannot replace itself.";
 
 export function makeDueCard(over: Partial<DueCard> = {}): DueCard {
   return {
@@ -304,6 +334,36 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       if (downloadState !== "paused") return true;
       await new Promise<void>((resolve) => wakers.push(resolve));
     }
+  };
+
+  // Mirrors updates.rs `UpdateState` and the checks lib.rs makes before it:
+  // one check-or-install at a time, `pending` holds the last check's
+  // answer, `installed` gates restart.
+  const updateMode = options.update?.mode ?? "install";
+  const updateBundle =
+    options.update && "bundle" in options.update
+      ? (options.update.bundle ?? null)
+      : updateMode === "install"
+        ? "AppImage"
+        : null;
+  const updateInfo: UpdateInfo = {
+    current_version: "0.1.0",
+    mode: updateMode,
+    reason:
+      updateMode === "install"
+        ? null
+        : updateBundle === "deb" || updateBundle === "rpm"
+          ? PACKAGE_REASON
+          : UNBUNDLED_REASON,
+    bundle: updateBundle,
+    release_page: "https://github.com/lubdhak7414/offline-language-practice/releases",
+  };
+  let updateBusy = false;
+  let pendingUpdate: AvailableUpdate | null = null;
+  let updateInstalled = false;
+  const refuse = (name: keyof Ipc, args: unknown[], message: string): Promise<never> => {
+    calls.push({ name, args });
+    return Promise.reject(message);
   };
 
   const calls: MockIpc["calls"] = [];
@@ -844,6 +904,76 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       downloadState = "cancelled";
       wakeDownload();
       return record("cancelDownloads", [], undefined as void);
+    },
+
+    updateInfo() {
+      return record("updateInfo", [], { ...updateInfo });
+    },
+
+    checkForUpdate(trigger) {
+      // lib.rs check_for_update: consent (updates::may_check) first...
+      if (trigger === "startup" && !preferences.check_updates) {
+        return refuse("checkForUpdate", [trigger], "UPDATE_REFUSED: update checks are turned off");
+      }
+      // ...then the UpdateState singleton.
+      if (updateBusy) {
+        return refuse(
+          "checkForUpdate",
+          [trigger],
+          "UPDATE_BUSY: an update check or install is already running",
+        );
+      }
+      const available = options.update?.available ?? null;
+      const found = available && { ...available, can_install: updateMode === "install" };
+      // The backend stores whatever the check returned, including "none".
+      pendingUpdate = found;
+      return record("checkForUpdate", [trigger], found);
+    },
+
+    async installUpdate(onEvent: (ev: UpdateEvent) => void) {
+      // lib.rs install_update, in its order: install mode, busy, pending.
+      if (updateMode === "notify") {
+        return refuse("installUpdate", [], `UPDATE_NOT_SUPPORTED: ${updateInfo.reason ?? ""}`);
+      }
+      if (updateBusy) {
+        return refuse(
+          "installUpdate",
+          [],
+          "UPDATE_BUSY: an update check or install is already running",
+        );
+      }
+      if (!pendingUpdate) {
+        return refuse("installUpdate", [], "UPDATE_NONE: check for an update first");
+      }
+      updateBusy = true;
+      try {
+        if (options.fail && "installUpdate" in options.fail) {
+          return await record("installUpdate", [], undefined as void);
+        }
+        const total = 50_000_000;
+        // A tick between events, so a second call can observe `busy`.
+        const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+        onEvent({ kind: "started", total });
+        await tick();
+        onEvent({ kind: "progress", received: total, total });
+        await tick();
+        onEvent({ kind: "verifying" });
+        onEvent({ kind: "installing" });
+        await tick();
+        updateInstalled = true;
+        onEvent({ kind: "installed" });
+        return await record("installUpdate", [], undefined as void);
+      } finally {
+        updateBusy = false;
+      }
+    },
+
+    restartApp() {
+      // lib.rs restart_app: refused until an install has finished.
+      if (!updateInstalled) {
+        return refuse("restartApp", [], "UPDATE_NONE: nothing has been installed to restart into");
+      }
+      return record("restartApp", [], undefined as void);
     },
   };
 }

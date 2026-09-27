@@ -34,6 +34,7 @@ mod pronounce;
 mod scheduler;
 mod stats;
 mod tts;
+mod updates;
 
 use std::sync::{Arc, RwLock};
 
@@ -41,6 +42,7 @@ use fsrs::{FSRS, FSRS6_DEFAULT_DECAY};
 use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_sql::{Builder as SqlBuilder, DbInstances, Migration, MigrationKind};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::asr::AsrEngine;
@@ -123,6 +125,9 @@ pub struct AppState {
     /// separate invokes while `download_models` is still awaiting — can
     /// reach the job that is actually running.
     pub downloads: Arc<crate::download::Control>,
+    /// The single in-flight update check or install, and the last check's
+    /// answer (Phase 7). See `updates.rs`.
+    pub updates: crate::updates::UpdateState,
 }
 
 /// Max `NeuralReq`s buffered per neural worker channel (see `run()`).
@@ -1153,6 +1158,175 @@ fn cancel_downloads(state: State<'_, AppState>) {
     state.downloads.cancel();
 }
 
+// ─── Updates (Phase 7) ──────────────────────────────────────────────────────
+
+/// What this copy is and whether it can replace itself. No network.
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    current_version: String,
+    /// `"install"` or `"notify"`.
+    mode: &'static str,
+    /// Why this copy cannot install updates itself, in notify mode.
+    reason: Option<&'static str>,
+    /// `updates::bundle_name`; `None` for a development build.
+    bundle: Option<&'static str>,
+    release_page: &'static str,
+}
+
+#[tauri::command]
+fn update_info(app: tauri::AppHandle) -> UpdateInfo {
+    let bundle = tauri::utils::platform::bundle_type();
+    let mode = crate::updates::install_mode(std::env::consts::OS, bundle.clone());
+    UpdateInfo {
+        current_version: app.package_info().version.to_string(),
+        mode: if mode == crate::updates::Mode::Install {
+            "install"
+        } else {
+            "notify"
+        },
+        reason: match mode {
+            crate::updates::Mode::Notify(r) => Some(r),
+            crate::updates::Mode::Install => None,
+        },
+        bundle: crate::updates::bundle_name(bundle),
+        release_page: crate::updates::RELEASES,
+    }
+}
+
+/// A newer release than the running one, as `latest.json` describes it.
+#[derive(serde::Serialize)]
+struct AvailableUpdate {
+    version: String,
+    current_version: String,
+    notes: Option<String>,
+    date: Option<String>,
+    can_install: bool,
+}
+
+/// Ask github.com whether a newer release exists. A `startup` check is refused
+/// unless the user opted in; `manual` is the user asking.
+#[tauri::command]
+async fn check_for_update(
+    trigger: crate::updates::Trigger,
+    state: State<'_, AppState>,
+    db: State<'_, DbInstances>,
+    app: tauri::AppHandle,
+) -> Result<Option<AvailableUpdate>, String> {
+    // Consent first, before anything that could build a request.
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let prefs = crate::prefs::load(&pool).await.map_err(String::from)?;
+    if !crate::updates::may_check(trigger, prefs.check_updates) {
+        return Err("UPDATE_REFUSED: update checks are turned off".into());
+    }
+    let Some(_busy) = state.updates.begin() else {
+        return Err("UPDATE_BUSY: an update check or install is already running".into());
+    };
+    let mut builder = app
+        .updater_builder()
+        .timeout(std::time::Duration::from_secs(30));
+    let env = std::env::var("OLP_UPDATE_ENDPOINT").ok();
+    if let Some(url) = crate::updates::endpoint_override(env.as_deref())? {
+        let url: tauri::Url = url.parse().map_err(|e| format!("bad endpoint: {e}"))?;
+        builder = builder.endpoints(vec![url]).map_err(|e| e.to_string())?;
+    }
+    let update = builder
+        .build()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| format!("update check failed: {e}"))?;
+    let can_install =
+        crate::updates::install_mode(std::env::consts::OS, tauri::utils::platform::bundle_type())
+            == crate::updates::Mode::Install;
+    let out = update.as_ref().map(|u| AvailableUpdate {
+        version: u.version.clone(),
+        current_version: u.current_version.clone(),
+        notes: u.body.clone(),
+        // raw_json, not `date`: avoids a direct `time` dependency for formatting.
+        date: u
+            .raw_json
+            .get("pub_date")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        can_install,
+    });
+    *state
+        .updates
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = update;
+    Ok(out)
+}
+
+/// Download, verify (minisign, pubkey + signed version) and install the
+/// pending update. On Windows the installer takes over and this process exits.
+#[tauri::command]
+async fn install_update(
+    channel: Channel<crate::updates::UpdateEvent>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use crate::updates::{Mode, UpdateEvent};
+    if let Mode::Notify(reason) =
+        crate::updates::install_mode(std::env::consts::OS, tauri::utils::platform::bundle_type())
+    {
+        return Err(format!("UPDATE_NOT_SUPPORTED: {reason}"));
+    }
+    let Some(_busy) = state.updates.begin() else {
+        return Err("UPDATE_BUSY: an update check or install is already running".into());
+    };
+    // Cloned, not taken, so a failed download can be retried without a new check.
+    let pending = state
+        .updates
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let Some(update) = pending else {
+        return Err("UPDATE_NONE: check for an update first".into());
+    };
+    let progress = channel.clone();
+    let mut received = 0u64;
+    let mut started = false;
+    let mut last = std::time::Instant::now();
+    let bytes = update
+        .download(
+            move |chunk, total| {
+                if !started {
+                    started = true;
+                    let _ = progress.send(UpdateEvent::Started { total });
+                }
+                received += chunk as u64;
+                if last.elapsed() >= crate::download::PROGRESS_EVERY {
+                    last = std::time::Instant::now();
+                    let _ = progress.send(UpdateEvent::Progress { received, total });
+                }
+            },
+            // Fires after the last byte, before the signature is checked.
+            || {
+                let _ = channel.send(UpdateEvent::Verifying);
+            },
+        )
+        .await
+        .map_err(|e| format!("update download failed: {e}"))?;
+    let _ = channel.send(UpdateEvent::Installing);
+    tauri::async_runtime::spawn_blocking(move || update.install(bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("update install failed: {e}"))?;
+    state.updates.mark_installed();
+    let _ = channel.send(UpdateEvent::Installed);
+    Ok(())
+}
+
+/// Relaunch into the installed version (macOS/Linux). Refused before an install.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if !state.updates.is_installed() {
+        return Err("UPDATE_NONE: nothing has been installed to restart into".into());
+    }
+    app.restart()
+}
+
 // ─── Data safety, stats, voice selection (Stream B2) ────────────────────────
 
 /// Result of `export_data`: where it wrote to, how many cards, and the
@@ -1493,6 +1667,7 @@ pub fn run() {
             retention: RwLock::new(crate::scheduler::DEFAULT_RETENTION),
             voice: RwLock::new(None),
             downloads: Arc::new(crate::download::Control::default()),
+            updates: Default::default(),
         })
         .plugin(tauri_plugin_dialog::init())
         // Registered BEFORE the SQL plugin so its `setup` hook runs first:
@@ -1538,6 +1713,11 @@ pub fn run() {
                 .add_migrations(DB_URL, migrations)
                 .build(),
         )
+        // After the SQL plugin, so the db-restore ordering above is untouched.
+        // Its config (pubkey, endpoint, requireSignedVersion) is
+        // `plugins.updater` in tauri.conf.json. The webview is granted none
+        // of its commands; the Rust commands below are the only way in.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Snapshot model search roots for the handle-less neural
             // workers: bundled `$RESOURCE/models/` first, then the
@@ -1829,7 +2009,11 @@ pub fn run() {
             stats_forecast,
             stats_retention,
             get_voice,
-            set_voice
+            set_voice,
+            update_info,
+            check_for_update,
+            install_update,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

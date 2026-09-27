@@ -29,6 +29,9 @@ import type {
   LintReport,
   DeckDeleteMode,
   DownloadEvent,
+  AvailableUpdate,
+  UpdateEvent,
+  UpdateInfo,
   ModelGroup,
   ModelStatus,
   NextPromptArgs,
@@ -229,6 +232,24 @@ export const tauriIpc: Ipc = {
 
   cancelDownloads() {
     return invoke<void>("cancel_downloads", {});
+  },
+
+  updateInfo() {
+    return invoke<UpdateInfo>("update_info", {});
+  },
+
+  checkForUpdate(trigger) {
+    return invoke<AvailableUpdate | null>("check_for_update", { trigger });
+  },
+
+  async installUpdate(onEvent) {
+    const channel = new Channel<UpdateEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("install_update", { channel });
+  },
+
+  restartApp() {
+    return invoke<void>("restart_app", {});
   },
 
   undoReview() {
