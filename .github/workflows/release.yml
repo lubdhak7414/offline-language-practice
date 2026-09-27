@@ -61,6 +61,24 @@ jobs:
           esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # Every release carries the updater, so an unsigned build would be one
+      # that installed copies can never move off. Fail in seconds, not after
+      # the ~40 minutes the build legs take to reach the signing step.
+      - name: Require the updater signing key and a real public key
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY is not set. See SECURITY.md, 'Automatic updates'."
+            exit 1
+          fi
+          # A minisign public key file, base64-encoded, is ~150 characters.
+          # The placeholder committed before the owner's key existed is not.
+          if ! jq -e '.plugins.updater.pubkey | test("^[A-Za-z0-9+/=]{100,}$")' src-tauri/tauri.conf.json >/dev/null; then
+            echo "::error::plugins.updater.pubkey in tauri.conf.json is missing or a placeholder."
+            exit 1
+          fi
+
   # One draft, created before any build starts, and every leg is handed its
   # id. Letting tauri-action create the release per leg is a race: GitHub's
   # get-release-by-tag API does not return drafts, so legs that start
@@ -108,9 +126,13 @@ jobs:
           Models are not bundled. The app downloads them on first run, or
           run `scripts/download-models.sh`.
           EOF
+            # A numeric pre-release (0.2.0-1) is published as a GitHub
+            # pre-release, which /releases/latest never resolves to, so no
+            # installed copy is ever offered a rehearsal build.
+            case "$VERSION" in *-*) PRE=true ;; *) PRE=false ;; esac
             id=$(gh api "repos/$REPO/releases" -X POST \
                    -f tag_name="$TAG" -f name="v$VERSION" \
-                   -F draft=true -F prerelease=false -F body=@notes.md --jq .id)
+                   -F draft=true -F prerelease="$PRE" -F body=@notes.md --jq .id)
           fi
           echo "draft release $id for $TAG"
           echo "id=$id" >> "$GITHUB_OUTPUT"
@@ -204,20 +226,30 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater bundles (.AppImage, .app.tar.gz, -setup.exe,
+          # .msi, and .deb/.rpm, which are signed but never offered).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          # Upload to the one draft the `release` job made. No tagName: it
-          # would only shape the updater's latest.json, which is off.
+          # Upload to the one draft the `release` job made. No tagName:
+          # everything is addressed by id (see the `release` job).
           releaseId: ${{ needs.release.outputs.id }}
-          # The updater stays off until 1.0 (no signing key, no endpoint), and
-          # v1 of this action uploads a latest.json by default. Say no rather
-          # than rely on it quietly doing nothing without signatures.
+          # Updater artifacts only here, so a contributor's `tauri build`
+          # needs no signing key (tauri-cli refuses to bundle them without
+          # one). Relative to the repo root, where the action runs the CLI.
+          args: --config src-tauri/tauri.updater.conf.json
+          # latest.json is written once, by `attest`, from the draft's own
+          # assets. tauri-action's per-leg read-modify-write of latest.json
+          # races across the three legs (one retry), points at api.github.com
+          # asset URLs, and would advertise .deb/.rpm installs.
           uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
 
   # Checksums and provenance are the whole security story for an unsigned
   # release, so they are produced once, over every platform's output, rather
   # than per job where they could silently cover only part of the set.
   attest:
-    needs: [release, build]
+    needs: [check, release, build]
     # Not the default `success()`. With fail-fast off, tauri-action has already
     # uploaded every good platform's binaries to the draft by the time one leg
     # fails; skipping this job would leave them there with no checksums and no
@@ -232,6 +264,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # For scripts/updater-manifest.mjs only; nothing here is built.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
       # Checksum and attest exactly what a user can download: the draft's
       # own assets, not files handed over by the build jobs. tauri-action
       # uploads things the build never reports — the rehearsal for 0.1.0
@@ -252,9 +289,9 @@ jobs:
           gh api "repos/$REPO/releases/$ID/assets" --paginate \
               --jq '.[] | "\(.id)\t\(.name)"' |
             while IFS=$'\t' read -r asset name; do
-              # A previous attempt's list is regenerated below, and must not
-              # become a subject of its own attestation.
-              [ "$name" = SHA256SUMS ] && continue
+              # A previous attempt's list and manifest are regenerated below,
+              # and must not become subjects of their own attestation.
+              case "$name" in SHA256SUMS|latest.json) continue ;; esac
               gh api -H "Accept: application/octet-stream" \
                 "repos/$REPO/releases/assets/$asset" > "dist/$name"
             done
@@ -272,6 +309,23 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      # One writer, after every leg, from exactly what the draft holds. Written
+      # before attestation so latest.json is a provenance subject and in
+      # SHA256SUMS, like every .sig beside it. continue-on-error so a bundle
+      # without a signature still leaves the draft checksummed and attested;
+      # the last step fails the run on it.
+      - name: Write latest.json for the updater
+        id: manifest
+        continue-on-error: true
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: node scripts/updater-manifest.mjs dist "$REPO" "$TAG" "$VERSION"
+
       # Before SHA256SUMS is written, so the subjects are exactly the
       # release binaries. Attesting the artifacts rather than only the
       # checksum file matters: provenance over a list of hashes proves
@@ -288,20 +342,24 @@ jobs:
             | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Attach SHA256SUMS to the draft
+      - name: Attach SHA256SUMS and latest.json to the draft
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ID: ${{ needs.release.outputs.id }}
         run: |
-          # Replace a previous attempt's list rather than failing on the name.
-          for old in $(gh api "repos/$REPO/releases/$ID/assets" --paginate \
-                         --jq '.[] | select(.name == "SHA256SUMS") | .id'); do
-            gh api -X DELETE "repos/$REPO/releases/assets/$old"
+          for file in SHA256SUMS latest.json; do
+            [ -f "dist/$file" ] || continue
+            # Replace a previous attempt's file rather than failing on the name.
+            for old in $(gh api "repos/$REPO/releases/$ID/assets" --paginate \
+                           --jq ".[] | select(.name == \"$file\") | .id"); do
+              gh api -X DELETE "repos/$REPO/releases/assets/$old"
+            done
+            case "$file" in *.json) ctype=application/json ;; *) ctype=text/plain ;; esac
+            gh api -X POST -H "Content-Type: $ctype" \
+              "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=$file" \
+              --input "dist/$file" --jq '"uploaded \(.name), \(.size) bytes"'
           done
-          gh api -X POST -H "Content-Type: text/plain" \
-            "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=SHA256SUMS" \
-            --input dist/SHA256SUMS --jq '"uploaded \(.name), \(.size) bytes"'
 
       # Every build succeeding is not the same as every platform being in the
       # draft: the split-release race was green. Name the files each platform
@@ -312,12 +370,19 @@ jobs:
           missing=0
           for want in _amd64.deb _amd64.AppImage .x86_64.rpm \
                       _aarch64.dmg _aarch64.app.tar.gz \
-                      _x64-setup.exe _x64_en-US.msi; do
+                      _x64-setup.exe _x64_en-US.msi \
+                      _amd64.AppImage.sig _aarch64.app.tar.gz.sig \
+                      _x64-setup.exe.sig _x64_en-US.msi.sig latest.json; do
             if ! ls dist | grep -qF -- "$want"; then
               echo "::error::The draft has no *$want."
               missing=1
             fi
           done
+          if [ -f dist/latest.json ]; then
+            jq -e '.platforms | has("linux-x86_64") and has("darwin-aarch64") and has("windows-x86_64")
+                   and has("windows-x86_64-msi") and (has("linux-x86_64-deb") | not)' dist/latest.json \
+              || { echo "::error::latest.json does not cover every platform."; missing=1; }
+          fi
           exit "$missing"
 
       # The draft now carries correct checksums and provenance for the
@@ -327,4 +392,13 @@ jobs:
         if: ${{ needs.build.result != 'success' }}
         run: |
           echo "::error::build result was '${{ needs.build.result }}'. SHA256SUMS and provenance cover only the platforms that built. Re-run the failed jobs (this one re-runs with them) before publishing."
+          exit 1
+
+      # The manifest step is allowed to fail so the steps above still run;
+      # a draft whose updater manifest could not be written must not look
+      # publishable.
+      - name: Fail the run if latest.json could not be written
+        if: ${{ steps.manifest.outcome == 'failure' }}
+        run: |
+          echo "::error::scripts/updater-manifest.mjs failed (see its step). The draft has no usable latest.json; do not publish it."
           exit 1
