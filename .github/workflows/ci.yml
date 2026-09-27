@@ -31,6 +31,8 @@ jobs:
       # `npm test` is tsc --noEmit + vitest run.
       - run: npm test
       - run: npx vite build
+      # The scripts/ Python tests: stdlib only, no corpus, well under a second.
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       # Non-blocking: surface known prod-dependency vulnerabilities without failing CI.
       - run: npm audit --omit=dev
         continue-on-error: true
