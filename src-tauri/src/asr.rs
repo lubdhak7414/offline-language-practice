@@ -7,6 +7,8 @@
 //! [`AsrEngine::transcribe_pcm_detailed`] additionally returns the
 //! log-softmax frame posteriors, which pronunciation scoring needs; plain
 //! [`AsrEngine::transcribe_pcm`] never allocates them.
+//! [`AsrEngine::transcribe_pcm_frames`] sits between the two: a
+//! [`CtcFrames`] summary of two values per frame, for delivery analysis.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -259,6 +261,104 @@ pub struct AsrOutput {
     pub frame_stride_ms: f32,
 }
 
+/// Per-frame CTC evidence for delivery analysis, small enough to cross the
+/// worker channel: two values per frame instead of the whole vocab row
+/// (about 18 KB at the 120 s cap, against about 768 KB of logits).
+///
+/// `label` is the argmax token as a byte: `0` for the blank, `b' '` for the
+/// `|` word delimiter, the upper-case letter or `'` for a letter token, and
+/// `b'?'` for any other special (`<s>`, `<unk>`, …).
+///
+/// `blank_logp` is log P(blank) for the frame, which says how sure the model
+/// is that nothing was spelled there — the argmax alone cannot tell a
+/// confident blank from a near tie.
+// Consumed by `fluency::detect_held_sounds`, which is wired into the app in
+// Phase 7 Stage 5 step 5 (gated on the AMI measurement).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CtcFrames {
+    pub stride_ms: f32,
+    pub label: Vec<u8>,
+    pub blank_logp: Vec<f32>,
+}
+
+/// Reduce row-major `[frames, vocab]` rows to a [`CtcFrames`]. Pure (no IO).
+///
+/// Works on raw logits *or* on log-softmax rows: `logp[blank] = x[blank] -
+/// logsumexp(row)`, and the logsumexp of an already-normalised row is 0, so
+/// the same call is right for both and the logits never need a copy. A row
+/// that runs past the end of the slice ends the summary instead of panicking.
+#[allow(dead_code)] // Phase 7 Stage 5 step 5, see `CtcFrames`.
+pub fn ctc_frames(
+    rows: &[f32],
+    frames: usize,
+    vocab: usize,
+    v: &Vocab,
+    stride_ms: f32,
+) -> CtcFrames {
+    let mut out = CtcFrames {
+        stride_ms,
+        label: Vec::with_capacity(frames),
+        blank_logp: Vec::with_capacity(frames),
+    };
+    if vocab == 0 {
+        return out;
+    }
+    let blank = usize::try_from(v.blank).ok().filter(|&b| b < vocab);
+    for t in 0..frames {
+        let base = t.saturating_mul(vocab);
+        let Some(row) = rows.get(base..base + vocab) else {
+            break;
+        };
+        let (mut best, mut best_val) = (0usize, row[0]);
+        for (i, &x) in row.iter().enumerate().skip(1) {
+            if x > best_val {
+                best = i;
+                best_val = x;
+            }
+        }
+        let label = if Some(best) == blank {
+            0
+        } else {
+            match v.id_to_token.get(&(best as i64)).map(String::as_str) {
+                Some("|") => b' ',
+                Some(tok) if tok.len() == 1 => {
+                    let c = tok.as_bytes()[0].to_ascii_uppercase();
+                    if c.is_ascii_uppercase() || c == b'\'' {
+                        c
+                    } else {
+                        b'?'
+                    }
+                }
+                _ => b'?',
+            }
+        };
+        // Same max-shifted f64 sum as `log_softmax_rows`, so the two agree.
+        let blank_logp = match blank {
+            Some(b) if best_val.is_finite() => {
+                let sum: f64 = row.iter().map(|&x| ((x - best_val) as f64).exp()).sum();
+                (row[b] as f64 - (best_val as f64 + sum.ln())) as f32
+            }
+            _ => f32::NEG_INFINITY,
+        };
+        out.label.push(label);
+        out.blank_logp.push(blank_logp);
+    }
+    out
+}
+
+/// Milliseconds of audio per output frame for one run.
+///
+/// Derived from the actual output length rather than assuming wav2vec2's
+/// nominal 20 ms hop, so a re-exported or strided model does not silently
+/// skew every word timing.
+fn frame_stride_ms(audio_samples: usize, frames: usize) -> f32 {
+    if frames == 0 {
+        return 0.0;
+    }
+    1000.0 * audio_samples as f32 / ASR_SAMPLE_RATE as f32 / frames as f32
+}
+
 /// Wav2vec2 session wrapper. `Session::run` takes `&mut self`, hence the Mutex.
 pub struct AsrEngine {
     session: Mutex<Session>,
@@ -325,21 +425,33 @@ impl AsrEngine {
             let mut logp = data[..len].to_vec();
             log_softmax_rows(&mut logp, frames, n_vocab);
             let collapsed = ctc_collapse_argmax(&logp, frames, n_vocab, vocab.blank);
-            let audio_ms = 1000.0 * audio_samples as f32 / ASR_SAMPLE_RATE as f32;
             Ok(AsrOutput {
                 text: decode_collapsed_ids(&collapsed, &vocab.id_to_token),
                 logp,
                 frames,
                 vocab: n_vocab,
-                // Derived from the actual output length rather than assuming
-                // wav2vec2's nominal 20 ms hop, so a re-exported or strided
-                // model does not silently skew every word timing.
-                frame_stride_ms: if frames == 0 {
-                    0.0
-                } else {
-                    audio_ms / frames as f32
-                },
+                frame_stride_ms: frame_stride_ms(audio_samples, frames),
             })
+        })
+    }
+
+    /// Transcribe and also return the compact [`CtcFrames`] summary.
+    ///
+    /// For callers that need to know *where* the model spelled nothing
+    /// (held-sound detection) but not the full posteriors. The logits are
+    /// read in place, never copied: argmax does not change under
+    /// log-softmax and [`ctc_frames`] normalises the blank itself.
+    #[allow(dead_code)] // Phase 7 Stage 5 step 5, see `CtcFrames`.
+    pub fn transcribe_pcm_frames(&self, pcm_f32: &[f32]) -> ort::Result<(String, CtcFrames)> {
+        let vocab = load_vocab()?;
+        let audio_samples = pcm_f32.len();
+        self.with_logits(pcm_f32, |data, frames, n_vocab| {
+            let collapsed = ctc_collapse_argmax(data, frames, n_vocab, vocab.blank);
+            let stride = frame_stride_ms(audio_samples, frames);
+            Ok((
+                decode_collapsed_ids(&collapsed, &vocab.id_to_token),
+                ctc_frames(data, frames, n_vocab, &vocab, stride),
+            ))
         })
     }
 
@@ -583,6 +695,64 @@ mod tests {
         let mut short = vec![1.0f32, 2.0];
         log_softmax_rows(&mut short, 4, 3);
         assert_eq!(short.len(), 2);
+    }
+
+    /// `<pad>`=0, `A`=1, `|`=2, `<unk>`=3.
+    fn tiny_vocab() -> Vocab {
+        Vocab::parse(r#"{"<pad>": 0, "a": 1, "|": 2, "<unk>": 3}"#).expect("parse")
+    }
+
+    /// Four frames whose argmax is blank, `a`, `|`, `<unk>`.
+    const TINY_LOGITS: [f32; 16] = [
+        3.0, 1.0, 0.0, -1.0, //
+        0.5, 2.5, 0.0, 0.0, //
+        -2.0, 0.0, 4.0, 1.0, //
+        0.0, 0.0, 0.0, 6.0, //
+    ];
+
+    #[test]
+    fn ctc_frames_matches_argmax_and_blank_logp() {
+        let v = tiny_vocab();
+        let f = ctc_frames(&TINY_LOGITS, 4, 4, &v, 20.0);
+        assert_eq!(f.stride_ms, 20.0);
+        assert_eq!(f.label, vec![0, b'A', b' ', b'?']);
+        // Oracle: the blank column of the independently normalised rows.
+        let mut logp = TINY_LOGITS.to_vec();
+        log_softmax_rows(&mut logp, 4, 4);
+        for (t, &got) in f.blank_logp.iter().enumerate() {
+            let want = logp[t * 4];
+            assert!((got - want).abs() < 1e-5, "frame {t}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn ctc_frames_is_the_same_on_raw_and_normalised_rows() {
+        let v = tiny_vocab();
+        let mut logp = TINY_LOGITS.to_vec();
+        log_softmax_rows(&mut logp, 4, 4);
+        let raw = ctc_frames(&TINY_LOGITS, 4, 4, &v, 20.0);
+        let norm = ctc_frames(&logp, 4, 4, &v, 20.0);
+        assert_eq!(raw.label, norm.label);
+        for (a, b) in raw.blank_logp.iter().zip(&norm.blank_logp) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        // A short slice stops at the last whole row rather than panicking.
+        assert_eq!(
+            ctc_frames(&TINY_LOGITS[..10], 4, 4, &v, 20.0).label.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ctc_frames_honours_a_non_zero_blank() {
+        // Same rows, but the file says the blank is id 1: frame 1 is now the
+        // blank and frame 0's id 0 is an ordinary (single-letter) token.
+        let v = Vocab::parse(r#"{"e": 0, "<pad>": 1, "|": 2, "<unk>": 3}"#).expect("parse");
+        let f = ctc_frames(&TINY_LOGITS, 4, 4, &v, 20.0);
+        assert_eq!(f.label, vec![b'E', 0, b' ', b'?']);
+        let mut logp = TINY_LOGITS.to_vec();
+        log_softmax_rows(&mut logp, 4, 4);
+        assert!((f.blank_logp[1] - logp[4 + 1]).abs() < 1e-5);
     }
 
     #[test]
