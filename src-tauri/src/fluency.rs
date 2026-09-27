@@ -337,8 +337,9 @@ pub fn filler_score(fillers: FillerCounts, hesitations: i64, word_count: usize) 
 // stretches "theee" holds the articulators still, so pitch barely moves and
 // the level barely changes. On top of those two cues sits the evidence the
 // CTC model already produces: voiced sound it did not spell. None of this is
-// wired into the app yet (Phase 7 Stage 5 step 5, gated on the AMI
-// measurement in `corpus`); every threshold below is provisional until then.
+// wired into the app (Phase 7 Stage 5 step 5): on AMI it failed its gate on
+// recall (see `corpus`). The classifier thresholds are the ones frozen on
+// the AMI dev split; the tracker and segmentation constants were not swept.
 // ---------------------------------------------------------------------------
 
 /// A hop must be this far above [`silence_floor_db`] before the pitch tracker
@@ -361,10 +362,13 @@ const HELD_GAP_HOPS: usize = 2;
 const SEGMENT_SPREAD_ST: f32 = 4.0;
 /// Candidates shorter than this are not even logged.
 const CANDIDATE_MIN_MS: i64 = 100;
-/// Pitch stability: p90 - p10 in semitones.
-const HELD_SPREAD_ST: f32 = 2.0;
-/// Level stability: words have consonant dips; a held "uh" does not.
-const HELD_ENERGY_SD_DB: f32 = 4.0;
+/// Pitch stability: p90 - p10 in semitones. On AMI dev, 2.0 found 21%
+/// of filled pauses and 2.5 found 28%, for about a point of precision.
+const HELD_SPREAD_ST: f32 = 2.5;
+/// Level stability: words have consonant dips; a held "uh" does not. On AMI
+/// this barely separates anything (recall moves ~1% from 4 to 10 dB), so it
+/// is set loose, at 6 dB, and pitch and CTC do the work.
+const HELD_ENERGY_SD_DB: f32 = 6.0;
 /// Filled pauses run about 200-600 ms, "um" longer. Past 1.5 s it is more
 /// likely a held tone than a hesitation.
 const HELD_MIN_MS: i64 = 200;
@@ -376,7 +380,9 @@ const LENGTHENING_MIN_MS: i64 = 300;
 const FILLER_LETTERS: &[u8] = b"AUMHER";
 /// A frame is blank-dominant when P(blank) > 0.5.
 const BLANK_DOMINANT_LOGP: f32 = -std::f32::consts::LN_2;
-/// Share of blank-dominant frames that makes a candidate "not spelled".
+/// Share of blank-dominant frames that makes a candidate "not spelled". The
+/// plan also let through anything with at most two filler letters whatever
+/// the blank share; on AMI dev that only added false positives.
 const BLANK_FRAC_MIN: f32 = 0.7;
 /// A blank run this long ends a CTC word even without a `|`.
 const WORD_GAP_MS: f32 = 500.0;
@@ -772,7 +778,7 @@ pub(crate) fn held_candidates(
     out
 }
 
-/// The provisional decision rule over one candidate's features.
+/// The decision rule over one candidate's features.
 pub(crate) fn classify_held(c: &HeldCandidate) -> Option<HeldKind> {
     let dur = c.end_ms - c.start_ms;
     if !(HELD_MIN_MS..=HELD_MAX_MS).contains(&dur)
@@ -787,8 +793,7 @@ pub(crate) fn classify_held(c: &HeldCandidate) -> Option<HeldKind> {
         UnderWord::Real => (dur >= LENGTHENING_MIN_MS).then_some(HeldKind::Lengthening),
         UnderWord::None | UnderWord::FillerShaped => {
             let filler_letters = c.letters.bytes().all(|l| FILLER_LETTERS.contains(&l));
-            (filler_letters && (c.blank_frac >= BLANK_FRAC_MIN || c.letters.len() <= 2))
-                .then_some(HeldKind::FilledPause)
+            (filler_letters && c.blank_frac >= BLANK_FRAC_MIN).then_some(HeldKind::FilledPause)
         }
     }
 }
@@ -1482,5 +1487,196 @@ mod tests {
             got,
             [("HELLO", 20, 220), ("WORLD", 260, 440), ("AB", 1040, 1100)]
         );
+    }
+}
+
+#[cfg(test)]
+mod corpus {
+    //! Measurement data for [`detect_held_sounds`], against hand-transcribed
+    //! filled pauses.
+    //!
+    //! `#[ignore]`d and needs two things off-repo: the model files, and a
+    //! directory holding `segments.tsv` plus the WAVs it names, as written by
+    //! `scripts/prepare-ami-fillers.py` from the AMI Meeting Corpus (CC BY
+    //! 4.0; individual headset microphones, mostly non-native speakers):
+    //!
+    //!   python3 scripts/prepare-ami-fillers.py ~/corpora/ami ~/corpora/ami-fillers
+    //!   OLP_FILLER_DIR=~/corpora/ami-fillers OLP_MODELS_DIR=$PWD/models \
+    //!     cargo test --release --manifest-path src-tauri/Cargo.toml \
+    //!     --lib corpus_dump_fillers -- --ignored --nocapture
+    //!   python3 scripts/eval-fillers.py ~/corpora/ami-fillers
+    //!
+    //! It writes every held-sound *candidate* with its features, not just the
+    //! detections, so the thresholds can be swept outside the build; plus the
+    //! fillers the transcript spelled, which is the text-only baseline the
+    //! detector has to beat. Only the ASR model is loaded.
+    //!
+    //! Result (2026-09-28; thresholds swept on the 12 dev meetings, frozen,
+    //! then the 12 test meetings scored once; 3,542 reference um/uh): on test
+    //! precision 0.82 (Wilson 0.79-0.85), recall 0.32, against 0.09 recall for
+    //! the transcript alone. The gate needs recall 0.40, so it is NO-GO and
+    //! nothing here is wired in. No threshold setting reaches 0.40 on dev even
+    //! at precision 0.5: roughly 30% of the fillers sit under a real word
+    //! the model bent them into ("AND", "I"), where this detector cannot tell
+    //! a filled pause from a lengthening.
+
+    use super::*;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// 16-bit PCM mono WAV to samples in [-1, 1], plus its sample rate.
+    ///
+    /// A copy of the reader in `pronounce::corpus`, kept separate so the two
+    /// harnesses do not reach into each other's private test modules.
+    fn read_wav(path: &Path) -> (Vec<f32>, u32) {
+        let b = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE");
+        let (mut i, mut rate, mut bits, mut channels) = (12usize, 0u32, 0u16, 0u16);
+        while i + 8 <= b.len() {
+            let id = &b[i..i + 4];
+            let len = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
+            let body = &b[i + 8..(i + 8 + len).min(b.len())];
+            if id == b"fmt " && body.len() >= 16 {
+                channels = u16::from_le_bytes([body[2], body[3]]);
+                rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            } else if id == b"data" {
+                assert_eq!(
+                    (channels, bits),
+                    (1, 16),
+                    "{}: not 16-bit mono",
+                    path.display()
+                );
+                let pcm = body
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
+                    .collect();
+                return (pcm, rate);
+            }
+            i += 8 + len + (len & 1);
+        }
+        panic!("{}: no data chunk", path.display());
+    }
+
+    fn under_name(u: UnderWord) -> &'static str {
+        match u {
+            UnderWord::None => "none",
+            UnderWord::FillerShaped => "filler_shaped",
+            UnderWord::SpelledFiller => "spelled_filler",
+            UnderWord::Real => "real",
+        }
+    }
+
+    #[test]
+    #[ignore = "corpus"]
+    fn corpus_dump_fillers() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("OLP_FILLER_DIR")
+                .expect("set OLP_FILLER_DIR to a prepare-ami-fillers.py output; see module doc"),
+        );
+        if std::env::var_os("OLP_MODELS_DIR").is_none() {
+            let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../models");
+            std::env::set_var("OLP_MODELS_DIR", models);
+        }
+        let model = crate::asr::find_model().expect("no ASR model; set OLP_MODELS_DIR");
+        let asr = crate::asr::AsrEngine::load(&model).expect("load ASR");
+
+        let listing = std::fs::read_to_string(root.join("segments.tsv")).expect("segments.tsv");
+        let mut lines = listing.lines();
+        let header: Vec<&str> = lines.next().expect("header").split('\t').collect();
+        let col = |name: &str| {
+            header
+                .iter()
+                .position(|h| *h == name)
+                .unwrap_or_else(|| panic!("segments.tsv has no {name} column"))
+        };
+        let (c_id, c_wav, c_split) = (col("id"), col("wav"), col("split"));
+
+        let out_path = root.join("filler_dump.tsv");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
+        // row = seg | text | cand. A `seg` row carries the transcript in
+        // `words` and its count_fillers total in `kind`; a `text` row is one
+        // filler the transcript spelled; a `cand` row is one candidate, `kind`
+        // being what the current thresholds make of it.
+        writeln!(
+            out,
+            "row\tid\tsplit\tstart_ms\tend_ms\tspread_st\tenergy_sd_db\tblank_frac\t\
+             letters\tunder\twords\tkind"
+        )
+        .unwrap();
+
+        let (mut segs, mut cands, mut refused) = (0usize, 0usize, 0usize);
+        let started = std::time::Instant::now();
+        for line in lines {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (id, split) = (f[c_id], f[c_split]);
+            let (pcm, rate) = read_wav(&root.join(f[c_wav]));
+            assert_eq!(rate, crate::asr::ASR_SAMPLE_RATE, "{id}: resample first");
+            let (text, ctc) = match asr.transcribe_pcm_frames(&pcm) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Digital silence and the like: the segment still counts,
+                    // with nothing detected and nothing spelled.
+                    refused += 1;
+                    (String::new(), CtcFrames::default())
+                }
+            };
+            let dur_ms = (pcm.len() as f32 * 1000.0 / rate as f32).round() as i64;
+            writeln!(
+                out,
+                "seg\t{id}\t{split}\t0\t{dur_ms}\t\t\t\t\t\t{}\t{}",
+                text.trim(),
+                count_fillers(&text).certain
+            )
+            .unwrap();
+            for w in ctc_word_spans(&ctc) {
+                if count_fillers(&w.text).certain > 0 {
+                    writeln!(
+                        out,
+                        "text\t{id}\t{split}\t{}\t{}\t\t\t\t{}\t\t{}\t",
+                        w.start_ms, w.end_ms, w.text, w.text
+                    )
+                    .unwrap();
+                }
+            }
+            for c in held_candidates(&pcm, rate, &ctc) {
+                let kind = match classify_held(&c) {
+                    Some(HeldKind::FilledPause) => "filled_pause",
+                    Some(HeldKind::Lengthening) => "lengthening",
+                    None => "",
+                };
+                writeln!(
+                    out,
+                    "cand\t{id}\t{split}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{kind}",
+                    c.start_ms,
+                    c.end_ms,
+                    c.f0_spread_st,
+                    c.energy_sd_db,
+                    c.blank_frac,
+                    c.letters,
+                    under_name(c.under),
+                    c.words
+                )
+                .unwrap();
+                cands += 1;
+            }
+            segs += 1;
+            if segs % 250 == 0 {
+                eprintln!(
+                    "{segs} segments, {cands} candidates, {:.0} s",
+                    started.elapsed().as_secs_f32()
+                );
+            }
+        }
+        out.flush().unwrap();
+        eprintln!(
+            "done: {segs} segments ({refused} refused by the ASR), {cands} candidates in \
+             {:.0} s -> {}",
+            started.elapsed().as_secs_f32(),
+            out_path.display()
+        );
+        assert!(segs > 0);
     }
 }
