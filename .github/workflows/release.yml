@@ -30,7 +30,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
@@ -165,7 +165,7 @@ jobs:
       # hit it.
       NO_STRIP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -183,7 +183,7 @@ jobs:
       # espeak needs cmake at build time; every hosted runner ships one.
       - run: cmake --version
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
