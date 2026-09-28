@@ -168,12 +168,33 @@ describe("Review", () => {
     await user.selectOptions(await screen.findByRole("combobox", { name: /Deck/ }), "travel");
     expect(await screen.findByText("travel front")).toBeInTheDocument();
     expect(screen.getByText("1 of 1")).toBeInTheDocument();
-    const last = mock.calls.filter((c) => c.name === "dueCards").at(-1)?.args[0];
+    const dueCalls = () => mock.calls.filter((c) => c.name === "dueCards");
+    const last = dueCalls()[dueCalls().length - 1]?.args[0];
     expect(last).toMatchObject({ deckId: "travel" });
 
     await user.selectOptions(screen.getByRole("combobox", { name: /Deck/ }), "");
     await waitFor(() => expect(screen.getByText("1 of 2")).toBeInTheDocument());
-    expect(mock.calls.filter((c) => c.name === "dueCards").at(-1)?.args[0]).not.toHaveProperty("deckId");
+    expect(dueCalls()[dueCalls().length - 1]?.args[0]).not.toHaveProperty("deckId");
+  });
+
+  it("keeps another deck's card out of a one-deck review", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({
+      due: [
+        makeDueCard({ id: "d1", front: "default front", deck_id: "default" }),
+        makeDueCard({ id: "t1", front: "travel front", deck_id: "travel", deck_name: "Travel" }),
+      ],
+    });
+    mount(mock);
+    await screen.findByText("default front");
+    await user.selectOptions(await screen.findByRole("combobox", { name: /Deck/ }), "travel");
+    await screen.findByText("travel front");
+    // Clicks, not keys: focus is still on the deck picker, which keeps them.
+    await user.click(screen.getByRole("button", { name: /Show answer/ }));
+    await user.click(screen.getByRole("button", { name: /Good/ }));
+    // The grade's replacement is "default front", from the other deck.
+    expect(await screen.findByText("Round finished")).toBeInTheDocument();
+    expect(screen.queryByText("default front")).not.toBeInTheDocument();
   });
 
   it("offers no deck picker with only one deck", async () => {

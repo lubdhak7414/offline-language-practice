@@ -135,12 +135,31 @@ export function Review(props: { announce: (msg: string) => void }) {
         setTally((t) => ({ ...t, [rating]: t[rating] + 1 }));
         setLog((l) => [...l, `${label}: ${firstLine(card.front)}`]);
         announce(`${label}. Next in ${formatInterval(card.intervals[String(rating)])}.`);
-        setQueue((q) =>
-          // Only extend at the end of the queue: mid-queue the backend's
-          // "next due" is almost always the card already sitting at index+1,
-          // and appending it would show it twice.
-          index === q.length - 1 && replacement ? [...q, replacement] : q,
-        );
+        const atEnd = index === queue.length - 1;
+        if (atEnd && deckId) {
+          // The grade's replacement is picked from every deck under the
+          // global caps, so it can belong to another deck or overrun this
+          // one's cap. Ask for this deck's queue instead.
+          // The grade is already saved: a failed refill must still move on,
+          // or the same card could be graded twice.
+          try {
+            const more = await ipc().dueCards({
+              limit: REVIEW_QUEUE_SIZE,
+              deckId,
+              tzOffsetMinutes: tzOffsetMinutes(),
+            });
+            setQueue((q) => [...q, ...more.filter((c) => c.id !== card.id)]);
+          } catch (e) {
+            setError(String(e));
+          }
+        } else {
+          setQueue((q) =>
+            // Only extend at the end of the queue: mid-queue the backend's
+            // "next due" is almost always the card already sitting at
+            // index+1, and appending it would show it twice.
+            atEnd && replacement ? [...q, replacement] : q,
+          );
+        }
         setIndex((i) => i + 1);
         setRevealed(false);
       } catch (e) {
@@ -150,7 +169,7 @@ export function Review(props: { announce: (msg: string) => void }) {
         setBusy(false);
       }
     },
-    [announce, card, index, revealed],
+    [announce, card, deckId, index, queue.length, revealed],
   );
 
   // Restoring the exact card and its position is the backend's job (the undo
