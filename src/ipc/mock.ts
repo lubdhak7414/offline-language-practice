@@ -77,6 +77,8 @@ export type MockOptions = {
   daily?: DayCount[];
   forecast?: ForecastDay[];
   retentionBuckets?: RetentionBucket[];
+  /** Practice history `listAttempts` starts with, newest first. */
+  attempts?: AttemptRow[];
   /** What the next open/save dialog returns; `undefined` means "cancelled". */
   pickOpenPath?: string | null;
   pickSavePath?: string | null;
@@ -242,7 +244,7 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
   }));
   const due: DueCard[] = [...(options.due ?? [])];
   const reviews: RecentReview[] = [];
-  const attempts: AttemptRow[] = [];
+  const attempts: AttemptRow[] = [...(options.attempts ?? [])];
   const prompts: PromptView[] = [...(options.prompts ?? [makePrompt()])];
   let retention = options.retention ?? 0.9;
   let preferences: Preferences = { ...DEFAULT_PREFERENCES, ...options.preferences };

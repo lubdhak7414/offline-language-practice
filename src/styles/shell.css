@@ -746,3 +746,7 @@ kbd {
 .check-writing textarea {
   margin-top: var(--space-2);
 }
+
+.recent-practice {
+  margin-top: var(--space-6);
+}

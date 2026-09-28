@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
-import type { DayCount, ForecastDay, Overview, RetentionBucket } from "../ipc/types";
+import type { AttemptRow, DayCount, ForecastDay, Overview, RetentionBucket } from "../ipc/types";
 import { BarChart, LineChart, type ChartPoint } from "../components/Chart";
 import { tzOffsetMinutes } from "../lib/tz";
 
@@ -9,6 +9,10 @@ const STATS_DAYS = 30;
 const FORECAST_DAYS = 14;
 const RETENTION_DAYS = 90;
 const RETENTION_BUCKET_DAYS = 7;
+/** Newest practice attempts listed; the backend caps the request at 200. */
+const RECENT_ATTEMPTS = 20;
+/** Characters of a free-speaking transcript shown in the history table. */
+const SNIPPET_CHARS = 60;
 
 /** `unix seconds -> "Mon 3"`, short enough for a chart axis and a table cell. */
 function dayLabel(unixSeconds: number): string {
@@ -20,11 +24,29 @@ function minutes(ms: number): number {
   return Math.round(ms / 60_000);
 }
 
+/** `created_at` is unix milliseconds. */
+function whenLabel(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function snippet(text: string): string {
+  const t = text.trim();
+  return t.length > SNIPPET_CHARS ? `${t.slice(0, SNIPPET_CHARS - 1)}…` : t;
+}
+
 export function Progress() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [daily, setDaily] = useState<DayCount[]>([]);
   const [forecast, setForecast] = useState<ForecastDay[]>([]);
   const [retention, setRetention] = useState<RetentionBucket[]>([]);
+  const [attempts, setAttempts] = useState<AttemptRow[] | null>(null);
+  const [attemptsError, setAttemptsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -48,6 +70,15 @@ export function Progress() {
         if (live) setError(String(e));
       } finally {
         if (live) setLoading(false);
+      }
+    })();
+    // Separate from the stats above, so a failure here does not blank the charts.
+    void (async () => {
+      try {
+        const rows = await ipc().listAttempts(undefined, RECENT_ATTEMPTS);
+        if (live) setAttempts(rows);
+      } catch (e) {
+        if (live) setAttemptsError(String(e));
       }
     })();
     return () => {
@@ -97,6 +128,67 @@ export function Progress() {
           <BarChart title="Due forecast (next 14 days)" unit="Cards due" data={forecastPoints} />
           <LineChart title="Retention by week" unit="Retention %" data={retentionPoints} />
         </div>
+      )}
+
+      <RecentPractice attempts={attempts} error={attemptsError} />
+    </section>
+  );
+}
+
+function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | null }) {
+  const { attempts, error } = props;
+  return (
+    <section class="recent-practice" aria-labelledby="recent-practice-title">
+      <h2 id="recent-practice-title">Recent practice</h2>
+      {error && (
+        <p class="notice notice-error" role="alert">
+          Could not load your practice history: {error}
+        </p>
+      )}
+      {!error && attempts === null && <p class="muted">Loading…</p>}
+      {attempts?.length === 0 && (
+        <p class="muted">No practice yet. Record an attempt on the Practice screen and it shows up here.</p>
+      )}
+      {attempts && attempts.length > 0 && (
+        <table class="cards-table">
+          <thead>
+            <tr>
+              <th scope="col">When</th>
+              <th scope="col">What you practised</th>
+              <th scope="col">Overall</th>
+              <th scope="col">Pronunciation</th>
+              <th scope="col">Length</th>
+            </tr>
+          </thead>
+          <tbody>
+            {attempts.map((a) => (
+              <tr key={a.id}>
+                <td>{whenLabel(a.created_at)}</td>
+                <td>
+                  {a.target_text ?? (
+                    <>
+                      <span class="muted">Free speaking:</span> {snippet(a.transcript)}
+                    </>
+                  )}
+                </td>
+                <td>{a.overall}</td>
+                <td>
+                  {/* Free speaking has no pronunciation score; never show one. */}
+                  {a.pron_overall === null ? (
+                    <span class="muted">Not scored</span>
+                  ) : a.pron_method === "text" ? (
+                    <>
+                      {a.pron_overall} <span class="muted">(word matching)</span>
+                    </>
+                  ) : (
+                    a.pron_overall
+                  )}
+                </td>
+                <td>{(a.duration_ms / 1000).toFixed(1)}s</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </section>
   );

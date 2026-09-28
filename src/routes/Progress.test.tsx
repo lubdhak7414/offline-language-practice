@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/preact";
+import { render, screen, within } from "@testing-library/preact";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { setIpc } from "../ipc/commands";
@@ -68,5 +68,63 @@ describe("Progress", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("img", { name: /Due forecast \(next 14 days\)/ })).toBeInTheDocument();
     expect(screen.getByRole("img", { name: /Retention by week/ })).toBeInTheDocument();
+  });
+
+  describe("recent practice", () => {
+    const row = {
+      id: "a1",
+      prompt_id: "p1",
+      target_text: "Hi, good to see you again.",
+      transcript: "hi good to see you again",
+      duration_ms: 2400,
+      created_at: Date.UTC(2026, 8, 27, 14, 5),
+      pron_overall: 82,
+      pron_method: "gop",
+      overall: 88,
+    };
+
+    it("lists attempts with their scores, newest first", async () => {
+      const mock = createMockIpc({
+        attempts: [
+          row,
+          {
+            ...row,
+            id: "a2",
+            prompt_id: null,
+            target_text: null,
+            transcript: "I would say my biggest strength is staying calm when things go wrong at work",
+            pron_overall: null,
+            pron_method: null,
+            overall: 71,
+          },
+          { ...row, id: "a3", pron_method: "text", pron_overall: 100 },
+        ],
+      });
+      mount(mock);
+      const section = await screen.findByRole("region", { name: "Recent practice" });
+      const table = await within(section).findByRole("table");
+      const rows = within(table).getAllByRole("row").slice(1);
+      expect(rows).toHaveLength(3);
+      expect(rows[0]).toHaveTextContent("Hi, good to see you again.");
+      expect(rows[0]).toHaveTextContent("88");
+      expect(rows[0]).toHaveTextContent("82");
+      expect(rows[0]).toHaveTextContent("2.4s");
+      // Free speaking: the start of what was said, and no invented score.
+      expect(rows[1]).toHaveTextContent("Free speaking: I would say my biggest strength is staying calm when things…");
+      expect(rows[1]).toHaveTextContent("Not scored");
+      expect(rows[2]).toHaveTextContent("100 (word matching)");
+      expect(mock.calls.find((c) => c.name === "listAttempts")?.args).toEqual([undefined, 20]);
+    });
+
+    it("says there is no practice yet", async () => {
+      mount(createMockIpc());
+      expect(await screen.findByText(/No practice yet/)).toBeInTheDocument();
+    });
+
+    it("keeps the charts when the history fails to load", async () => {
+      mount(createMockIpc({ fail: { listAttempts: "db locked" } }));
+      expect(await screen.findByText(/Could not load your practice history: db locked/)).toBeInTheDocument();
+      expect(screen.getAllByText("Reviews per day (last 30 days)").length).toBeGreaterThan(0);
+    });
   });
 });
