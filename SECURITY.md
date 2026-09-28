@@ -22,6 +22,12 @@ Check now. That request goes to `github.com` over HTTPS. Everything else —
 speech recognition, speech synthesis, grammar checking, scheduling — runs
 on-device with the network off.
 
+Settings → Diagnostics can save a text report to a file you choose, for
+attaching to a bug report. It is written locally and never sent by the app.
+It holds the version, platform, model status, settings and counts of decks,
+cards, reviews and practice attempts. It leaves out recordings, transcripts,
+card and prompt text, and the microphone's name.
+
 ## Model integrity
 
 Model files are large binaries that get loaded into the inference runtime, so

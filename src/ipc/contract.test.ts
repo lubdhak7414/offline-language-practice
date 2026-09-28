@@ -87,6 +87,7 @@ describe("Ipc implementations", () => {
         "renameDeck",
         "restartApp",
         "restoreDatabase",
+        "saveDiagnostics",
         "resumeDownloads",
         "reviewStats",
         "scoreAttempt",

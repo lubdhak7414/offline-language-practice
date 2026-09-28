@@ -907,6 +907,10 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       );
     },
 
+    saveDiagnostics(path: string) {
+      return record("saveDiagnostics", [path], undefined as void);
+    },
+
     epReport() {
       return record("epReport", [], "inference: cpu");
     },

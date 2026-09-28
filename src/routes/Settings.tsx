@@ -246,6 +246,21 @@ export function Settings(props: { announce: (msg: string) => void }) {
     }
   }, []);
 
+  const doSaveDiagnostics = useCallback(async () => {
+    const path = await ipc().pickSavePath({
+      title: "Save diagnostics",
+      defaultName: "olp-diagnostics.txt",
+      extensions: ["txt"],
+    });
+    if (!path) return;
+    try {
+      await ipc().saveDiagnostics(path);
+      setNotice(`Saved diagnostics to ${path}.`);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
   const doRestore = useCallback(async () => {
     if (restoring.current) return;
     const path = await ipc().pickOpenPath({ title: "Restore database", extensions: ["sqlite", "bak"] });
@@ -610,6 +625,15 @@ export function Settings(props: { announce: (msg: string) => void }) {
           </ul>
         )}
         <pre class="output">{epReport}</pre>
+        <div class="row">
+          <button type="button" onClick={() => void doSaveDiagnostics()}>
+            Save diagnostics to a file
+          </button>
+        </div>
+        <p class="muted">
+          For a bug report: versions, settings and counts only. No recordings, transcripts, cards or
+          microphone name.
+        </p>
       </section>
     </section>
   );

@@ -228,6 +228,10 @@ export const tauriIpc: Ipc = {
     return invoke<string>("ep_report");
   },
 
+  saveDiagnostics(path: string) {
+    return invoke<void>("save_diagnostics", { path });
+  },
+
   listModelCatalog() {
     return invoke<ModelGroup[]>("list_model_catalog", {});
   },

@@ -48,6 +48,10 @@ Notable changes to this project. The format follows
   of the calibration recordings (peak 0.086) and the fact that none reached
   0.99.
 
+- **Save diagnostics.** Settings can write a text report (versions, platform,
+  model status, settings, counts) for a bug report. No recordings,
+  transcripts, card text or microphone name are included.
+
 ### Changed
 
 - **Accessibility.** Buttons and control borders in dark mode now meet WCAG

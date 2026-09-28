@@ -519,6 +519,7 @@ export type Ipc = {
   // --- diagnostics ---
   modelStatus(): Promise<ModelStatus>;
   epReport(): Promise<string>;
+  saveDiagnostics(path: string): Promise<void>;
 
   // --- model downloads ---
   listModelCatalog(): Promise<ModelGroup[]>;

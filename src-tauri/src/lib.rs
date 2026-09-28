@@ -19,6 +19,7 @@ mod audio;
 mod backup;
 mod csvfmt;
 mod db;
+mod diagnostics;
 mod download;
 mod error;
 mod fluency;
@@ -1108,6 +1109,53 @@ fn list_voices() -> Vec<VoiceInfo> {
         .collect()
 }
 
+/// Write a text diagnostics report to `path` (chosen by the user in a save
+/// dialog). Counts and settings only: see `diagnostics` for what is left out.
+#[tauri::command]
+async fn save_diagnostics(
+    path: String,
+    app: tauri::AppHandle,
+    db: State<'_, DbInstances>,
+) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let prefs = crate::prefs::load(&pool).await.map_err(String::from)?;
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let cards = count("SELECT COUNT(*) FROM cards").await?;
+    let decks = count("SELECT COUNT(*) FROM decks").await?;
+    let reviews = count("SELECT COUNT(*) FROM review_logs").await?;
+    let attempts = count("SELECT COUNT(*) FROM attempts").await?;
+    let custom_prompts = count("SELECT COUNT(*) FROM prompts WHERE builtin = 0").await?;
+    let status = model_status();
+    let ep = crate::inference::describe_providers().to_string();
+    let version = app.package_info().version.to_string();
+    let bundle = crate::updates::bundle_name(tauri::utils::platform::bundle_type());
+    let text = crate::diagnostics::render(&crate::diagnostics::Snapshot {
+        version: &version,
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        bundle,
+        asr_model: status.asr_model,
+        asr_vocab: status.asr_vocab,
+        tts_voice: status.tts_voice,
+        ep_report: &ep,
+        prefs: &prefs,
+        cards,
+        decks,
+        reviews,
+        attempts,
+        custom_prompts,
+    });
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
 /// Human-readable execution-provider report (CUDA → CoreML → DirectML → …).
 #[tauri::command]
 fn ep_report() -> String {
@@ -2042,6 +2090,7 @@ pub fn run() {
             grade_card,
             optimize_parameters,
             ep_report,
+            save_diagnostics,
             get_retention,
             set_retention,
             add_card,

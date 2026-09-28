@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/preact";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/preact";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
@@ -47,6 +48,22 @@ describe("Settings", () => {
       const last = saves[saves.length - 1];
       expect((last?.args[0] as { practice_goal_attempts: number }).practice_goal_attempts).toBe(8);
     });
+  });
+
+  it("saves diagnostics to the chosen file, and does nothing when the dialog is cancelled", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({ pickSavePath: "/tmp/diag.txt" });
+    mount(mock);
+    await user.click(await screen.findByRole("button", { name: "Save diagnostics to a file" }));
+    expect(await screen.findByText(/Saved diagnostics to \/tmp\/diag\.txt/)).toBeInTheDocument();
+    expect(mock.calls.find((c) => c.name === "saveDiagnostics")?.args).toEqual(["/tmp/diag.txt"]);
+
+    const cancelled = createMockIpc();
+    cleanup();
+    restore?.();
+    mount(cancelled);
+    await user.click(await screen.findByRole("button", { name: "Save diagnostics to a file" }));
+    expect(cancelled.calls.some((c) => c.name === "saveDiagnostics")).toBe(false);
   });
 
   it("saves the practice goal", async () => {
