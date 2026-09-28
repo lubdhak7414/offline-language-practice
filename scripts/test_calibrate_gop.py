@@ -118,5 +118,73 @@ class Bootstrap(unittest.TestCase):
         self.assertLessEqual(fa, hi)
 
 
+class RepeatFlags(unittest.TestCase):
+    def rows(self):
+        def w(utt, word, human, now):
+            return f"test\t{utt}\t30\t0\t{word}\t{human}\t-1.0\t{now}\t0\t100"
+        lines = [OLD_HEADER,
+                 # speaker 0001: CAT flagged in 3 utterances (twice in the first), DOG in 1 of 2,
+                 # SUN said once and flagged, HAT said twice and never flagged
+                 w("000010001", "CAT", 2, 3), w("000010001", "Cat", 10, 5),
+                 w("000010002", "CAT", 4, 9), w("000010003", "CAT", 10, 0),
+                 w("000010001", "DOG", 6, 1), w("000010002", "DOG", 10, 100),
+                 w("000010002", "SUN", 9, 2),
+                 w("000010001", "HAT", 3, 50), w("000010003", "HAT", 3, 60),
+                 # speaker 0002 flags CAT in 2 utterances: same word, different speaker
+                 w("000020001", "CAT", 5, 4), w("000020002", "CAT", 10, 7),
+                 # not flagged at exactly FLAG_BELOW
+                 w("000020002", "SUN", 1, cg.FLAG_BELOW)]
+        return cg.parse(lines)
+
+    def test_flag_counts_are_per_speaker_and_per_utterance(self):
+        flagged = cg.flag_repeats(self.rows())
+        got = sorted((r["speaker"], r["word"], r["utt"][-1], r["nflag"], r["nutt"], r["human"])
+                     for r in flagged)
+        self.assertEqual(got, [
+            # CAT flagged twice in utterance 1 still counts that utterance once
+            ("0001", "cat", "1", 3, 3, 2), ("0001", "cat", "1", 3, 3, 10),
+            ("0001", "cat", "2", 3, 3, 4), ("0001", "cat", "3", 3, 3, 10),
+            ("0001", "dog", "1", 1, 2, 6),
+            ("0001", "sun", "2", 1, 1, 9),
+            ("0002", "cat", "1", 2, 2, 5), ("0002", "cat", "2", 2, 2, 10),
+        ])
+
+    def test_unflagged_and_at_cutoff_words_are_left_out(self):
+        flagged = cg.flag_repeats(self.rows())
+        self.assertFalse([r for r in flagged if r["word"] == "hat"])
+        self.assertFalse([r for r in flagged if r["speaker"] == "0002" and r["word"] == "sun"])
+
+    def test_precision_per_group_counts_each_flagged_instance(self):
+        flagged = cg.flag_repeats(self.rows())
+        once, twice, thrice, diff = cg.repeat_precision(flagged)
+        self.assertEqual(once, 1 / 2)      # dog (6: yes), sun (9: no)
+        self.assertEqual(twice, 3 / 6)     # 0001 cat (2, 10, 4, 10), 0002 cat (5, 10)
+        self.assertEqual(thrice, 2 / 4)    # 0001 cat only
+        self.assertEqual(diff, twice - once)
+
+    def test_empty_group_is_nan(self):
+        rows = [r for r in self.rows() if r["word"] != "cat"]
+        _, twice, thrice, diff = cg.repeat_precision(cg.flag_repeats(rows))
+        for x in (twice, thrice, diff):
+            self.assertNotEqual(x, x)
+
+    def test_report_counts_pairs_and_restricts_to_repeated_words(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cg.repeat_report(self.rows(), 50)
+        lines = out.getvalue().splitlines()
+        row = lambda block, name: next(
+            l for l in lines[lines.index(block):] if l.strip().startswith(name)).split()
+        all_words = "  all words: 8 flagged instances, 2 speakers"
+        repeated = "  words the speaker says in >= 2 utterances: 7 flagged instances, 2 speakers"
+        self.assertIn(all_words, lines)
+        self.assertIn(repeated, lines)  # sun (said once) drops out
+        # pairs, flags: exactly 1 -> dog, sun; >= 2 -> both cats; >= 3 -> speaker 0001's cat
+        self.assertEqual(row(all_words, "flagged in exactly 1")[-4:-2], ["2", "2"])
+        self.assertEqual(row(all_words, "flagged in >= 2")[-4:-2], ["2", "6"])
+        self.assertEqual(row(all_words, "flagged in >= 3")[-4:-2], ["1", "4"])
+        self.assertEqual(row(repeated, "flagged in exactly 1")[-4:-2], ["1", "1"])
+
+
 if __name__ == "__main__":
     unittest.main()

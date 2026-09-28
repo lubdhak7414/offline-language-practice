@@ -10,6 +10,7 @@ KINDS below).
     python3 scripts/calibrate-gop.py gop_dump.tsv
     python3 scripts/calibrate-gop.py gop_dump.tsv --cutoffs 10 20   # GOP cutoffs
     python3 scripts/calibrate-gop.py gop_dump.tsv --rust            # the table
+    python3 scripts/calibrate-gop.py gop_dump.tsv --repeat-flags    # repeat-flag precision
     python3 scripts/calibrate-gop.py gop_dump.tsv \\
         --eval-on cmuarctic.tsv l2arctic.tsv --by l1                # by first language
 
@@ -104,7 +105,8 @@ def parse(lines, src="<memory>"):
         age = (r.get("age") or "").strip()
         corpus = (r.get("corpus") or "").strip() or DEFAULTS["corpus"]
         rows.append({
-            "split": r["split"], "utt": r["utt"], "gop": float(r["gop"]), "now": int(r["score_now"]),
+            "split": r["split"], "utt": r["utt"], "word": r["word"].strip().lower(),
+            "gop": float(r["gop"]), "now": int(r["score_now"]),
             "human": human, "y": human * 10.0, "age": int(age) if age.isdigit() else None,
             "corpus": corpus,
             "l1": (r.get("l1") or "").strip() or DEFAULTS["l1"],
@@ -372,6 +374,71 @@ def bootstrap(rows, stat, key="speaker", n=1000, seed=BOOT_SEED, alpha=0.05):
     return out
 
 
+def flag_repeats(rows):
+    """Tag each flagged word instance with how often its speaker's word is flagged.
+
+    A row is flagged when its dump-time score (`now`) is below FLAG_BELOW. Sets,
+    on flagged rows only, `nflag` (distinct utterances of that speaker in which
+    the word is flagged, counting the row's own) and `nutt` (distinct utterances
+    of that speaker containing the word at all). Returns the flagged rows.
+    """
+    utts, flagged = {}, {}
+    for r in rows:
+        k = (r["corpus"], r["speaker"], r["word"])
+        utts.setdefault(k, set()).add(r["utt"])
+        if r["now"] < FLAG_BELOW:
+            flagged.setdefault(k, set()).add(r["utt"])
+    out = [r for r in rows if r["now"] < FLAG_BELOW]
+    for r in out:
+        k = (r["corpus"], r["speaker"], r["word"])
+        r["nflag"], r["nutt"] = len(flagged[k]), len(utts[k])
+    return out
+
+
+# Repeat-flag groups: name and the test on a flagged row's `nflag`. The last two
+# overlap by design (a word flagged in 3 utterances is also flagged in >= 2).
+REPEAT_GROUPS = (("flagged in exactly 1 utterance", lambda n: n == 1),
+                 ("flagged in >= 2 utterances", lambda n: n >= 2),
+                 ("flagged in >= 3 utterances", lambda n: n >= 3))
+
+
+def repeat_precision(flagged):
+    """Share of flagged instances truly mispronounced, per REPEAT_GROUPS, then the
+    difference (>= 2 minus exactly 1). NaN where a group is empty."""
+    def prec(sel):
+        return (sum(r["human"] <= MISPRONOUNCED_AT_OR_BELOW for r in sel) / len(sel)
+                if sel else float("nan"))
+    p = [prec([r for r in flagged if keep(r["nflag"])]) for _, keep in REPEAT_GROUPS]
+    return (*p, p[1] - p[0])
+
+
+def repeat_report(test, n_boot):
+    flagged = flag_repeats(test)
+    if not flagged:
+        print("\nrepeat flags: no flagged words in test")
+        return
+    pct = lambda x: "-" if x != x else f"{100 * x:.1f}%"
+    ci = lambda p: "-" if p[0] != p[0] else f"[{100 * p[0]:.1f}-{100 * p[1]:.1f}]"
+    dpt = lambda x: "-" if x != x else f"{100 * x:+.1f}"
+    dci = lambda p: "-" if p[0] != p[0] else f"[{100 * p[0]:+.1f} to {100 * p[1]:+.1f}]"
+    print(f"\nrepeat flags: precision of a flag (expert <= {MISPRONOUNCED_AT_OR_BELOW}) per flagged "
+          f"word instance, by how many utterances of the same speaker flag that word (flag = "
+          f"score < {FLAG_BELOW}); 95% CIs from {n_boot} bootstrap resamples (seed {BOOT_SEED}) "
+          "of whole speakers")
+    for title, sel in (("all words", flagged),
+                       ("words the speaker says in >= 2 utterances",
+                        [r for r in flagged if r["nutt"] >= 2])):
+        est = repeat_precision(sel)
+        cis = bootstrap(sel, repeat_precision, n=n_boot)
+        print(f"  {title}: {len(sel)} flagged instances, {len({r['speaker'] for r in sel})} speakers")
+        print(f"    {'group':32} {'pairs':>6} {'flags':>6}  {'precision':>9}  95% CI")
+        for i, (name, keep) in enumerate(REPEAT_GROUPS):
+            grp = [r for r in sel if keep(r["nflag"])]
+            pairs = len({(r["corpus"], r["speaker"], r["word"]) for r in grp})
+            print(f"    {name:32} {pairs:6} {len(grp):6}  {pct(est[i]):>9}  {ci(cis[i])}")
+        print(f"    {'>= 2 minus exactly 1 (points)':32} {'':6} {'':6}  {dpt(est[3]):>9}  {dci(cis[3])}")
+
+
 def group_key(by):
     if by == "age":
         return lambda r: ("unknown" if r["age"] is None
@@ -438,7 +505,11 @@ def main(argv=None):
                     help="extra dumps that are only measured, never fitted")
     ap.add_argument("--by", choices=["l1", "corpus", "age", "speaker"],
                     help="false alarms, catch rate, precision and AUC per group, with CIs")
-    ap.add_argument("--boot", type=int, default=1000, help="bootstrap resamples for --by")
+    ap.add_argument("--boot", type=int, default=1000,
+                    help="bootstrap resamples for --by and --repeat-flags")
+    ap.add_argument("--repeat-flags", action="store_true",
+                    help="is a word flagged in >= 2 utterances of one speaker more often truly "
+                         "mispronounced than one flagged once? (test split, speaker bootstrap)")
     ap.add_argument("--rust", action="store_true",
                     help="print the percentile table for pronounce.rs (shippable corpora only)")
     ap.add_argument("--cutoffs", type=float, nargs="*", default=[],
@@ -542,6 +613,9 @@ def main(argv=None):
         for r in pool:
             r["table"] = interp(knots, r["gop"])
         by_report(pool, args.by, args.boot)
+
+    if args.repeat_flags:
+        repeat_report(test, args.boot)
 
     if args.rust:
         print_rust(knots)
