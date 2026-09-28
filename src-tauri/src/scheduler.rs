@@ -897,40 +897,6 @@ pub async fn undo_last_review(pool: &sqlx::SqlitePool) -> Result<Option<UndoResu
     }))
 }
 
-/// Seed 3 demo EN/ES cards so first-run review is non-empty.
-///
-/// Cards (`INSERT OR IGNORE`): ids `demo-1..3`, `deck_id = "default"`,
-/// `created_at = now`. No `card_memory_states` row is written, so demo cards
-/// are genuinely new exactly like `add_card` output. Seeding one previously
-/// set `last_review_date = 0`, which made the first grade compute an elapsed
-/// time of ~20,000 days and persist it as the review's `delta_t`.
-///
-/// Returns the number of card rows actually inserted (0..3).
-pub async fn seed_demo_deck(pool: &sqlx::SqlitePool) -> Result<usize, AppError> {
-    let now = now_unix();
-    let demo: [(&str, &str, &str); 3] = [
-        ("demo-1", "Hello", "Hola"),
-        ("demo-2", "Good morning", "Buenos días"),
-        ("demo-3", "Thank you", "Gracias"),
-    ];
-    let mut inserted: usize = 0;
-    for (id, front, back) in demo {
-        let r = sqlx::query(
-            "INSERT OR IGNORE INTO cards (id, deck_id, content_front, content_back, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind("default")
-        .bind(front)
-        .bind(back)
-        .bind(now)
-        .execute(pool)
-        .await?;
-        inserted += r.rows_affected() as usize;
-    }
-    Ok(inserted)
-}
-
 /// Insert a new card (no memory row, so it is new/due immediately).
 ///
 /// Returns the new card's uuid. `deck_id`, `front`, and `back` must all be
@@ -1929,18 +1895,6 @@ mod tests {
                 .await
                 .expect("migration 4 must be re-runnable");
         }
-    }
-
-    #[tokio::test]
-    async fn seed_uses_default_deck() {
-        let pool = mem_pool().await;
-        let n = seed_demo_deck(&pool).await.unwrap();
-        assert_eq!(n, 3);
-        let distinct: Vec<String> = sqlx::query_scalar("SELECT DISTINCT deck_id FROM cards")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(distinct, vec!["default".to_string()]);
     }
 
     #[tokio::test]

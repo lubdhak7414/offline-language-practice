@@ -415,7 +415,6 @@ export type Ipc = {
   listCards(deckId?: string): Promise<CardRow[]>;
   addCard(deckId: string, front: string, back: string): Promise<string>;
   deleteCard(cardId: string): Promise<void>;
-  seedDemoDeck(): Promise<number>;
   listTags(): Promise<TagRow[]>;
   setCardTags(cardId: string, tags: string[]): Promise<string[]>;
   suspendCard(cardId: string, suspended: boolean): Promise<void>;

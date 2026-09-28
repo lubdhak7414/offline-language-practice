@@ -913,17 +913,6 @@ async fn set_daily_limits(
         .map_err(String::from)
 }
 
-/// Seed the demo deck. Full-path call avoids colliding with this command name.
-///
-/// Contract: returns the inserted count so the frontend can toast it.
-#[tauri::command]
-async fn seed_demo_deck(db: State<'_, DbInstances>) -> Result<usize, String> {
-    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
-    crate::scheduler::seed_demo_deck(&pool)
-        .await
-        .map_err(String::from)
-}
-
 /// Re-optimize FSRS weights from review logs, swap them into `AppState`, return them.
 ///
 /// On success updates BOTH `fsrs` and the cached `params` (so `read_decay`
@@ -1980,7 +1969,6 @@ pub fn run() {
             synthesize_speech,
             due_cards,
             grade_card,
-            seed_demo_deck,
             optimize_parameters,
             ep_report,
             get_retention,

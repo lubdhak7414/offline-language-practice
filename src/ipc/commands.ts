@@ -142,10 +142,6 @@ export const tauriIpc: Ipc = {
     return invoke<void>("delete_card", { cardId });
   },
 
-  seedDemoDeck() {
-    return invoke<number>("seed_demo_deck");
-  },
-
   startSession(kind: string) {
     return invoke<string>("start_session", { kind });
   },

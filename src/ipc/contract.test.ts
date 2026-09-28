@@ -87,7 +87,6 @@ describe("Ipc implementations", () => {
         "resumeDownloads",
         "reviewStats",
         "scoreAttempt",
-        "seedDemoDeck",
         "seedPrompts",
         "setCardTags",
         "setDailyLimits",

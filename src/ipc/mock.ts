@@ -516,10 +516,6 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       return record("deleteCard", [cardId], undefined as void);
     },
 
-    seedDemoDeck() {
-      return record("seedDemoDeck", [], 0);
-    },
-
     listTags() {
       const counts = new Map<string, number>();
       for (const c of cards) for (const t of c.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
