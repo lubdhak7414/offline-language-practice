@@ -285,6 +285,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
             </button>
           ))}
         </div>
+      </header>
+      <div class="row practice-filters">
         <div class="segmented" role="group" aria-label="Level">
           {LEVELS.map((l) => (
             <button
@@ -303,7 +305,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
             </button>
           ))}
         </div>
-      </header>
+      </div>
 
       {!asrReady && (
         <p class="notice notice-blocking">

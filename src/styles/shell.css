@@ -159,6 +159,10 @@ label {
   flex-wrap: wrap;
 }
 
+.practice-filters {
+  margin: 0 0 var(--space-4);
+}
+
 .segmented {
   display: inline-flex;
   border: 1px solid var(--border-strong);

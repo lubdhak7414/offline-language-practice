@@ -4,7 +4,7 @@ A desktop language-learning app that runs entirely on your machine — speech re
 
 Everything happens on-device: the speech model, the voice synthesis, the grammar checker, and the scheduling algorithm all run locally, so it works on a plane with no wifi and never sends your voice or your study data anywhere.
 
-![Offline Language Practice — record, transcribe, and grammar-check a phrase](docs/screenshot.png)
+![Offline Language Practice — the Practice screen with a read-aloud prompt, ready to record](docs/screenshot.png)
 
 ## Features
 
