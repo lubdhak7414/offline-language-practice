@@ -43,8 +43,13 @@ feedback and spaced repetition, running entirely on-device.
   voice models with progress, pause, resume and cancel. Downloads resume
   after an interruption, are verified by sha256 before installation, and are
   also reachable from Settings.
+- **Opt-in updates.** Off by default. When turned on, the app checks GitHub
+  once per launch; "Check now" is always available. AppImage, macOS and
+  Windows copies install signed updates in place; .deb/.rpm copies are told a
+  new version exists.
 - **Offline by construction.** No account, no telemetry, no cloud calls. The
-  only network request the app makes is fetching model files.
+  app goes online only to fetch model files and, if you opt in, to check
+  GitHub for a new version.
 
 ### License
 
@@ -64,6 +69,9 @@ feedback and spaced repetition, running entirely on-device.
   export are written unchanged.
 - Releases publish `SHA256SUMS` and build provenance attestations. Binaries
   are not code-signed — see SECURITY.md for why, and how to verify them.
+- Updates are minisign-signed in CI, bound to their version, and verified
+  before installation; `latest.json` and the signatures are in `SHA256SUMS`
+  and attested. The web view is granted none of the updater's commands.
 
 ### Known limitations
 
@@ -79,6 +87,5 @@ feedback and spaced repetition, running entirely on-device.
 - Release builds cover Linux (x86_64), macOS (Apple Silicon) and Windows
   (x86_64). Intel Macs are not supported: the ONNX Runtime binding ships no
   prebuilt library for them.
-- Automatic updates are disabled. Updating means downloading a new release.
 
 [0.1.0]: https://github.com/lubdhak7414/offline-language-practice/releases/tag/v0.1.0

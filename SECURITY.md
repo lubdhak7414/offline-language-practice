@@ -14,11 +14,13 @@ It is an offline desktop app. It has no account, no server, no telemetry, and
 no analytics. Practice audio, transcripts and review history stay in a local
 SQLite database and are never transmitted.
 
-The app makes network requests in exactly one situation: downloading model
-files, either during first-run onboarding or from Settings. Those requests go
-to `huggingface.co` over HTTPS and nowhere else. Everything else — speech
-recognition, speech synthesis, grammar checking, scheduling — runs on-device
-with the network off.
+The app makes network requests in exactly two situations. The first is
+downloading model files, during first-run onboarding or from Settings. Those
+requests go to `huggingface.co` over HTTPS. The second is checking for
+updates, which is **off unless you turn it on**, plus pressing Settings →
+Check now. That request goes to `github.com` over HTTPS. Everything else —
+speech recognition, speech synthesis, grammar checking, scheduling — runs
+on-device with the network off.
 
 ## Model integrity
 
@@ -81,9 +83,34 @@ claim than most code signatures make. It does not prove the code is safe.
 
 ## Automatic updates
 
-Disabled. Enabling the Tauri updater needs a minisign keypair held in CI and a
-hosted update endpoint; shipping it half-configured would be worse than not
-shipping it. Until then, updates are manual.
+Off by default. When you turn on "Check for a new version each time the app
+starts" (Settings, or the model-download step of setup), the app fetches
+`https://github.com/lubdhak7414/offline-language-practice/releases/latest/download/latest.json`
+once per launch. "Check now" does the same once, when pressed. The request
+contains no information about you or your practice; GitHub sees your IP
+address and a `tauri-plugin-updater` user agent, as with any connection. The
+decision is enforced in the app's Rust code, not in its web view.
+
+Updates are signed with a minisign key held only in this repository's CI
+secrets. The app carries the public key, rejects any download whose signature
+does not verify, and rejects a signature made for a different version than
+the one announced (`requireSignedVersion`). An update is installed only when
+you press Install.
+
+- **AppImage, macOS, Windows (NSIS or MSI):** the app downloads, verifies and
+  installs the update, then restarts. On Windows the installer closes the app
+  and reopens it.
+- **.deb and .rpm:** the app tells you a new version exists but does not
+  install it. Your package manager owns those files, and installing a package
+  needs root, which the app will not ask for.
+- **macOS:** run the app from `/Applications` after removing the quarantine
+  flag (see Code signing). A copy launched straight from Downloads runs from a
+  read-only location and cannot update itself.
+
+`latest.json` and every `.sig` file are listed in `SHA256SUMS` and covered by
+the build attestation, like the installers. Only published, non-pre-release
+releases are ever offered: GitHub's `releases/latest` does not resolve to a
+draft or a pre-release.
 
 ## Hardening in the app
 
@@ -91,7 +118,9 @@ shipping it. Until then, updates are manual.
   (`app.security.csp` in `src-tauri/tauri.conf.json`). `object-src` is
   `none`, `frame-ancestors` is `none`, and `connect-src` does not include
   any remote origin — the webview cannot reach the network at all. Model
-  downloads happen in Rust, not in the webview.
+  downloads and update checks happen in Rust, not in the webview.
+- The web view holds no updater capability. `updater:*` permissions are not
+  granted; checks and installs go through the app's own Rust commands.
 - The frontend holds no SQL capability. `sql:*` permissions are deliberately
   not granted; every database access goes through the app's own Rust
   commands, which use bound parameters throughout.

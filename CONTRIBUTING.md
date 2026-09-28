@@ -11,8 +11,10 @@ finding, licensing, hashing and shipping a new model for each subsystem.
 Multi-language support is out of scope; a fork is a reasonable answer.
 
 Anything that sends user audio, transcripts or review history off the machine
-is out of scope too. The only network request the app makes is downloading
-model files from a pinned URL.
+is out of scope too. The only network requests the app makes are downloading
+model files from a pinned URL and, only if the user opts in (or presses Check
+now), asking this repository's GitHub Releases for a newer version. Keep it
+that way: a new request needs the same opt-in and a SECURITY.md entry.
 
 ## Getting set up
 
