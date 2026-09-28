@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/preact";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
@@ -60,6 +60,17 @@ describe("Settings", () => {
     const notice = await screen.findByText(/No voice is installed/);
     expect(notice).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Test voice" })).toBeDisabled();
+  });
+
+  it("explains a busy voice instead of showing the raw error", async () => {
+    const mock = createMockIpc({ voices: [{ id: "v1", label: "Voice one" }] });
+    vi.spyOn(mock, "synthesizeSpeech").mockRejectedValue("TTS_BUSY: queue full");
+    mount(mock);
+    const button = await screen.findByRole("button", { name: "Test voice" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(await screen.findByText(/Still speaking/)).toBeInTheDocument();
+    expect(screen.queryByText(/TTS_BUSY/)).not.toBeInTheDocument();
   });
 
   it("gates the optimizer on the real training-data numbers", async () => {

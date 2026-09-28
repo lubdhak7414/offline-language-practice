@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { friendlyAsrError, friendlyTtsError, isTtsBusy } from "./errors";
+import { friendlyAsrError, friendlyMicError, friendlyTtsError, isTtsBusy } from "./errors";
 
 describe("friendlyAsrError", () => {
   it("translates each backend prefix", () => {
@@ -20,5 +20,20 @@ describe("tts errors", () => {
     expect(isTtsBusy("TTS_BUSY: queue full")).toBe(true);
     expect(isTtsBusy("something else")).toBe(false);
     expect(friendlyTtsError("TTS_BUSY: queue full")).toMatch(/Still speaking/);
+  });
+});
+
+describe("friendlyMicError", () => {
+  it("names what to do for each getUserMedia failure", () => {
+    expect(friendlyMicError(new DOMException("denied", "NotAllowedError"))).toMatch(/blocked/);
+    expect(friendlyMicError(new DOMException("none", "NotFoundError"))).toMatch(/No microphone/);
+    expect(friendlyMicError(new DOMException("busy", "NotReadableError"))).toMatch(/in use/);
+  });
+
+  it("keeps an unrecognised error's text", () => {
+    expect(friendlyMicError(new Error("driver crashed"))).toBe(
+      "Microphone unavailable: Error: driver crashed",
+    );
+    expect(friendlyMicError("plain")).toBe("Microphone unavailable: plain");
   });
 });

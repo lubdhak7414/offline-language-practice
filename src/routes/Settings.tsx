@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
+import { createClipPlayer, speak } from "../lib/audio/player";
+import { friendlyTtsError } from "../lib/errors";
 import { ModelDownloads } from "../components/ModelDownloads";
 import type {
   BackupInfo,
@@ -33,6 +35,13 @@ export function Settings(props: { announce: (msg: string) => void }) {
 
   const optimizing = useRef(false);
   const restoring = useRef(false);
+  const player = useRef(createClipPlayer());
+  const speaking = useRef(false);
+
+  useEffect(() => {
+    const clips = player.current;
+    return () => clips.stop();
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -91,15 +100,14 @@ export function Settings(props: { announce: (msg: string) => void }) {
   );
 
   const testVoice = useCallback(async () => {
+    if (speaking.current) return;
+    speaking.current = true;
     try {
-      const chunks: BlobPart[] = [];
-      await ipc().synthesizeSpeech("This is what the selected voice sounds like.", (buf) =>
-        chunks.push(new Uint8Array(buf)),
-      );
-      const audio = new Audio(URL.createObjectURL(new Blob(chunks, { type: "audio/wav" })));
-      void audio.play();
+      await speak("This is what the selected voice sounds like.", player.current);
     } catch (e) {
-      setError(String(e));
+      setError(friendlyTtsError(e));
+    } finally {
+      speaking.current = false;
     }
   }, []);
 

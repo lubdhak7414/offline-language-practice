@@ -29,3 +29,23 @@ export function friendlyTtsError(e: unknown): string {
   if (isTtsBusy(e)) return "Still speaking — wait a moment and try again.";
   return `Speech playback is unavailable: ${String(e)}`;
 }
+
+/**
+ * `getUserMedia` failures by DOMException name. The names are what browsers
+ * and WebKitGTK/WebView2 actually throw; the message text is not stable.
+ */
+const MIC_MESSAGES: Readonly<Record<string, string>> = {
+  NotAllowedError:
+    "Microphone access was blocked — allow it for this app in your system settings, then try again.",
+  SecurityError:
+    "Microphone access was blocked — allow it for this app in your system settings, then try again.",
+  NotFoundError: "No microphone found — plug one in and try again.",
+  OverconstrainedError: "No microphone found — plug one in and try again.",
+  NotReadableError: "The microphone is in use by another app — close it and try again.",
+  AbortError: "The microphone is in use by another app — close it and try again.",
+};
+
+export function friendlyMicError(e: unknown): string {
+  const name = typeof e === "object" && e !== null && "name" in e ? String(e.name) : "";
+  return MIC_MESSAGES[name] ?? `Microphone unavailable: ${String(e)}`;
+}

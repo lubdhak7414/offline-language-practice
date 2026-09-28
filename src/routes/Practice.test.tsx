@@ -212,4 +212,101 @@ describe("Practice", () => {
     mount(createMockIpc({ fail: { nextPrompt: new Error("db is gone") } }));
     expect(await screen.findByText(/db is gone/)).toBeInTheDocument();
   });
+
+  describe("audio and saving", () => {
+    let played: number;
+    beforeEach(() => {
+      played = 0;
+      vi.stubGlobal("URL", {
+        ...URL,
+        createObjectURL: () => "blob:test",
+        revokeObjectURL: () => {},
+      });
+      vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(() => {
+        played++;
+        return Promise.resolve();
+      });
+      vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    async function recordOnce(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByRole("button", { name: /^(Record|Try again)/ }));
+      await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+      await screen.findByRole("button", { name: "Next prompt" });
+    }
+
+    it("saves a phrase once, however often the button is pressed", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await recordOnce(user);
+
+      const save = screen.getByRole("button", { name: "Save phrase to review" });
+      await user.dblClick(save);
+      expect(await screen.findByRole("button", { name: "Saved to review" })).toBeDisabled();
+      expect(mock.calls.filter((c) => c.name === "addCard")).toHaveLength(1);
+
+      // Trying the same prompt again does not offer to save it twice.
+      await recordOnce(user);
+      expect(screen.getByRole("button", { name: "Saved to review" })).toBeDisabled();
+    });
+
+    it("plays back the learner's own recording", async () => {
+      const user = userEvent.setup();
+      mount(createMockIpc());
+      await screen.findByText("Reply to a greeting:");
+      expect(screen.queryByRole("button", { name: "Play my recording" })).not.toBeInTheDocument();
+      await recordOnce(user);
+      await user.click(screen.getByRole("button", { name: "Play my recording" }));
+      expect(played).toBe(1);
+
+      // The clip goes with the prompt.
+      await user.click(screen.getByRole("button", { name: "Next prompt" }));
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: "Play my recording" })).not.toBeInTheDocument(),
+      );
+    });
+
+    it("stops playback when a new recording starts", async () => {
+      const user = userEvent.setup();
+      const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+      mount(createMockIpc());
+      await screen.findByText("Reply to a greeting:");
+      await recordOnce(user);
+      await user.click(screen.getByRole("button", { name: "Play my recording" }));
+      pause.mockClear();
+      await user.click(screen.getByRole("button", { name: /^Try again/ }));
+      expect(pause).toHaveBeenCalled();
+    });
+
+    it("explains a busy voice instead of showing the raw error", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      vi.spyOn(mock, "synthesizeSpeech").mockRejectedValue("TTS_BUSY: queue full");
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await user.click(screen.getByRole("button", { name: /^Listen/ }));
+      expect(await screen.findByRole("alert")).toHaveTextContent(/Still speaking/);
+      expect(screen.queryByText(/TTS_BUSY/)).not.toBeInTheDocument();
+    });
+
+    it("ignores a second Listen while the first is still being synthesized", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      let release: () => void = () => {};
+      const spy = vi.spyOn(mock, "synthesizeSpeech").mockImplementation(
+        () => new Promise<number>((r) => (release = () => r(22050))),
+      );
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      const listen = screen.getByRole("button", { name: /^Listen/ });
+      await user.click(listen);
+      await user.click(listen);
+      expect(spy).toHaveBeenCalledTimes(1);
+      release();
+      await waitFor(() => expect(played).toBe(1));
+    });
+  });
 });

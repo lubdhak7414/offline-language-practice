@@ -3,7 +3,9 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ipc } from "../ipc/commands";
 import type { AttemptReport, LintReport, PromptView } from "../ipc/types";
 import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
-import { friendlyAsrError } from "../lib/errors";
+import { createClipPlayer, speak } from "../lib/audio/player";
+import { f32ToWav } from "../lib/audio/wav";
+import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { goPrefix } from "../lib/globalKeys";
 import { practiceKeyAction } from "../lib/keyboard";
 import {
@@ -34,6 +36,16 @@ export function Practice(props: { announce: (msg: string) => void }) {
   const [level, setLevel] = useState(0);
   const [asrReady, setAsrReady] = useState(true);
   const recorder = useRef(createRecorder());
+  const player = useRef(createClipPlayer());
+  // One Listen at a time: the TTS worker queues, so a double-press would
+  // otherwise play the prompt twice back to back.
+  const speakingRef = useRef(false);
+  // The last attempt's audio, kept in memory only so it can be played back
+  // next to the feedback. Dropped with the prompt.
+  const [lastPcm, setLastPcm] = useState<Uint8Array | null>(null);
+  // A saved phrase is a new card every time, so the button saves once per prompt.
+  const [savedPromptId, setSavedPromptId] = useState<string | null>(null);
+  const savingRef = useRef(false);
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   // The Lab's one irreplaceable feature: checking arbitrary writing, not
@@ -67,6 +79,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
       const seq = ++promptSeq.current;
       setError(null);
       setReport(null);
+      setLastPcm(null);
       setStage("prompt");
       try {
         const next = await ipc().nextPrompt({
@@ -114,8 +127,10 @@ export function Practice(props: { announce: (msg: string) => void }) {
   // Never leave the microphone open when the route unmounts.
   useEffect(() => {
     const active = recorder.current;
+    const clips = player.current;
     return () => {
       active.cancel();
+      clips.stop();
       clearInterval(timer.current);
     };
   }, []);
@@ -126,6 +141,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
     setStage("scoring");
     try {
       const rec = await recorder.current.stop();
+      setLastPcm(rec.pcm);
       const report = await ipc().scoreAttempt({
         pcm: rec.pcm,
         sampleRate: 16000,
@@ -147,6 +163,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
   }, [announce, prompt, sessionId]);
 
   const startRecording = useCallback(async () => {
+    // The microphone would otherwise pick up the prompt or the last attempt.
+    player.current.stop();
     setError(null);
     setElapsedMs(0);
     try {
@@ -162,22 +180,31 @@ export function Practice(props: { announce: (msg: string) => void }) {
         if (ms >= MAX_RECORDING_MS) void stopAndScore();
       }, 100);
     } catch (e) {
-      setError(`Microphone unavailable: ${String(e)}`);
+      setError(friendlyMicError(e));
     }
   }, [announce, stopAndScore]);
 
   const speakPrompt = useCallback(async () => {
     const text = prompt?.target_text ?? prompt?.prompt_text;
-    if (!text) return;
+    if (!text || speakingRef.current) return;
+    speakingRef.current = true;
     try {
-      const chunks: BlobPart[] = [];
-      await ipc().synthesizeSpeech(text, (buf) => chunks.push(new Uint8Array(buf)));
-      const audio = new Audio(URL.createObjectURL(new Blob(chunks, { type: "audio/wav" })));
-      void audio.play();
+      await speak(text, player.current);
     } catch (e) {
-      setError(`Could not play the prompt: ${String(e)}`);
+      setError(friendlyTtsError(e));
+    } finally {
+      speakingRef.current = false;
     }
   }, [prompt]);
+
+  const playRecording = useCallback(async () => {
+    if (!lastPcm) return;
+    try {
+      await player.current.play([f32ToWav(lastPcm, 16000)]);
+    } catch (e) {
+      setError(`Could not play your recording: ${String(e)}`);
+    }
+  }, [lastPcm]);
 
   // Same pattern as the review keys: the rule is pure and tested, and the
   // listener reads current state through a ref so it never has to be
@@ -212,14 +239,18 @@ export function Practice(props: { announce: (msg: string) => void }) {
   }, []);
 
   const saveToReview = useCallback(async () => {
-    if (!prompt?.target_text) return;
+    if (!prompt?.target_text || savingRef.current || savedPromptId === prompt.id) return;
+    savingRef.current = true;
     try {
       await ipc().addCard("default", prompt.target_text, prompt.prompt_text);
+      setSavedPromptId(prompt.id);
       announce("Saved to your review deck.");
     } catch (e) {
       setError(String(e));
+    } finally {
+      savingRef.current = false;
     }
-  }, [announce, prompt]);
+  }, [announce, prompt, savedPromptId]);
 
   return (
     <section class="route">
@@ -245,7 +276,11 @@ export function Practice(props: { announce: (msg: string) => void }) {
           Install it and reopen this screen.
         </p>
       )}
-      {error && <p class="notice notice-error">{error}</p>}
+      {error && (
+        <p class="notice notice-error" role="alert">
+          {error}
+        </p>
+      )}
 
       {!prompt && !error && <p class="muted">Loading a prompt…</p>}
 
@@ -360,11 +395,21 @@ export function Practice(props: { announce: (msg: string) => void }) {
             <button type="button" class="primary" onClick={() => void loadPrompt(sessionId, category)}>
               Next prompt
             </button>
-            {prompt?.target_text && (
-              <button type="button" onClick={() => void saveToReview()}>
-                Save phrase to review
+            {lastPcm && (
+              <button type="button" onClick={() => void playRecording()}>
+                Play my recording
               </button>
             )}
+            {prompt?.target_text &&
+              (savedPromptId === prompt.id ? (
+                <button type="button" disabled>
+                  Saved to review
+                </button>
+              ) : (
+                <button type="button" onClick={() => void saveToReview()}>
+                  Save phrase to review
+                </button>
+              ))}
           </div>
         </article>
       )}

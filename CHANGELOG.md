@@ -16,6 +16,9 @@ feedback and spaced repetition, running entirely on-device.
   (speaking rate, pauses, fillers) and offline grammar feedback with in-place
   suggestions. About 120 built-in prompts across everyday conversation and
   job interviews.
+- **Hear yourself.** After an attempt, play your own recording next to the
+  feedback and the voice's reading of the prompt. The recording stays in
+  memory and is dropped with the prompt; it is never written to disk.
 - **Pronunciation feedback calibrated against expert ratings.** The score
   comes from a table measured against speechocean762's expert ratings.
   Individual words are only marked "check" when they are worth another
