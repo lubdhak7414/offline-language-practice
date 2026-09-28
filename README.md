@@ -24,7 +24,21 @@ Getting five separate subsystems (speech recognition, speech synthesis, grammar 
 - Audio, grammar checking, and database writes each get their own thread pool so a slow model-loading step or a spaced-repetition parameter refit never freezes the UI.
 - CI enforces that `package.json`, `tauri.conf.json`, and `Cargo.toml` all report the same version number before anything else runs, and denies any Rust lint warning outright.
 
+## Download
+
+Installers are on the [Releases page](https://github.com/lubdhak7414/offline-language-practice/releases):
+
+| Platform | File |
+|---|---|
+| Linux (x86_64) | `.AppImage` (can update itself), `.deb` or `.rpm` |
+| macOS (Apple Silicon) | `.dmg` |
+| Windows (x86_64) | `_x64-setup.exe` or `.msi` |
+
+The files are not code-signed, so macOS and Windows warn before the first launch. SECURITY.md explains why, how to get past the warning, and how to check a download against `SHA256SUMS` and its build attestation. The app downloads its speech models on first run.
+
 ## Quick start
+
+To run from source instead:
 
 ```bash
 npm install
