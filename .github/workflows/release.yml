@@ -205,7 +205,11 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libxdo-dev \
-            libssl-dev
+            libssl-dev \
+            xvfb \
+            xauth
+      # (xvfb, xauth: only for the bundle smoke test after the build. Installed
+      # here so a mirror hiccup costs seconds, not the ~40 minutes of build.)
       # espeak needs cmake at build time; every hosted runner ships one.
       - run: cmake --version
 
@@ -244,6 +248,31 @@ jobs:
           # asset URLs, and would advertise .deb/.rpm installs.
           uploadUpdaterJson: false
           uploadUpdaterSignatures: true
+
+      # Does what was just built install and boot anywhere but here? The .deb
+      # is unpacked into a scratch root and the AppImage is extracted, and each
+      # is run on a private Xvfb with scratch XDG dirs: the espeak-ng data must
+      # ship in the bundle, and the app must stay up, create app.db and print
+      # no panic. TTS once worked only on the builder's machine because the
+      # data was found through a path in the build tree; nothing but running
+      # the shipped bundle can show that. It checks the very bundle this leg
+      # built, so it costs about a minute; the same check in ci.yml would need
+      # a second full release build on every PR. No secrets are in this step's
+      # env and it uploads nothing. The bundles are already in the draft by
+      # now, so a failure here turns the run red without removing them: like
+      # any partial build, `attest` still runs and the run still ends red.
+      - name: Smoke-test the Linux bundles
+        if: runner.os == 'Linux'
+        run: |
+          deb=$(find "$CARGO_TARGET_DIR" -path '*/bundle/deb/*.deb')
+          appimage=$(find "$CARGO_TARGET_DIR" -path '*/bundle/appimage/*.AppImage')
+          for f in "$deb" "$appimage"; do
+            if [ -z "$f" ] || [ "$(printf '%s\n' "$f" | wc -l)" -ne 1 ]; then
+              echo "::error::Expected exactly one .deb and one .AppImage under $CARGO_TARGET_DIR; got: '$deb' '$appimage'"
+              exit 1
+            fi
+          done
+          scripts/bundle-smoke.sh "$deb" "$appimage"
 
   # Checksums and provenance are the whole security story for an unsigned
   # release, so they are produced once, over every platform's output, rather

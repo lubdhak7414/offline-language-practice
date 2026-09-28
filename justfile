@@ -40,6 +40,12 @@ e2e-restore:
     cargo build --manifest-path {{manifest}}
     scripts/restore-e2e.sh
 
+# Unpack a built .deb (and .AppImage) into a scratch root and boot it on a
+# private Xvfb, as the release workflow does. Linux only; needs xvfb-run.
+#   just bundle-smoke src-tauri/target/release/bundle/deb/*.deb
+bundle-smoke deb appimage="":
+    scripts/bundle-smoke.sh {{deb}} {{appimage}}
+
 # Dependency audit: advisories, licenses, duplicate crates, source origins.
 deny:
     cargo deny --manifest-path {{manifest}} check
