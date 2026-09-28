@@ -49,7 +49,7 @@
       "preload": ["sqlite:app.db"]
     },
     "updater": {
-      "pubkey": "PLACEHOLDER-replace-with-the-owner-minisign-public-key",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1QTYzODBGQ0FCNkU5OEYKUldTUDZiYktEemltVldST0ZpYit5WGhFbEJSeWd1Nzd3ays5WklyZi9aenVkR0ZKMnZKYXgxbHAK",
       "endpoints": [
         "https://github.com/lubdhak7414/offline-language-practice/releases/latest/download/latest.json"
       ],
