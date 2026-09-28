@@ -378,7 +378,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
       </ul>
 
       {deleteTarget && (
-        <article class="confirm-panel" role="alertdialog" aria-label="Confirm deck delete">
+        <div class="confirm-panel" role="alertdialog" aria-label="Confirm deck delete">
           <p>
             Delete "{deleteTarget.name}"? It has {deleteTarget.card_count} card(s).
           </p>
@@ -410,7 +410,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
               Cancel
             </button>
           </div>
-        </article>
+        </div>
       )}
 
       {selected && <DeckLimits key={selected} deckId={selected} announce={announce} />}
