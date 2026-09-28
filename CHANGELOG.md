@@ -4,6 +4,8 @@ Notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.1.0] — 2026-09-28
 
 First release. Speaking practice, pronunciation and fluency scoring, grammar
@@ -88,4 +90,5 @@ feedback and spaced repetition, running entirely on-device.
   (x86_64). Intel Macs are not supported: the ONNX Runtime binding ships no
   prebuilt library for them.
 
+[Unreleased]: https://github.com/lubdhak7414/offline-language-practice/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/lubdhak7414/offline-language-practice/releases/tag/v0.1.0

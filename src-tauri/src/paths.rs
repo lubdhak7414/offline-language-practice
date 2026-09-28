@@ -1,8 +1,9 @@
 //! Extra model search roots, resolved once at startup.
 //!
 //! On-device weights live outside the binary: dev trees use CWD-relative
-//! `models/` dirs, while installed bundles ship them under Tauri's resource
-//! dir (`$RESOURCE/models/` via `bundle.resources`). The neural workers run
+//! `models/` dirs; installed apps download them into the app-data dir's
+//! `models/`, and `$RESOURCE/models/` is also searched in case a packager
+//! ships weights there (the bundle itself does not). The neural workers run
 //! on threads without an app handle, so `run()` snapshots the resolved dirs
 //! here and the `asr`/`tts` loaders consult them after their CWD candidates.
 

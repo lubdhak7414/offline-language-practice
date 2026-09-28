@@ -8,11 +8,11 @@ Everything happens on-device: the speech model, the voice synthesis, the grammar
 
 ## Features
 
-- **Speaking practice** — pick a prompt, record yourself, and get scored: a sentence-level pronunciation score from CTC forced alignment, with words worth another listen marked, plus fluency (speaking rate, pauses, fillers) and grammar. About 120 built-in prompts across everyday conversation and job interviews.
+- **Speaking practice** — pick a prompt, record yourself, and get scored: a sentence-level pronunciation score from CTC forced alignment, with words worth another listen marked, plus fluency (speaking rate, pauses, fillers) and grammar. Play your own recording back next to the voice's reading. About 120 built-in prompts across everyday conversation and job interviews, at three levels.
 - **Speech recognition** — transcription runs locally via a Wav2Vec2 ONNX model.
 - **Grammar checking** — transcripts, or anything you type, are checked by a local offline linter with in-place suggestions.
 - **Text-to-speech** — hear correct pronunciation via a local neural voice (Piper).
-- **Spaced repetition** — review scheduled by FSRS-6, the memory model behind modern Anki, fitted to your own history. Daily caps, tags, suspend, bury and undo.
+- **Spaced repetition** — review scheduled by FSRS-6, the memory model behind modern Anki, fitted to your own history. Daily caps (optionally per deck), tags, suspend, bury and undo; review one deck or all of them.
 - **Your data stays yours** — JSON export that round-trips full review history and FSRS state, CSV/TSV for Anki, and whole-database backup and restore. CSV export gives a card beginning with `=`, `+`, `-` or `@` a leading apostrophe so spreadsheets show it as text instead of running it as a formula. TSV is written verbatim — use it for Anki, which would otherwise show the apostrophe. JSON export is unchanged.
 - **Offline by default** — the only network requests are downloading the models, and checking github.com for a new version if you turn that on (it is off unless you do). Everything works with the network off.
 

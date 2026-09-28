@@ -3,13 +3,11 @@ fn main() {
     // metadata/resources stay in sync.
     println!("cargo:rerun-if-changed=tauri.conf.json");
 
-    // The `bundle.resources` map references `../models/` (repo-root models/
-    // populated by scripts/download-models.sh). Tauri's build script fails
-    // the whole build when a resource pattern matches nothing, so ensure the
-    // directory exists: an empty dir is silently skipped by the resource
-    // iterator, while a populated one gets bundled to `$RESOURCE/models/`.
-    // `models/` is gitignored build input, so creating it here is harmless.
-    // The build script cwd is the package dir (src-tauri/), hence `../models`.
+    // Models are not bundled (`bundle.resources` ships only
+    // `resources/espeak-ng-data/`); installs fetch them into the app-data dir.
+    // `$RESOURCE/models/` stays a search root in `paths`, so a packager may
+    // still drop weights there. Creating the gitignored repo-root `models/`
+    // is harmless and keeps `scripts/download-models.sh`'s target present.
     let _ = std::fs::create_dir_all("../models");
     println!("cargo:rerun-if-changed=../models");
 

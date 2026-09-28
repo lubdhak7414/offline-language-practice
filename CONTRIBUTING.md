@@ -99,6 +99,12 @@ if you re-pin a revision, update both and run `just test-net`, which is the
 only check that the pinned URLs still resolve to the bytes the catalog
 expects. See SECURITY.md for why this is strict.
 
+The voice needs espeak-ng's data directory at runtime. An English subset is
+vendored in `src-tauri/resources/espeak-ng-data/` and bundled with the app;
+its format is tied to the espeak-ng version inside `espeak-rs-sys`, so after
+bumping `piper-rs` or `espeak-rs-sys` re-run `./scripts/vendor-espeak-data.sh`
+and the `real_models` tests.
+
 ## License
 
 The project is GPL-3.0-or-later (see LICENSE and the README's License
@@ -110,6 +116,11 @@ license; `cargo deny` enforces the list in `src-tauri/deny.toml`.
 
 Conventional-style subjects (`feat(srs):`, `fix(ui):`, `ci:`) in the
 imperative mood. Say what changed and why; the diff already says how.
+A change a user would notice also gets a line under `## [Unreleased]` in
+CHANGELOG.md.
+
+Adding a UI change? `scripts/screenshot.sh` regenerates
+`docs/screenshot.png` headlessly (Linux, needs weston).
 
 Small PRs get reviewed faster. If you are planning something large, open an
 issue first so the design can be argued about before you write it.
