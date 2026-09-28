@@ -11,6 +11,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AttemptReport,
   AttemptRow,
+  AddPromptArgs,
   PracticeDay,
   SessionSummary,
   BackupInfo,
@@ -180,6 +181,23 @@ export const tauriIpc: Ipc = {
       sessionId: sessionId ?? null,
       limit,
     });
+  },
+
+  addPrompt(args: AddPromptArgs) {
+    return invoke<PromptView>("add_prompt", {
+      category: args.category,
+      promptText: args.promptText,
+      targetText: args.targetText ?? null,
+      level: args.level,
+    });
+  },
+
+  listCustomPrompts() {
+    return invoke<PromptView[]>("list_custom_prompts");
+  },
+
+  deletePrompt(promptId: string) {
+    return invoke<void>("delete_prompt", { promptId });
   },
 
   sessionSummary(sessionId: string) {

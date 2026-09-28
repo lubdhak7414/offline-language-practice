@@ -7,6 +7,7 @@ import { createClipPlayer, speak } from "../lib/audio/player";
 import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { categoryForGoal } from "../lib/goals";
+import { OwnPrompts } from "../components/OwnPrompts";
 import { describeChange } from "../lib/attemptDelta";
 import { describeDailyGoal } from "../lib/practiceGoal";
 import { tzOffsetMinutes } from "../lib/tz";
@@ -105,6 +106,18 @@ export function Practice(props: { announce: (msg: string) => void }) {
       setChecking(false);
     }
   }, [checkText]);
+
+  // Show a specific prompt (one the user just wrote or picked from their own
+  // list). Bumps the sequence so a slow random-prompt reply cannot replace it.
+  const showPrompt = useCallback((p: PromptView) => {
+    promptSeq.current += 1;
+    setError(null);
+    setReport(null);
+    setLastPcm(null);
+    setStage("prompt");
+    setPrompt(p);
+    setNoPrompt(false);
+  }, []);
 
   const loadPrompt = useCallback(
     async (session: string | undefined, cat: string) => {
@@ -533,6 +546,14 @@ export function Practice(props: { announce: (msg: string) => void }) {
           </div>
         </article>
       )}
+
+      <OwnPrompts
+        category={category}
+        categoryLabel={CATEGORIES.find((c) => c.id === category)?.label ?? category}
+        onPractise={showPrompt}
+        disabled={stage === "recording" || stage === "scoring"}
+        announce={announce}
+      />
 
       <details class="check-writing">
         <summary>Check writing</summary>

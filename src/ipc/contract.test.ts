@@ -47,6 +47,7 @@ describe("Ipc implementations", () => {
     expect(methods.sort()).toEqual(
       [
         "addCard",
+        "addPrompt",
         "backupDatabase",
         "buryCard",
         "cancelDownloads",
@@ -54,6 +55,7 @@ describe("Ipc implementations", () => {
         "createDeck",
         "deleteCard",
         "deleteDeck",
+        "deletePrompt",
         "downloadModels",
         "dueCards",
         "endSession",
@@ -69,6 +71,7 @@ describe("Ipc implementations", () => {
         "lintText",
         "listAttempts",
         "listCards",
+        "listCustomPrompts",
         "listDecks",
         "listModelCatalog",
         "listTags",

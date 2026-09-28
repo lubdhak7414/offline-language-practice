@@ -530,6 +530,47 @@ async fn end_session(session_id: String, db: State<'_, DbInstances>) -> Result<(
         .map_err(String::from)
 }
 
+/// Add a prompt of the user's own (validated in `practice`).
+#[tauri::command]
+async fn add_prompt(
+    category: String,
+    prompt_text: String,
+    target_text: Option<String>,
+    level: i64,
+    db: State<'_, DbInstances>,
+) -> Result<crate::practice::PromptView, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::add_prompt(
+        &pool,
+        crate::practice::NewPrompt {
+            category,
+            prompt_text,
+            target_text,
+            level,
+        },
+    )
+    .await
+    .map_err(String::from)
+}
+
+#[tauri::command]
+async fn list_custom_prompts(
+    db: State<'_, DbInstances>,
+) -> Result<Vec<crate::practice::PromptView>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::list_custom_prompts(&pool)
+        .await
+        .map_err(String::from)
+}
+
+#[tauri::command]
+async fn delete_prompt(prompt_id: String, db: State<'_, DbInstances>) -> Result<(), String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::delete_prompt(&pool, &prompt_id)
+        .await
+        .map_err(String::from)
+}
+
 /// How a practice session went so far.
 #[tauri::command]
 async fn session_summary(
@@ -1988,6 +2029,9 @@ pub fn run() {
             next_prompt,
             list_attempts,
             session_summary,
+            add_prompt,
+            list_custom_prompts,
+            delete_prompt,
             create_deck,
             rename_deck,
             delete_deck,

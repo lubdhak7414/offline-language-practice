@@ -28,6 +28,14 @@ Notable changes to this project. The format follows
   over the last 30 days. Days without a read-aloud attempt are left out of the
   pronunciation line rather than drawn as zero.
 
+- **Your own prompts.** Add a sentence to read aloud (scored for
+  pronunciation) or a question to answer (free speaking) from "Your own
+  prompts" on Practice. They join the random prompts, can be practised
+  straight away, and can be deleted. Sentences must be plain letters and
+  apostrophes, with numbers written as words, because the recogniser cannot
+  produce digits and could never match them. Up to 200 are kept, in the
+  database, so a backup carries them.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides

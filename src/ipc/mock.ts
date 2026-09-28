@@ -38,6 +38,7 @@ import type {
   PronScore,
   Rating,
   RetentionBucket,
+  AddPromptArgs,
   PracticeDay,
   ScoreAttemptArgs,
   SessionSummary,
@@ -51,6 +52,7 @@ import type {
   UpdateInfo,
   VoiceInfo,
 } from "./types";
+import { CUSTOM_TOPIC, MAX_CUSTOM_PROMPTS, validateCustomPrompt } from "../lib/customPrompt";
 
 export type MockDeck = { id: string; name: string };
 export type MockCard = {
@@ -711,6 +713,36 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       const next = pool[promptCursor % Math.max(1, pool.length)];
       promptCursor += 1;
       return record("nextPrompt", [args], next ?? null);
+    },
+
+    addPrompt(args: AddPromptArgs) {
+      const v = validateCustomPrompt(args);
+      if (!v.ok) return refuse("addPrompt", [args], `bad input: ${v.message}`);
+      if (prompts.filter((p) => p.id.startsWith("custom-")).length >= MAX_CUSTOM_PROMPTS) {
+        return refuse("addPrompt", [args], `bad input: you can keep up to ${MAX_CUSTOM_PROMPTS} prompts of your own; delete some first`);
+      }
+      const prompt: PromptView = {
+        id: `custom-${nextId++}`,
+        category: v.value.category,
+        topic: CUSTOM_TOPIC,
+        prompt_text: v.value.prompt_text,
+        target_text: v.value.target_text,
+        level: v.value.level,
+      };
+      prompts.push(prompt);
+      return record("addPrompt", [args], prompt);
+    },
+
+    listCustomPrompts() {
+      const mine = prompts.filter((p) => p.id.startsWith("custom-")).reverse();
+      return record("listCustomPrompts", [], mine);
+    },
+
+    deletePrompt(promptId: string) {
+      const i = prompts.findIndex((p) => p.id === promptId && p.id.startsWith("custom-"));
+      if (i < 0) return refuse("deletePrompt", [promptId], "bad input: no such prompt of your own");
+      prompts.splice(i, 1);
+      return record("deletePrompt", [promptId], undefined as void);
     },
 
     seedPrompts() {

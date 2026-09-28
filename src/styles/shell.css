@@ -738,17 +738,49 @@ kbd {
 /* ─── Practice: the standalone grammar check ─────────────────────────────
    The one thing the retired Lab was the only home for. Kept compact and out
    of the way, at the bottom of the screen. */
-.check-writing {
+.check-writing,
+.own-prompts {
   margin-top: var(--space-6);
   border-top: 1px solid var(--border);
   padding-top: var(--space-3);
 }
-.check-writing summary {
+.check-writing summary,
+.own-prompts summary {
   cursor: pointer;
   font-weight: 600;
 }
-.check-writing textarea {
+.check-writing textarea,
+.own-prompts textarea {
   margin-top: var(--space-2);
+}
+
+.own-prompts .segmented {
+  margin: var(--space-3) 0 var(--space-2);
+}
+.own-prompts textarea {
+  width: 100%;
+}
+.own-prompt-list {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+}
+.own-prompt-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border);
+}
+.own-prompt-list li > span:first-child {
+  flex: 1 1 16rem;
+}
+
+.daily-goal,
+.session-summary,
+.try-change {
+  margin: var(--space-2) 0;
 }
 
 .recent-practice {

@@ -524,6 +524,156 @@ pub async fn list_attempts(
         .collect())
 }
 
+/// Longest sentence or question a user can add. The scorer and the voice
+/// both cope with far more; this keeps a stray paste from becoming a prompt.
+pub const MAX_CUSTOM_PROMPT_CHARS: usize = 300;
+/// A ceiling so the list stays usable and a runaway loop cannot fill the file.
+pub const MAX_CUSTOM_PROMPTS: i64 = 200;
+const CUSTOM_TOPIC: &str = "mine";
+const CUSTOM_READ_CUE: &str = "Read this aloud:";
+
+/// What the user typed to add a prompt of their own.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct NewPrompt {
+    pub category: String,
+    /// The question or cue. Optional for read-aloud (a default cue is used).
+    pub prompt_text: String,
+    /// The sentence to read aloud; `None` or blank makes it free speaking.
+    pub target_text: Option<String>,
+    pub level: i64,
+}
+
+/// Trim and check a new prompt. A read-aloud target must be something the
+/// scorer can align: letters and apostrophes only, because the recogniser
+/// spells words with a 26-letter vocabulary and cannot produce digits or
+/// accented letters, so such a target could never be matched.
+pub fn validate_new_prompt(p: NewPrompt) -> Result<NewPrompt, AppError> {
+    let bad = |m: &str| Err(AppError::BadInput(m.to_string()));
+    if p.category != crate::prompts_seed::CATEGORY_CONVERSATION
+        && p.category != crate::prompts_seed::CATEGORY_INTERVIEW
+    {
+        return bad("category must be conversation or interview");
+    }
+    if !(1..=3).contains(&p.level) {
+        return bad("level must be 1, 2 or 3");
+    }
+    let prompt_text = p.prompt_text.trim().to_string();
+    let target_text = p
+        .target_text
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if prompt_text.chars().count() > MAX_CUSTOM_PROMPT_CHARS
+        || target_text
+            .as_deref()
+            .is_some_and(|t| t.chars().count() > MAX_CUSTOM_PROMPT_CHARS)
+    {
+        return bad(&format!(
+            "keep it under {MAX_CUSTOM_PROMPT_CHARS} characters"
+        ));
+    }
+    match &target_text {
+        None if prompt_text.is_empty() => return bad("write a question or a sentence to read"),
+        Some(t) => {
+            let words = tokenize(t);
+            if words.is_empty() {
+                return bad("the sentence needs at least one word");
+            }
+            if words
+                .iter()
+                .any(|w| !w.chars().all(|c| c.is_ascii_uppercase() || c == '\''))
+            {
+                return bad(
+                    "use plain letters and apostrophes only; write numbers and symbols as words",
+                );
+            }
+        }
+        None => {}
+    }
+    let prompt_text = if prompt_text.is_empty() {
+        CUSTOM_READ_CUE.to_string()
+    } else {
+        prompt_text
+    };
+    Ok(NewPrompt {
+        category: p.category,
+        prompt_text,
+        target_text,
+        level: p.level,
+    })
+}
+
+pub async fn add_prompt(pool: &sqlx::SqlitePool, p: NewPrompt) -> Result<PromptView, AppError> {
+    let p = validate_new_prompt(p)?;
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompts WHERE builtin = 0")
+        .fetch_one(pool)
+        .await?;
+    if existing >= MAX_CUSTOM_PROMPTS {
+        return Err(AppError::BadInput(format!(
+            "you can keep up to {MAX_CUSTOM_PROMPTS} prompts of your own; delete some first"
+        )));
+    }
+    let id = format!("custom-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO prompts \
+         (id, category, topic, prompt_text, target_text, level, builtin, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+    )
+    .bind(&id)
+    .bind(&p.category)
+    .bind(CUSTOM_TOPIC)
+    .bind(&p.prompt_text)
+    .bind(&p.target_text)
+    .bind(p.level)
+    .bind(now_unix())
+    .execute(pool)
+    .await?;
+    Ok(PromptView {
+        id,
+        category: p.category,
+        topic: CUSTOM_TOPIC.to_string(),
+        prompt_text: p.prompt_text,
+        target_text: p.target_text,
+        level: p.level,
+    })
+}
+
+/// The user's own prompts, newest first.
+pub async fn list_custom_prompts(pool: &sqlx::SqlitePool) -> Result<Vec<PromptView>, AppError> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
+        "SELECT id, category, topic, prompt_text, target_text, level FROM prompts \
+         WHERE builtin = 0 ORDER BY created_at DESC, rowid DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, category, topic, prompt_text, target_text, level)| PromptView {
+                id,
+                category,
+                topic,
+                prompt_text,
+                target_text,
+                level,
+            },
+        )
+        .collect())
+}
+
+/// Delete one of the user's own prompts. Built-in prompts are never
+/// deletable here. Past attempts keep their own copy of the target text, so
+/// history is unaffected.
+pub async fn delete_prompt(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AppError> {
+    let res = sqlx::query("DELETE FROM prompts WHERE id = ? AND builtin = 0")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::BadInput("no such prompt of your own".to_string()));
+    }
+    Ok(())
+}
+
 /// How a practice sitting went, from what was stored.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionSummary {
@@ -1103,5 +1253,121 @@ mod tests {
         assert_eq!(s.words_to_recheck[0], "through");
         assert!(!s.words_to_recheck.contains(&"fine".to_string()));
         assert!(!s.words_to_recheck.contains(&"elsewhere".to_string()));
+    }
+
+    fn new_prompt(target: Option<&str>, text: &str) -> NewPrompt {
+        NewPrompt {
+            category: "conversation".to_string(),
+            prompt_text: text.to_string(),
+            target_text: target.map(String::from),
+            level: 2,
+        }
+    }
+
+    #[test]
+    fn validation_trims_defaults_the_cue_and_rejects_the_unscoreable() {
+        let ok =
+            validate_new_prompt(new_prompt(Some("  I'd like a table for two.  "), "  ")).unwrap();
+        assert_eq!(ok.target_text.as_deref(), Some("I'd like a table for two."));
+        assert_eq!(ok.prompt_text, "Read this aloud:");
+        // Blank target means free speaking, which needs a question.
+        assert!(validate_new_prompt(new_prompt(Some("   "), "")).is_err());
+        let free = validate_new_prompt(new_prompt(Some(" "), "Describe your week.")).unwrap();
+        assert_eq!(free.target_text, None);
+        // Digits, accents and symbols could never be matched by the recogniser.
+        for bad in ["Meet me at 5.", "Un caf\u{e9}, please.", "Save 50% today"] {
+            assert!(
+                validate_new_prompt(new_prompt(Some(bad), "")).is_err(),
+                "{bad}"
+            );
+        }
+        // Punctuation around ordinary words is fine.
+        assert!(validate_new_prompt(new_prompt(Some("Well, \"hello\" - again?"), "")).is_ok());
+        assert!(
+            validate_new_prompt(new_prompt(Some("...!"), "")).is_err(),
+            "no words"
+        );
+    }
+
+    #[test]
+    fn validation_checks_category_level_and_length() {
+        let mut p = new_prompt(Some("Hello there."), "");
+        p.category = "sport".to_string();
+        assert!(validate_new_prompt(p).is_err());
+        let mut p = new_prompt(Some("Hello there."), "");
+        p.level = 4;
+        assert!(validate_new_prompt(p).is_err());
+        let long = "a ".repeat(MAX_CUSTOM_PROMPT_CHARS);
+        assert!(validate_new_prompt(new_prompt(Some(&long), "")).is_err());
+        assert!(validate_new_prompt(new_prompt(None, &long)).is_err());
+    }
+
+    #[tokio::test]
+    async fn own_prompts_are_stored_served_and_deleted_and_builtins_are_safe() {
+        let pool = test_pool().await;
+        let added = add_prompt(
+            &pool,
+            new_prompt(Some("Could I have the bill?"), "Ask for the bill:"),
+        )
+        .await
+        .unwrap();
+        assert!(added.id.starts_with("custom-"));
+        assert!(!added.id.starts_with("builtin-"));
+
+        // Seeding again must neither touch nor duplicate it.
+        seed_prompts(&pool).await.unwrap();
+        seed_prompts(&pool).await.unwrap();
+        let mine = list_custom_prompts(&pool).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].id, added.id);
+
+        // With only conversation/level-2 custom prompt allowed by the filter it can be served.
+        let mut served = false;
+        for _ in 0..400 {
+            let p = next_prompt(&pool, None, Some("conversation"), Some(2))
+                .await
+                .unwrap()
+                .unwrap();
+            if p.id == added.id {
+                served = true;
+                break;
+            }
+        }
+        assert!(
+            served,
+            "next_prompt should be able to hand back a user prompt"
+        );
+
+        delete_prompt(&pool, &added.id).await.unwrap();
+        assert!(list_custom_prompts(&pool).await.unwrap().is_empty());
+        assert!(
+            delete_prompt(&pool, &added.id).await.is_err(),
+            "already gone"
+        );
+        assert!(
+            delete_prompt(&pool, "builtin-conversation-1")
+                .await
+                .is_err(),
+            "built-ins cannot be deleted"
+        );
+        let builtin_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM prompts WHERE id = 'builtin-conversation-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(builtin_left, 1);
+    }
+
+    #[tokio::test]
+    async fn the_number_of_own_prompts_is_capped() {
+        let pool = test_pool().await;
+        for _ in 0..MAX_CUSTOM_PROMPTS {
+            add_prompt(&pool, new_prompt(Some("Good morning."), ""))
+                .await
+                .unwrap();
+        }
+        assert!(add_prompt(&pool, new_prompt(Some("Good morning."), ""))
+            .await
+            .is_err());
     }
 }

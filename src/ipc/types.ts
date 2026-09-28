@@ -228,6 +228,15 @@ export type ScoreAttemptArgs = {
   dialect?: string;
 };
 
+export type AddPromptArgs = {
+  category: string;
+  /** The question or cue. Blank for a read-aloud sentence uses a default cue. */
+  promptText: string;
+  /** The sentence to read aloud; blank or absent makes it free speaking. */
+  targetText?: string;
+  level: number;
+};
+
 export type NextPromptArgs = {
   sessionId?: string;
   category?: string;
@@ -490,6 +499,9 @@ export type Ipc = {
   startSession(kind: string): Promise<string>;
   endSession(sessionId: string): Promise<void>;
   nextPrompt(args: NextPromptArgs): Promise<PromptView | null>;
+  addPrompt(args: AddPromptArgs): Promise<PromptView>;
+  listCustomPrompts(): Promise<PromptView[]>;
+  deletePrompt(promptId: string): Promise<void>;
   seedPrompts(): Promise<number>;
   scoreAttempt(args: ScoreAttemptArgs): Promise<AttemptReport>;
   listAttempts(sessionId: string | undefined, limit: number): Promise<AttemptRow[]>;
