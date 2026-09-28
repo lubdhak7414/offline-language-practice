@@ -6,6 +6,12 @@ Notable changes to this project. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Streak counts speaking practice.** A day counts if you reviewed a card or
+  recorded a practice attempt. Before, only card reviews counted, so someone
+  who practised speaking every day had no streak.
+
 ## [0.1.0] — 2026-09-28
 
 First release. Speaking practice, pronunciation and fluency scoring, grammar

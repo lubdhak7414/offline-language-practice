@@ -57,7 +57,7 @@ pub struct RetentionBucket {
 }
 
 /// Whether any review landed inside the practice-day starting at `day`.
-async fn has_reviews_on_day(
+async fn has_activity_on_day(
     pool: &sqlx::SqlitePool,
     day: i64,
     tz: i64,
@@ -65,8 +65,11 @@ async fn has_reviews_on_day(
 ) -> Result<bool, AppError> {
     let start = day_start_unix(day, tz, cutoff);
     let end = start + 86_400;
+    // A day counts if anything was practised: a card review or a speaking
+    // attempt. Someone who only speaks would otherwise never have a streak.
     let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM review_logs WHERE reviewed_at >= ? AND reviewed_at < ?",
+        "SELECT (SELECT COUNT(*) FROM review_logs WHERE reviewed_at >= ?1 AND reviewed_at < ?2) \
+              + (SELECT COUNT(*) FROM attempts WHERE created_at >= ?1 AND created_at < ?2)",
     )
     .bind(start)
     .bind(end)
@@ -80,17 +83,17 @@ async fn has_reviews_on_day(
 /// **The "missing today" rule**: today is not over yet, so a user who
 /// simply hasn't practiced *yet today* must not see their streak reset to
 /// zero. The streak therefore starts counting from today if today already
-/// has a review, and from yesterday otherwise — only a day that is
+/// has a review or an attempt, and from yesterday otherwise — only a day that is
 /// genuinely in the past can break a streak.
 async fn compute_streak(pool: &sqlx::SqlitePool, tz: i64, cutoff: i64) -> Result<i64, AppError> {
     let today = day_index(now_unix(), tz, cutoff);
-    let mut day = if has_reviews_on_day(pool, today, tz, cutoff).await? {
+    let mut day = if has_activity_on_day(pool, today, tz, cutoff).await? {
         today
     } else {
         today - 1
     };
     let mut streak: i64 = 0;
-    while has_reviews_on_day(pool, day, tz, cutoff).await? {
+    while has_activity_on_day(pool, day, tz, cutoff).await? {
         streak += 1;
         day -= 1;
     }
@@ -391,6 +394,58 @@ mod tests {
             streak, 1,
             "today not being over yet must not break the streak"
         );
+    }
+
+    /// Insert a bare attempt row; the streak only looks at `created_at`.
+    async fn attempt_at(pool: &sqlx::SqlitePool, id: &str, at: i64) {
+        sqlx::query(
+            "INSERT INTO attempts (id, transcript, duration_ms, created_at) VALUES (?, 't', 1000, ?)",
+        )
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn speaking_attempts_alone_build_a_streak() {
+        let pool = pool().await;
+        let cutoff = 4;
+        let today = day_index(now_unix(), 0, cutoff);
+        for (i, d) in [today, today - 1, today - 2].into_iter().enumerate() {
+            attempt_at(&pool, &format!("a{i}"), day_start_unix(d, 0, cutoff) + 100).await;
+        }
+        assert_eq!(compute_streak(&pool, 0, cutoff).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn streak_mixes_reviews_and_attempts_and_a_gap_breaks_it() {
+        let pool = pool().await;
+        sqlx::query("INSERT INTO cards (id, deck_id, content_front, content_back, created_at) VALUES ('c1','default','F','B',0)")
+            .execute(&pool).await.unwrap();
+        let cutoff = 4;
+        let today = day_index(now_unix(), 0, cutoff);
+        // Yesterday: a review. Two days ago: an attempt. Three days ago: nothing.
+        // Four days ago: an attempt, which the gap must cut off.
+        sqlx::query("INSERT INTO review_logs (id, card_id, rating, delta_t, reviewed_at) VALUES ('r1','c1',3,1,?)")
+            .bind(day_start_unix(today - 1, 0, cutoff) + 100)
+            .execute(&pool).await.unwrap();
+        attempt_at(&pool, "a1", day_start_unix(today - 2, 0, cutoff) + 100).await;
+        attempt_at(&pool, "a2", day_start_unix(today - 4, 0, cutoff) + 100).await;
+        assert_eq!(compute_streak(&pool, 0, cutoff).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn attempts_respect_the_day_cutoff_hour() {
+        let pool = pool().await;
+        let cutoff = 4;
+        let today = day_index(now_unix(), 0, cutoff);
+        // 03:00 on the calendar day after `today` still belongs to `today`.
+        let just_before_rollover = day_start_unix(today + 1, 0, cutoff) - 1;
+        attempt_at(&pool, "a1", just_before_rollover).await;
+        // A streak of exactly one day, on `today`, not two.
+        assert_eq!(compute_streak(&pool, 0, cutoff).await.unwrap(), 1);
     }
 
     #[tokio::test]
