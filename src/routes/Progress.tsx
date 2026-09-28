@@ -6,6 +6,7 @@ import { ipc } from "../ipc/commands";
 import type { AttemptRow, DayCount, ForecastDay, Overview, PracticeDay, RetentionBucket } from "../ipc/types";
 import { BarChart, LineChart, type ChartPoint } from "../components/Chart";
 import { tzOffsetMinutes } from "../lib/tz";
+import { describeWeek } from "../lib/weeklyRecap";
 
 const STATS_DAYS = 30;
 const FORECAST_DAYS = 14;
@@ -104,6 +105,7 @@ export function Progress() {
   const pronPoints: ChartPoint[] = practice.flatMap((p) =>
     p.avg_pron === null ? [] : [{ label: dayLabel(p.day), value: Math.round(p.avg_pron) }],
   );
+  const weekNote = describeWeek(practice);
   const forecastPoints: ChartPoint[] = forecast.map((f) => ({ label: dayLabel(f.day), value: f.due }));
   const retentionPoints: ChartPoint[] = retention.map((r) => ({
     label: dayLabel(r.day),
@@ -139,6 +141,8 @@ export function Progress() {
           <Tile label="Practice time" value={`${minutes(overview.practice_ms_30d)} min`} />
         </div>
       )}
+
+      {weekNote && <p class="week-recap">{weekNote}</p>}
 
       {!loading && (
         <div class="charts">

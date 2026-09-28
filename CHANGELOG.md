@@ -57,6 +57,12 @@ Notable changes to this project. The format follows
   lengthens a sentence by about a third on the shipped voice (pauses do not
   stretch), and the recogniser still understands it.
 
+- **Weekly recap.** Progress opens with a sentence on the last 7 days of
+  speaking (attempts, days practised) and, where read-aloud attempts were
+  scored, their average against the week before. The average is weighted by
+  scored attempts (`stats_practice` now returns `scored` per day) and a
+  change under 5 points is reported as "about the same".
+
 - **Hear it, then me.** After scoring, one button plays the model voice saying
   the sentence and then your own recording, to hear the difference back to back.
 

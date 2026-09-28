@@ -273,6 +273,7 @@ function defaultPractice(): PracticeDay[] {
     return {
       day: start + i * 86_400,
       attempts,
+      scored: attempts === 0 || i % 5 === 0 ? 0 : attempts,
       // Days with only free speaking, or none, have no pronunciation average.
       avg_pron: attempts === 0 || i % 5 === 0 ? null : 55 + ((i * 3) % 30),
       avg_wpm: attempts === 0 ? null : 110 + (i % 20),

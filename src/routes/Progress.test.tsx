@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { takePracticeRequest } from "../app/handoff";
 
 import { setIpc } from "../ipc/commands";
+import type { PracticeDay } from "../ipc/types";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
 import { expectNoA11yViolations } from "../test/axe";
 import { Progress } from "./Progress";
@@ -150,10 +151,10 @@ describe("Progress", () => {
     mount(
       createMockIpc({
         practice: [
-          { day: day(0), attempts: 2, avg_pron: 70, avg_wpm: 120 },
-          { day: day(1), attempts: 0, avg_pron: null, avg_wpm: null },
-          { day: day(2), attempts: 1, avg_pron: null, avg_wpm: 100 },
-          { day: day(3), attempts: 3, avg_pron: 82.4, avg_wpm: 130 },
+          { day: day(0), attempts: 2, scored: 2, avg_pron: 70, avg_wpm: 120 },
+          { day: day(1), attempts: 0, scored: 0, avg_pron: null, avg_wpm: null },
+          { day: day(2), attempts: 1, scored: 0, avg_pron: null, avg_wpm: 100 },
+          { day: day(3), attempts: 3, scored: 3, avg_pron: 82.4, avg_wpm: 130 },
         ],
       }),
     );
@@ -164,6 +165,24 @@ describe("Progress", () => {
     expect(rows).toHaveLength(3);
     expect(within(chart).getByText("82")).toBeInTheDocument();
     expect(screen.getByText(/Days without a read-aloud attempt are left out/)).toBeInTheDocument();
+  });
+});
+
+describe("Progress weekly recap", () => {
+  const blank: PracticeDay = { day: 0, attempts: 0, scored: 0, avg_pron: null, avg_wpm: null };
+  const days = (last7: Array<Partial<PracticeDay>>): PracticeDay[] =>
+    Array.from({ length: 14 }, (_, i) => ({ ...blank, day: i * 86_400, ...(i >= 7 ? last7[i - 7] : {}) }));
+
+  it("sums up the last seven days above the charts", async () => {
+    mount(createMockIpc({ practice: days([{ attempts: 2, scored: 2, avg_pron: 70 }, { attempts: 1 }]) }));
+    expect(await screen.findByText(/In the last 7 days you did 3 speaking attempts on 2 days/)).toBeInTheDocument();
+    expect(screen.getByText(/averaged 70 over 2 scored attempts/)).toBeInTheDocument();
+  });
+
+  it("is absent when nothing was practised this week", async () => {
+    mount(createMockIpc({ practice: days([]) }));
+    await screen.findByRole("img", { name: /Reviews per day/ });
+    expect(screen.queryByText(/In the last 7 days/)).not.toBeInTheDocument();
   });
 });
 

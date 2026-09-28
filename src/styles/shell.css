@@ -386,6 +386,9 @@ button.primary.recording {
   white-space: nowrap;
 }
 /* A marked word that plays when pressed: looks like the word, not a button. */
+.week-recap {
+  margin: var(--space-3) 0;
+}
 .word-button {
   font: inherit;
   background: none;

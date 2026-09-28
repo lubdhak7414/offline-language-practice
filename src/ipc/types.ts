@@ -309,6 +309,8 @@ export type Overview = {
 export type PracticeDay = {
   day: number;
   attempts: number;
+  /** How many of `attempts` have an acoustic score: the weight behind `avg_pron`. */
+  scored: number;
   /** Mean acoustic pronunciation; null when none was scored that day, never 0. */
   avg_pron: number | null;
   avg_wpm: number | null;

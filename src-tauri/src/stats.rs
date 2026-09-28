@@ -261,6 +261,9 @@ pub struct PracticeDay {
     /// The day's start, unix seconds (same bucketing as [`DayCount`]).
     pub day: i64,
     pub attempts: i64,
+    /// How many of `attempts` have an acoustic pronunciation score: the weight
+    /// behind `avg_pron`, so several days can be averaged without bias.
+    pub scored: i64,
     /// Mean acoustic pronunciation that day, `None` when no attempt had one.
     /// Text-fallback scores are a different measurement and are left out.
     pub avg_pron: Option<f64>,
@@ -322,6 +325,7 @@ pub async fn practice_daily(
             out.push(PracticeDay {
                 day: day_start_unix(day, tz, cutoff),
                 attempts: acc.attempts,
+                scored: acc.pron.1,
                 avg_pron: (acc.pron.1 > 0).then(|| acc.pron.0 / acc.pron.1 as f64),
                 avg_wpm: (acc.wpm.1 > 0).then(|| acc.wpm.0 / acc.wpm.1 as f64),
             });
@@ -521,6 +525,8 @@ mod tests {
         assert_eq!(out[0].attempts, 0);
         assert_eq!(out[0].avg_pron, None, "no practice is None, not 0");
         assert_eq!(out[1].attempts, 3);
+        assert_eq!(out[1].scored, 2, "the text-fallback score is not counted");
+        assert_eq!(out[3].scored, 0);
         assert_eq!(out[1].avg_pron, Some(70.0), "text fallback left out");
         assert_eq!(out[1].avg_wpm, Some(120.0));
         assert_eq!(out[2].attempts, 0);
