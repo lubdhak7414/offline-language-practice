@@ -518,6 +518,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
                     <td>
                       <input
                         type="text"
+                        aria-label="Front"
                         value={editing.front}
                         onInput={(e) =>
                           setEditing({ ...editing, front: (e.target as HTMLInputElement).value })
@@ -527,6 +528,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
                     <td>
                       <input
                         type="text"
+                        aria-label="Back"
                         value={editing.back}
                         onInput={(e) =>
                           setEditing({ ...editing, back: (e.target as HTMLInputElement).value })
