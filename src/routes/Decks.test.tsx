@@ -132,6 +132,46 @@ describe("Decks", () => {
     );
   });
 
+  describe("filtering", () => {
+    const cards = [
+      { id: "a", deck_id: "default", front: "Good morning", back: "Greeting", tags: ["greetings"] },
+      { id: "b", deck_id: "default", front: "Where is the station?", back: "Directions", tags: ["travel"] },
+      { id: "c", deck_id: "default", front: "See you later", back: "Goodbye", tags: ["greetings"] },
+    ];
+    const fronts = () =>
+      within(screen.getByRole("table")).getAllByRole("row").slice(1).map((r) => (r as HTMLTableRowElement).cells[1]?.textContent);
+
+    it("narrows the list by text and by tag", async () => {
+      const user = userEvent.setup();
+      mount(createMockIpc({ cards }));
+      await screen.findByText("Good morning");
+      await user.type(screen.getByRole("searchbox", { name: "Search cards" }), "GOOD");
+      expect(fronts()).toEqual(["Good morning", "See you later"]);
+      expect(screen.getByText("2 of 3 cards")).toBeInTheDocument();
+
+      await user.clear(screen.getByRole("searchbox", { name: "Search cards" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Tag" }), "travel");
+      expect(fronts()).toEqual(["Where is the station?"]);
+
+      await user.type(screen.getByRole("searchbox", { name: "Search cards" }), "zzz");
+      expect(screen.getByText("No cards match.")).toBeInTheDocument();
+    });
+
+    it("never deletes a checked card the filter is hiding", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc({ cards });
+      mount(mock);
+      await screen.findByText("Good morning");
+      await user.click(screen.getByRole("checkbox", { name: "Select Good morning" }));
+      await user.click(screen.getByRole("checkbox", { name: "Select Where is the station?" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Tag" }), "travel");
+      await user.click(screen.getByRole("button", { name: "Delete 1 selected" }));
+      await waitFor(() =>
+        expect(mock.calls.filter((c) => c.name === "deleteCard").map((c) => c.args)).toEqual([["b"]]),
+      );
+    });
+  });
+
   describe("daily limits", () => {
     it("shows and saves one deck's limits", async () => {
       const user = userEvent.setup();

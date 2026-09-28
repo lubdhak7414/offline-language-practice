@@ -31,8 +31,8 @@ feedback and spaced repetition, running entirely on-device.
   and undo. Keyboard-first, with the predicted interval shown under each
   grade. Review one deck or all of them, with optional per-deck daily
   limits, and hear any card read aloud.
-- **Decks, Progress and Settings.** Deck and card management, reviews-per-day
-  and retention charts, streaks, a recent-practice history with each
+- **Decks, Progress and Settings.** Deck and card management with search
+  and tag filters, reviews-per-day and retention charts, streaks, a recent-practice history with each
   attempt's scores, voice selection, and a diagnostics panel.
 - **Data portability.** JSON export that round-trips FSRS memory state and
   full review history, CSV/TSV for interchange with Anki, and whole-database

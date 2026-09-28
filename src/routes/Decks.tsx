@@ -24,6 +24,9 @@ export function Decks(props: { announce: (msg: string) => void }) {
   const [editing, setEditing] = useState<{ id: string; front: string; back: string } | null>(null);
   const [tagDrafts, setTagDrafts] = useState<Record<string, string>>({});
   const [checked, setChecked] = useState<Set<string>>(new Set());
+  // In-memory filters over the loaded cards: text in front/back, and a tag.
+  const [query, setQuery] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
 
   // Guards a ref, not state: two clicks in the same tick both read the state
   // from their own closure, so a destructive action needs the real guard to
@@ -68,6 +71,9 @@ export function Decks(props: { announce: (msg: string) => void }) {
   }, [loadDecks]);
 
   useEffect(() => {
+    // A tag from the last deck may not exist in this one.
+    setQuery("");
+    setTagFilter("");
     void loadCards(selected);
   }, [selected, loadCards]);
 
@@ -169,11 +175,24 @@ export function Decks(props: { announce: (msg: string) => void }) {
     [loadCards, loadDecks, selected],
   );
 
+  const needle = query.trim().toLowerCase();
+  const visible = cards.filter(
+    (c) =>
+      (tagFilter === "" || c.tags.includes(tagFilter)) &&
+      (needle === "" ||
+        c.front.toLowerCase().includes(needle) ||
+        c.back.toLowerCase().includes(needle)),
+  );
+  const tagNames = [...new Set(cards.flatMap((c) => c.tags))].sort();
+  // Only what is on screen can be deleted: a card checked and then hidden by
+  // a filter must never be removed without being seen.
+  const visibleChecked = visible.filter((c) => checked.has(c.id)).map((c) => c.id);
+
   const bulkDelete = useCallback(async () => {
-    if (busy.current || checked.size === 0) return;
+    if (busy.current || visibleChecked.length === 0) return;
     busy.current = true;
     try {
-      for (const id of checked) await ipc().deleteCard(id);
+      for (const id of visibleChecked) await ipc().deleteCard(id);
       await loadCards(selected);
       await loadDecks();
     } catch (e) {
@@ -181,7 +200,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
     } finally {
       busy.current = false;
     }
-  }, [checked, loadCards, loadDecks, selected]);
+  }, [loadCards, loadDecks, selected, visibleChecked]);
 
   const toggleSuspend = useCallback(
     async (card: CardRow) => {
@@ -420,15 +439,46 @@ export function Decks(props: { announce: (msg: string) => void }) {
         </div>
       )}
 
-      {checked.size > 0 && (
+      {!loading && cards.length > 0 && (
+        <div class="row" role="search" aria-label="Filter cards">
+          <input
+            type="search"
+            aria-label="Search cards"
+            placeholder="Search front or back…"
+            value={query}
+            onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
+          />
+          {tagNames.length > 0 && (
+            <select
+              aria-label="Tag"
+              value={tagFilter}
+              onChange={(e) => setTagFilter((e.target as HTMLSelectElement).value)}
+            >
+              <option value="">Any tag</option>
+              {tagNames.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          )}
+          {visible.length !== cards.length && (
+            <span class="muted">
+              {visible.length} of {cards.length} cards
+            </span>
+          )}
+        </div>
+      )}
+
+      {visibleChecked.length > 0 && (
         <div class="row">
           <button type="button" onClick={() => void bulkDelete()}>
-            Delete {checked.size} selected
+            Delete {visibleChecked.length} selected
           </button>
         </div>
       )}
 
-      {!loading && cards.length > 0 && (
+      {!loading && visible.length > 0 && (
         <table class="cards-table">
           <caption class="visually-hidden">Cards {selected ? "in this deck" : "in all decks"}</caption>
           <thead>
@@ -446,7 +496,7 @@ export function Decks(props: { announce: (msg: string) => void }) {
             </tr>
           </thead>
           <tbody>
-            {cards.map((c) => (
+            {visible.map((c) => (
               <tr key={c.id}>
                 <td>
                   <input
@@ -537,6 +587,9 @@ export function Decks(props: { announce: (msg: string) => void }) {
 
       {!loading && cards.length === 0 && (
         <p class="muted">No cards {selected ? "in this deck" : "yet"}.</p>
+      )}
+      {!loading && cards.length > 0 && visible.length === 0 && (
+        <p class="muted">No cards match.</p>
       )}
     </section>
   );
