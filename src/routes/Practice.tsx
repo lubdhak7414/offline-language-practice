@@ -8,6 +8,7 @@ import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { categoryForGoal } from "../lib/goals";
 import { OwnPrompts } from "../components/OwnPrompts";
+import { describeMicLevel } from "../lib/micLevel";
 import { answerLengthNote, targetSeconds } from "../lib/answerLength";
 import { describeChange } from "../lib/attemptDelta";
 import { describeDailyGoal } from "../lib/practiceGoal";
@@ -46,6 +47,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
   // the first prompt is never the wrong kind.
   const [goalLoaded, setGoalLoaded] = useState(false);
   const [dailyGoal, setDailyGoal] = useState(0);
+  // The chosen microphone, read when a recording starts.
+  const micRef = useRef("");
+  const [micNote, setMicNote] = useState<string | null>(null);
   const [attemptsToday, setAttemptsToday] = useState(0);
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [summary, setSummary] = useState<SessionSummary | null>(null);
@@ -154,6 +158,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
         if (!live) return;
         setCategory(categoryForGoal(p.goal));
         setDailyGoal(p.practice_goal_attempts);
+        micRef.current = p.mic_device_id;
       })
       .catch(() => {
         // Unreadable preferences: keep the default category.
@@ -230,6 +235,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
     try {
       const rec = await recorder.current.stop();
       setLastPcm(rec.pcm);
+      setMicNote(describeMicLevel(rec.peak));
       const report = await ipc().scoreAttempt({
         pcm: rec.pcm,
         sampleRate: 16000,
@@ -268,7 +274,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
     setError(null);
     setElapsedMs(0);
     try {
-      await recorder.current.start(setLevel);
+      setMicNote(null);
+      await recorder.current.start(setLevel, micRef.current);
       setStage("recording");
       announce("Recording.");
       const startedAt = Date.now();
@@ -529,6 +536,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
             </p>
           )}
 
+          {micNote && <p class="notice mic-note">{micNote}</p>}
           {change && <p class="muted try-change">{change}</p>}
           {lengthNote && <p class="muted answer-length">{lengthNote}</p>}
           {summary && describeSession(summary) && (

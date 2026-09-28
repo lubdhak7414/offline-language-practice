@@ -176,6 +176,8 @@ export function sanitizePrefs(p: Preferences): Preferences {
     // so a malformed save can never turn update checks on.
     check_updates: p.check_updates === true,
     practice_goal_attempts: clamp(p.practice_goal_attempts, 0, 100),
+    // prefs.rs: trimmed, and an id over 256 characters falls back to the default mic.
+    mic_device_id: p.mic_device_id.trim().length > 256 ? "" : p.mic_device_id.trim(),
   };
 }
 
@@ -246,6 +248,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   // Mirrors the backend default: update checks are opt-in.
   check_updates: false,
   practice_goal_attempts: 5,
+  mic_device_id: "",
 };
 
 /** ~30 days of daily counts with a couple of gaps, so charts have to cope. */

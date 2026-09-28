@@ -42,7 +42,16 @@ pub struct Preferences {
     /// `serde(default)` for the same reason as `check_updates`.
     #[serde(default = "default_practice_goal_attempts")]
     pub practice_goal_attempts: i64,
+    /// The microphone to record from: a browser `deviceId`, or empty for the
+    /// system default. Opaque to Rust; the webview asks for it as `ideal`, so
+    /// a device that has gone away falls back to the default.
+    #[serde(default)]
+    pub mic_device_id: String,
 }
+
+/// Longest device id kept. Real ids are a few dozen characters; this only
+/// stops a malformed save from filling the settings table.
+pub const MAX_MIC_DEVICE_ID_CHARS: usize = 256;
 
 /// Five recordings is a few minutes: enough to matter, short enough to keep.
 pub const DEFAULT_PRACTICE_GOAL_ATTEMPTS: i64 = 5;
@@ -65,6 +74,7 @@ impl Default for Preferences {
             goal: "both".to_string(),
             check_updates: false,
             practice_goal_attempts: DEFAULT_PRACTICE_GOAL_ATTEMPTS,
+            mic_device_id: String::new(),
         }
     }
 }
@@ -98,13 +108,21 @@ pub fn sanitize(p: Preferences) -> Preferences {
         goal,
         check_updates: p.check_updates,
         practice_goal_attempts: p.practice_goal_attempts.clamp(0, 100),
+        mic_device_id: {
+            let id = p.mic_device_id.trim();
+            if id.chars().count() > MAX_MIC_DEVICE_ID_CHARS {
+                String::new()
+            } else {
+                id.to_string()
+            }
+        },
     }
 }
 
 /// The `app_settings` keys this module owns, paired with the
 /// `Preferences` field each fills. Kept in one place so `load`/`save` cannot
 /// drift apart on which keys exist.
-const KEYS: [&str; 11] = [
+const KEYS: [&str; 12] = [
     "dialect",
     "theme",
     "day_cutoff_hour",
@@ -116,6 +134,7 @@ const KEYS: [&str; 11] = [
     "goal",
     "check_updates",
     "practice_goal_attempts",
+    "mic_device_id",
 ];
 
 /// Load every preference from `app_settings`, falling back field-by-field to
@@ -168,6 +187,10 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
             .get("practice_goal_attempts")
             .and_then(|v| v.parse().ok())
             .unwrap_or(default.practice_goal_attempts),
+        mic_device_id: raw
+            .get("mic_device_id")
+            .cloned()
+            .unwrap_or(default.mic_device_id),
     };
     Ok(sanitize(parsed))
 }
@@ -176,7 +199,7 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
 /// save never reaches storage. Returns the sanitized value actually saved.
 pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preferences, AppError> {
     let p = sanitize(p.clone());
-    let pairs: [(&str, String); 11] = [
+    let pairs: [(&str, String); 12] = [
         ("dialect", p.dialect.clone()),
         ("theme", p.theme.clone()),
         ("day_cutoff_hour", p.day_cutoff_hour.to_string()),
@@ -194,6 +217,7 @@ pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preference
             "practice_goal_attempts",
             p.practice_goal_attempts.to_string(),
         ),
+        ("mic_device_id", p.mic_device_id.clone()),
     ];
     let mut tx = pool.begin().await?;
     for (key, value) in pairs {
@@ -279,6 +303,36 @@ mod tests {
         .unwrap();
         assert_eq!(off.practice_goal_attempts, 0, "0 means the goal is off");
         assert_eq!(load(&pool).await.unwrap().practice_goal_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn the_microphone_choice_round_trips_and_a_silly_one_is_dropped() {
+        let pool = pool().await;
+        assert_eq!(load(&pool).await.unwrap().mic_device_id, "");
+        let saved = save(
+            &pool,
+            &Preferences {
+                mic_device_id: "  abc123  ".to_string(),
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.mic_device_id, "abc123");
+        assert_eq!(load(&pool).await.unwrap().mic_device_id, "abc123");
+        let long = save(
+            &pool,
+            &Preferences {
+                mic_device_id: "x".repeat(MAX_MIC_DEVICE_ID_CHARS + 1),
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            long.mic_device_id, "",
+            "an absurd id falls back to the default mic"
+        );
     }
 
     #[test]
@@ -381,6 +435,7 @@ mod tests {
             goal: "everyday".to_string(),
             check_updates: true,
             practice_goal_attempts: 8,
+            mic_device_id: "mic-1".to_string(),
         };
         assert_eq!(sanitize(p.clone()), p);
     }
@@ -415,6 +470,7 @@ mod tests {
                 goal: "interview".to_string(),
                 check_updates: false,
                 practice_goal_attempts: 12,
+                mic_device_id: "mic-2".to_string(),
             },
         )
         .await

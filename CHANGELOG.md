@@ -41,7 +41,19 @@ Notable changes to this project. The format follows
   whether yours was short, about right or long. It is advice about length
   only; what you said is never scored.
 
+- **Choose your microphone, and a warning when it is too quiet or too loud.**
+  Settings lists the microphones and has a Test microphone button. After each
+  attempt, Practice says so if the recording was very quiet or clipped, since
+  the score is less reliable then. The thresholds come from the quietest 1%
+  of the calibration recordings (peak 0.086) and the fact that none reached
+  0.99.
+
 ### Changed
+
+- **Recording runs in an AudioWorklet.** The deprecated main-thread capture
+  node is now only a fallback, used if the worklet cannot load or delivers
+  no audio within 1.5 seconds. Tested against a faked Web Audio; not yet
+  exercised with a real microphone on macOS or Windows.
 
 - **Practice opens on your goal.** The goal chosen during setup now decides
   whether Practice starts on everyday conversation or job interviews, and can

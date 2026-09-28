@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
+import { listMics, type Mic } from "../app/devices";
+import { createRecorder } from "../app/recorder";
 import { ipc } from "../ipc/commands";
 import { createClipPlayer, speak } from "../lib/audio/player";
-import { friendlyTtsError } from "../lib/errors";
+import { friendlyMicError, friendlyTtsError } from "../lib/errors";
+import { describeMicLevel } from "../lib/micLevel";
 import { ModelDownloads, formatBytes } from "../components/ModelDownloads";
 import type {
   AvailableUpdate,
@@ -35,8 +38,15 @@ function retentionLabel(r: number): string {
   return `Remember about ${Math.round(r * 100)} out of 100`;
 }
 
+/** How long "Test microphone" listens. */
+const MIC_TEST_MS = 2000;
+
 export function Settings(props: { announce: (msg: string) => void }) {
   const { announce } = props;
+  const [mics, setMics] = useState<Mic[]>([]);
+  const [micResult, setMicResult] = useState<string | null>(null);
+  const [micTesting, setMicTesting] = useState(false);
+  const micTestingRef = useRef(false);
   const [voices, setVoices] = useState<VoiceInfo[]>([]);
   const [voice, setVoiceState] = useState("");
   const [prefs, setPrefsState] = useState<Preferences | null>(null);
@@ -108,6 +118,43 @@ export function Settings(props: { announce: (msg: string) => void }) {
       }
     },
     [],
+  );
+
+  const refreshMics = useCallback(async () => {
+    try {
+      setMics(await listMics());
+    } catch {
+      setMics([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshMics();
+  }, [refreshMics]);
+
+  const testMic = useCallback(
+    async (deviceId: string) => {
+      if (micTestingRef.current) return;
+      micTestingRef.current = true;
+      setMicTesting(true);
+      setMicResult("Listening… say something.");
+      const rec = createRecorder();
+      try {
+        await rec.start(undefined, deviceId);
+        await new Promise((resolve) => setTimeout(resolve, MIC_TEST_MS));
+        const out = await rec.stop();
+        setMicResult(describeMicLevel(out.peak) ?? "That sounds good.");
+        // Permission is granted now, so the list can show real device names.
+        void refreshMics();
+      } catch (e) {
+        rec.cancel();
+        setMicResult(friendlyMicError(e));
+      } finally {
+        micTestingRef.current = false;
+        setMicTesting(false);
+      }
+    },
+    [refreshMics],
   );
 
   const changeVoice = useCallback(
@@ -328,6 +375,34 @@ export function Settings(props: { announce: (msg: string) => void }) {
 
       <section class="settings-section">
         <h2>Practice</h2>
+        <div class="row">
+          <label for="setting-mic">Microphone</label>
+          <select
+            id="setting-mic"
+            value={prefs.mic_device_id}
+            onChange={(e) =>
+              void savePrefs({ ...prefs, mic_device_id: (e.target as HTMLSelectElement).value })
+            }
+          >
+            <option value="">System default</option>
+            {mics.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+            {prefs.mic_device_id !== "" && !mics.some((m) => m.id === prefs.mic_device_id) && (
+              <option value={prefs.mic_device_id}>Saved microphone (not connected)</option>
+            )}
+          </select>
+          <button type="button" disabled={micTesting} onClick={() => void testMic(prefs.mic_device_id)}>
+            Test microphone
+          </button>
+        </div>
+        {micResult && (
+          <p class="muted" role="status">
+            {micResult}
+          </p>
+        )}
         <div class="row">
           <label for="setting-goal">Practice goal</label>
           <select

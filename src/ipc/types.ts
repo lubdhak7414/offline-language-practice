@@ -275,6 +275,8 @@ export type Preferences = {
   check_updates: boolean;
   /** Practice attempts per day to aim for; 0 = no daily goal. */
   practice_goal_attempts: number;
+  /** A browser microphone id; empty is the system default. */
+  mic_device_id: string;
 };
 
 export type DailyLimits = {

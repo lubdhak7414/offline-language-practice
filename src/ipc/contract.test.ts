@@ -197,6 +197,13 @@ describe("mock fidelity", () => {
     expect(sanitizePrefs({ ...prefs, practice_goal_attempts: -3 }).practice_goal_attempts).toBe(0);
   });
 
+  it("sanitizePrefs trims the microphone id and drops an absurd one (prefs.rs sanitize)", async () => {
+    const prefs = await createMockIpc().getPreferences();
+    expect(sanitizePrefs({ ...prefs, mic_device_id: "  abc  " }).mic_device_id).toBe("abc");
+    expect(sanitizePrefs({ ...prefs, mic_device_id: "x".repeat(257) }).mic_device_id).toBe("");
+    expect(sanitizePrefs({ ...prefs, mic_device_id: "x".repeat(256) }).mic_device_id).toBe("x".repeat(256));
+  });
+
   it("sanitizePrefs leaves valid values alone", async () => {
     const prefs = await createMockIpc().getPreferences();
     expect(sanitizePrefs(prefs)).toEqual(prefs);
