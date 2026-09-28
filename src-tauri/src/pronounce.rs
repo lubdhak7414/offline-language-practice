@@ -450,8 +450,8 @@ pub fn text_to_labels(target: &str, v: &Vocab) -> Result<TargetLabels, ScoreErro
 /// verbatim (IPA is case-sensitive). Any phone the vocab lacks refuses the
 /// whole target, so the caller falls back to the grapheme path rather than
 /// scoring a target with holes in it.
-// Consumed by the phone-GOP corpus dump today and by the app in Phase 7
-// Stage 6A A7 (phone-level scoring), gated on the E2 measurement.
+// Consumed only by the phone-GOP corpus dump: the Stage 6A measurement was
+// NO-GO, so the app's A7 consumer (phone-level scoring) did not land.
 #[allow(dead_code)]
 pub fn phones_to_labels(
     words: &[crate::phonemize::WordPhones],
@@ -758,8 +758,8 @@ pub fn score_against_target(
 ///
 /// For a phone model this is one phone; for the grapheme model, one letter
 /// (or a word delimiter).
-// Read by the phone-GOP corpus dump today; the app consumes it in Phase 7
-// Stage 6A A7 (phone-level scoring), gated on the E2 measurement.
+// Read only by the phone-GOP corpus dump: the Stage 6A measurement was
+// NO-GO, so the app's A7 consumer (phone-level scoring) did not land.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LabelScore {

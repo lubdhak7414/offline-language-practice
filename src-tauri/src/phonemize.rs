@@ -112,8 +112,8 @@ fn groups_locked(text: &str) -> Result<Vec<Vec<String>>, String> {
 /// including the word-by-word fallback. Errors (espeak failed to start, a
 /// word with no phones, an empty target) mean "no phone scoring", never a
 /// score.
-// Consumed by the phone-GOP corpus dump today and by the app in Phase 7
-// Stage 6A A7 (phone-level scoring), gated on the E2 measurement.
+// Consumed only by the phone-GOP corpus dump: the Stage 6A measurement was
+// NO-GO, so the app's A7 consumer (phone-level scoring) did not land.
 #[allow(dead_code)]
 pub fn phonemize(target: &str) -> Result<Vec<WordPhones>, String> {
     let words = tokenize(target);

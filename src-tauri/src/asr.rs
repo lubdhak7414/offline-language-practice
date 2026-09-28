@@ -449,8 +449,8 @@ impl AsrEngine {
     /// and log-softmax. With a 392-token phone vocab the posteriors reach
     /// about 9.4 MB at the 120 s cap; like the grapheme ones they are scored
     /// inside the worker and never cross a channel.
-    // Used by the phone-GOP corpus dump and E0 smoke test today; the app
-    // consumes it in Phase 7 Stage 6A A7, gated on the E2 measurement.
+    // Used only by the phone-GOP corpus dump and E0 smoke test: the Stage
+    // 6A measurement was NO-GO, so the app's A7 consumer did not land.
     #[allow(dead_code)]
     pub fn posteriors(&self, pcm_f32: &[f32]) -> ort::Result<AsrOutput> {
         let audio_samples = pcm_f32.len();
