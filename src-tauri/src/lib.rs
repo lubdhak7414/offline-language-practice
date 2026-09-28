@@ -530,6 +530,18 @@ async fn end_session(session_id: String, db: State<'_, DbInstances>) -> Result<(
         .map_err(String::from)
 }
 
+/// How a practice session went so far.
+#[tauri::command]
+async fn session_summary(
+    session_id: String,
+    db: State<'_, DbInstances>,
+) -> Result<crate::practice::SessionSummary, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::session_summary(&pool, &session_id)
+        .await
+        .map_err(String::from)
+}
+
 /// Next prompt for a session, skipping ones it already covered.
 #[tauri::command]
 async fn next_prompt(
@@ -1961,6 +1973,7 @@ pub fn run() {
             end_session,
             next_prompt,
             list_attempts,
+            session_summary,
             create_deck,
             rename_deck,
             delete_deck,

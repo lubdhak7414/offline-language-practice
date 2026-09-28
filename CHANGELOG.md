@@ -6,6 +6,13 @@ Notable changes to this project. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Session summary.** From your second attempt in a sitting, Practice shows
+  how it is going: attempts, time, average pronunciation and speaking rate
+  where they were measured, and the words worth another listen most often.
+  Sessions now end when you switch topic or leave the screen.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides

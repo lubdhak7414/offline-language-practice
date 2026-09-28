@@ -524,6 +524,78 @@ pub async fn list_attempts(
         .collect())
 }
 
+/// How a practice sitting went, from what was stored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionSummary {
+    pub attempts: i64,
+    /// Attempts that got an acoustic pronunciation score.
+    pub scored: i64,
+    /// Mean pronunciation over the `scored` attempts only; `None` when there
+    /// are none, never 0. Text-fallback scores are left out: they are a
+    /// different measurement and must not be averaged with acoustic ones.
+    pub avg_pron: Option<u8>,
+    /// Mean speaking rate over attempts where one was measured.
+    pub avg_wpm: Option<f64>,
+    /// Total recording time, milliseconds.
+    pub practice_ms: i64,
+    /// Words marked "worth another listen" most often this session, at most
+    /// [`MAX_RECHECK_WORDS`], lower-cased. Hints, not verdicts.
+    pub words_to_recheck: Vec<String>,
+}
+
+const MAX_RECHECK_WORDS: i64 = 5;
+
+pub async fn session_summary(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<SessionSummary, AppError> {
+    let (attempts, practice_ms): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM attempts WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (scored, avg_pron): (i64, Option<f64>) = sqlx::query_as(
+        "SELECT COUNT(s.pron_overall), AVG(s.pron_overall) \
+         FROM attempts a JOIN attempt_scores s ON s.attempt_id = a.id \
+         WHERE a.session_id = ? AND s.pron_method = 'gop' AND s.pron_overall IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+
+    let avg_wpm: Option<f64> = sqlx::query_scalar(
+        "SELECT AVG(s.wpm) FROM attempts a JOIN attempt_scores s ON s.attempt_id = a.id \
+         WHERE a.session_id = ? AND s.wpm IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+
+    let words_to_recheck: Vec<String> = sqlx::query_scalar(
+        "SELECT LOWER(w.word) FROM attempt_word_scores w \
+         JOIN attempts a ON a.id = w.attempt_id \
+         WHERE a.session_id = ?1 AND w.verdict = 'unclear' \
+         GROUP BY LOWER(w.word) \
+         ORDER BY COUNT(*) DESC, MAX(a.created_at) DESC, LOWER(w.word) \
+         LIMIT ?2",
+    )
+    .bind(session_id)
+    .bind(MAX_RECHECK_WORDS)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(SessionSummary {
+        attempts,
+        scored,
+        avg_pron: avg_pron.map(|v| v.round().clamp(0.0, 100.0) as u8),
+        avg_wpm,
+        practice_ms,
+        words_to_recheck,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,5 +1022,86 @@ mod tests {
         assert_eq!(grammar_score(&no_lint(), 0), 0);
         // Never underflows.
         assert_eq!(grammar_score(&lint_with(&["error"; 50]), 3), 0);
+    }
+
+    async fn add_attempt(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        session: &str,
+        ms: i64,
+        pron: Option<(i64, &str)>,
+        wpm: Option<f64>,
+    ) {
+        sqlx::query("INSERT INTO attempts (id, session_id, transcript, duration_ms, created_at) VALUES (?, ?, 't', ?, ?)")
+            .bind(id).bind(session).bind(ms).bind(now_unix())
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO attempt_scores (attempt_id, pron_overall, pron_method, wpm, overall) VALUES (?, ?, ?, ?, 50)")
+            .bind(id)
+            .bind(pron.map(|p| p.0))
+            .bind(pron.map(|p| p.1))
+            .bind(wpm)
+            .execute(pool).await.unwrap();
+    }
+
+    async fn add_word(pool: &sqlx::SqlitePool, attempt: &str, idx: i64, word: &str, verdict: &str) {
+        sqlx::query("INSERT INTO attempt_word_scores (attempt_id, word_index, word, verdict) VALUES (?, ?, ?, ?)")
+            .bind(attempt).bind(idx).bind(word).bind(verdict)
+            .execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_session_summarises_to_nothing_not_zero() {
+        let pool = test_pool().await;
+        let s = session_summary(&pool, "none").await.unwrap();
+        assert_eq!((s.attempts, s.scored, s.practice_ms), (0, 0, 0));
+        assert_eq!(s.avg_pron, None);
+        assert_eq!(s.avg_wpm, None);
+        assert!(s.words_to_recheck.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_averages_only_acoustic_scores_and_only_its_own_session() {
+        let pool = test_pool().await;
+        add_attempt(&pool, "a1", "s1", 4000, Some((80, "gop")), Some(120.0)).await;
+        add_attempt(&pool, "a2", "s1", 6000, Some((60, "gop")), Some(100.0)).await;
+        // Text fallback: counted as an attempt, never averaged into pronunciation.
+        add_attempt(&pool, "a3", "s1", 2000, Some((10, "text")), None).await;
+        // Free speaking: no pronunciation at all.
+        add_attempt(&pool, "a4", "s1", 3000, None, Some(140.0)).await;
+        add_attempt(&pool, "other", "s2", 9999, Some((1, "gop")), Some(1.0)).await;
+        let s = session_summary(&pool, "s1").await.unwrap();
+        assert_eq!(s.attempts, 4);
+        assert_eq!(s.scored, 2);
+        assert_eq!(s.avg_pron, Some(70));
+        assert_eq!(s.practice_ms, 15_000);
+        let wpm = s.avg_wpm.unwrap();
+        assert!(
+            (wpm - 120.0).abs() < 1e-9,
+            "mean of 120, 100, 140, got {wpm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_words_are_the_most_flagged_lowercased_and_capped() {
+        let pool = test_pool().await;
+        add_attempt(&pool, "a1", "s1", 1000, Some((70, "gop")), None).await;
+        add_attempt(&pool, "a2", "s1", 1000, Some((70, "gop")), None).await;
+        add_attempt(&pool, "o", "s2", 1000, Some((70, "gop")), None).await;
+        // THROUGH flagged twice (different case), the rest once; "good" never counts.
+        add_word(&pool, "a1", 0, "THROUGH", "unclear").await;
+        add_word(&pool, "a2", 0, "through", "unclear").await;
+        for (i, w) in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+            .iter()
+            .enumerate()
+        {
+            add_word(&pool, "a1", 1 + i as i64, w, "unclear").await;
+        }
+        add_word(&pool, "a1", 20, "fine", "good").await;
+        add_word(&pool, "o", 0, "elsewhere", "unclear").await;
+        let s = session_summary(&pool, "s1").await.unwrap();
+        assert_eq!(s.words_to_recheck.len(), 5);
+        assert_eq!(s.words_to_recheck[0], "through");
+        assert!(!s.words_to_recheck.contains(&"fine".to_string()));
+        assert!(!s.words_to_recheck.contains(&"elsewhere".to_string()));
     }
 }

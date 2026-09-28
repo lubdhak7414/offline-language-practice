@@ -11,6 +11,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AttemptReport,
   AttemptRow,
+  SessionSummary,
   BackupInfo,
   BackupResult,
   CardRow,
@@ -178,6 +179,10 @@ export const tauriIpc: Ipc = {
       sessionId: sessionId ?? null,
       limit,
     });
+  },
+
+  sessionSummary(sessionId: string) {
+    return invoke<SessionSummary>("session_summary", { sessionId });
   },
 
   createDeck(name: string) {

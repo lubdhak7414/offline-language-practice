@@ -206,6 +206,19 @@ export type AttemptRow = {
   overall: number;
 };
 
+/** How a practice session went so far. Averages are null, never 0, when nothing was measured. */
+export type SessionSummary = {
+  attempts: number;
+  /** Attempts that got an acoustic pronunciation score. */
+  scored: number;
+  avg_pron: number | null;
+  avg_wpm: number | null;
+  /** Total recording time, milliseconds. */
+  practice_ms: number;
+  /** Words marked "worth another listen" most often, lower-cased, at most 5. */
+  words_to_recheck: string[];
+};
+
 export type ScoreAttemptArgs = {
   pcm: Uint8Array;
   sampleRate: number;
@@ -466,6 +479,7 @@ export type Ipc = {
   seedPrompts(): Promise<number>;
   scoreAttempt(args: ScoreAttemptArgs): Promise<AttemptReport>;
   listAttempts(sessionId: string | undefined, limit: number): Promise<AttemptRow[]>;
+  sessionSummary(sessionId: string): Promise<SessionSummary>;
 
   // --- decks ---
   createDeck(name: string): Promise<string>;

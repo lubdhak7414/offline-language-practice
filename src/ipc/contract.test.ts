@@ -92,6 +92,7 @@ describe("Ipc implementations", () => {
         "setDailyLimits",
         "setPreferences",
         "setRetention",
+        "sessionSummary",
         "setVoice",
         "startSession",
         "statsDaily",

@@ -194,6 +194,33 @@ describe("Practice", () => {
     expect(screen.queryByText(/word-by-word matching/)).not.toBeInTheDocument();
   });
 
+  it("shows a session summary from the second attempt, not the first", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    await screen.findByText(/^Overall/);
+    expect(screen.queryByText(/^This session/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Try again/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    expect(await screen.findByText(/^This session: 2 attempts/)).toBeInTheDocument();
+  });
+
+  it("ends the session it opened when the category changes and on unmount", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc();
+    const view = mount(mock);
+    await screen.findByText("Reply to a greeting:");
+    const ended = () => mock.calls.filter((c) => c.name === "endSession").length;
+    expect(ended()).toBe(0);
+    await user.click(screen.getByRole("button", { name: "Job interview" }));
+    await waitFor(() => expect(ended()).toBe(1));
+    view.unmount();
+    await waitFor(() => expect(ended()).toBe(2));
+  });
+
   it("switches the session when the category changes", async () => {
     const mock = createMockIpc();
     mount(mock);

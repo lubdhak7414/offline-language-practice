@@ -39,6 +39,7 @@ import type {
   Rating,
   RetentionBucket,
   ScoreAttemptArgs,
+  SessionSummary,
   SetDailyLimitsArgs,
   WordAlignment,
   RecentReview,
@@ -280,6 +281,8 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
   const due: DueCard[] = [...(options.due ?? [])];
   const reviews: RecentReview[] = [];
   const attempts: AttemptRow[] = [...(options.attempts ?? [])];
+  // Every report `scoreAttempt` produced, by session, for `sessionSummary`.
+  const sessionLog: Array<{ sessionId: string | undefined; report: AttemptReport }> = [];
   const prompts: PromptView[] = [...(options.prompts ?? [makePrompt()])];
   let retention = options.retention ?? 0.9;
   let preferences: Preferences = { ...DEFAULT_PREFERENCES, ...options.preferences };
@@ -759,7 +762,36 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
         pron_method: report.pron_method,
         overall: report.overall,
       });
+      sessionLog.push({ sessionId: args.sessionId, report });
       return record("scoreAttempt", [args], report);
+    },
+
+    // Mirrors practice.rs::session_summary: acoustic scores only in the
+    // pronunciation average, null (never 0) when nothing was measured.
+    sessionSummary(sessionId: string) {
+      const mine = sessionLog.filter((e) => e.sessionId === sessionId).map((e) => e.report);
+      const acoustic = mine.filter((r) => r.pron_method === "gop" && r.pron_overall !== null);
+      const wpms = mine.flatMap((r) => (r.fluency ? [r.fluency.wpm] : []));
+      const mean = (xs: number[]) => (xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length);
+      const counts = new Map<string, number>();
+      for (const r of mine) {
+        for (const w of r.pron?.words ?? []) {
+          if (w.verdict === "unclear") counts.set(w.word.toLowerCase(), (counts.get(w.word.toLowerCase()) ?? 0) + 1);
+        }
+      }
+      const avgPron = mean(acoustic.map((r) => r.pron_overall ?? 0));
+      const summary: SessionSummary = {
+        attempts: mine.length,
+        scored: acoustic.length,
+        avg_pron: avgPron === null ? null : Math.round(avgPron),
+        avg_wpm: mean(wpms),
+        practice_ms: mine.reduce((a, r) => a + r.duration_ms, 0),
+        words_to_recheck: [...counts.entries()]
+          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+          .slice(0, 5)
+          .map(([w]) => w),
+      };
+      return record("sessionSummary", [sessionId], summary);
     },
 
     listAttempts(sessionId: string | undefined, limit: number) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
-import type { AttemptReport, LintReport, PromptView } from "../ipc/types";
+import type { AttemptReport, LintReport, PromptView, SessionSummary } from "../ipc/types";
 import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
 import { createClipPlayer, speak } from "../lib/audio/player";
 import { f32ToWav } from "../lib/audio/wav";
@@ -9,6 +9,7 @@ import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/err
 import { categoryForGoal } from "../lib/goals";
 import { goPrefix } from "../lib/globalKeys";
 import { practiceKeyAction } from "../lib/keyboard";
+import { describeSession } from "../lib/sessionSummary";
 import {
   DeliveryNote,
   LintedText,
@@ -40,6 +41,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
   // the first prompt is never the wrong kind.
   const [goalLoaded, setGoalLoaded] = useState(false);
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
+  const [summary, setSummary] = useState<SessionSummary | null>(null);
+  // The session a late summary reply belongs to; a reply for an older one is dropped.
+  const currentSession = useRef<string | undefined>(undefined);
   const [prompt, setPrompt] = useState<PromptView | null>(null);
   const [stage, setStage] = useState<Stage>("prompt");
   const [report, setReport] = useState<AttemptReport | null>(null);
@@ -141,6 +145,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
   useEffect(() => {
     if (!goalLoaded) return;
     let live = true;
+    let startedId: string | undefined;
+    setSummary(null);
     void (async () => {
       try {
         const status = await ipc().modelStatus();
@@ -152,7 +158,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
       }
       try {
         const id = await ipc().startSession(category);
-        if (!live) return;
+        startedId = id;
+        if (!live) {
+          void ipc().endSession(id).catch(() => {});
+          return;
+        }
+        currentSession.current = id;
         setSessionId(id);
         await loadPrompt(id, category);
       } catch (e) {
@@ -161,6 +172,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
     })();
     return () => {
       live = false;
+      currentSession.current = undefined;
+      // Close the session it opened; best effort, the next launch is unaffected.
+      if (startedId !== undefined) void ipc().endSession(startedId).catch(() => {});
     };
   }, [category, goalLoaded, loadPrompt]);
 
@@ -191,6 +205,16 @@ export function Practice(props: { announce: (msg: string) => void }) {
       });
       setReport(report);
       setStage("feedback");
+      if (sessionId !== undefined) {
+        void ipc()
+          .sessionSummary(sessionId)
+          .then((s) => {
+            if (currentSession.current === sessionId) setSummary(s);
+          })
+          .catch(() => {
+            // The summary is a nicety; the attempt itself already succeeded.
+          });
+      }
       announce(
         report.pron_overall === null
           ? `Scored. Grammar ${report.grammar_score} out of 100.`
@@ -455,6 +479,10 @@ export function Practice(props: { announce: (msg: string) => void }) {
               Pronunciation here is word-by-word matching: the close listen
               could not run on this recording.
             </p>
+          )}
+
+          {summary && describeSession(summary) && (
+            <p class="muted session-summary">{describeSession(summary)}</p>
           )}
 
           <div class="row">
