@@ -18,11 +18,11 @@
   --bg-raised: #ffffff;
   --bg-sunken: #f1f2f6;
   --border: #d5d7e0;
-  --border-strong: #b6b9c8;
+  --border-strong: #878994;
 
   /* --- text --- */
   --fg: #16181d;
-  /* A real colour: 4.7:1 on --bg, so it passes even on error text. */
+  /* A real colour: 6.1:1 on --bg, so it passes even on error text. */
   --fg-muted: #5b5f70;
   --fg-on-accent: #ffffff;
 
@@ -81,11 +81,13 @@
     --bg-raised: #1c1f27;
     --bg-sunken: #0f1116;
     --border: #2e323d;
-    --border-strong: #454a59;
+    --border-strong: #666b77;
 
     --fg: #eceef4;
-    /* 5.4:1 on --bg. */
+    /* 7.5:1 on --bg. */
     --fg-muted: #a1a7b8;
+    /* Dark text on the light dark-mode accent: white was 2.5:1 on it. */
+    --fg-on-accent: #0f1116;
 
     --accent: #7ea2ff;
     --accent-hover: #9cb7ff;
@@ -108,10 +110,11 @@
   --bg-raised: #1c1f27;
   --bg-sunken: #0f1116;
   --border: #2e323d;
-  --border-strong: #454a59;
+  --border-strong: #666b77;
 
   --fg: #eceef4;
   --fg-muted: #a1a7b8;
+  --fg-on-accent: #0f1116;
 
   --accent: #7ea2ff;
   --accent-hover: #9cb7ff;
