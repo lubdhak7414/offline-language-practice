@@ -110,17 +110,35 @@ export function WordAlignmentView(props: { ops: WordOp[] }) {
  * pronounce.rs), so a two-digit score would claim a precision that is not
  * there. A flag is a hint, and says so in text as well as colour.
  */
-export function WordScoreView(props: { words: WordScore[] }) {
+export function WordScoreView(props: {
+  words: WordScore[];
+  /** When given, a marked word becomes a button that plays that word. */
+  onHear?: (word: string) => void;
+}) {
+  const { onHear } = props;
   return (
     <p class="alignment" aria-label="Word by word pronunciation">
       {props.words.map((w, i) => {
         const flagged = w.verdict !== "good";
+        const title = flagged ? `${w.word}: worth another listen` : `${w.word}: came through clearly`;
+        const cls = `word word-gop word-${w.verdict}`;
+        if (flagged && onHear) {
+          return (
+            <button
+              key={i}
+              type="button"
+              class={`${cls} word-button`}
+              title={title}
+              aria-label={`Hear the word ${w.word.toLowerCase()}`}
+              onClick={() => onHear(w.word)}
+            >
+              {w.word}
+              <span class="word-flag">check</span>
+            </button>
+          );
+        }
         return (
-          <span
-            key={i}
-            class={`word word-gop word-${w.verdict}`}
-            title={flagged ? `${w.word}: worth another listen` : `${w.word}: came through clearly`}
-          >
+          <span key={i} class={cls} title={title}>
             {w.word}
             {flagged && <span class="word-flag">check</span>}
           </span>
@@ -131,7 +149,7 @@ export function WordScoreView(props: { words: WordScore[] }) {
 }
 
 /** One line under the word view: what a flag means, or that there are none. */
-export function FlagNote(props: { words: WordScore[] }) {
+export function FlagNote(props: { words: WordScore[]; canHear?: boolean }) {
   const flagged = props.words.filter((w) => w.verdict !== "good").length;
   if (flagged === 0) {
     return <p class="muted">Every word came through clearly.</p>;
@@ -140,6 +158,7 @@ export function FlagNote(props: { words: WordScore[] }) {
     <p class="muted">
       {flagged === 1 ? "One word is" : `${flagged} words are`} worth another listen. This
       check often mistakes an accent for an error, so treat a flag as a hint, not a mistake.
+      {props.canHear && " Select a marked word to hear it."}
     </p>
   );
 }

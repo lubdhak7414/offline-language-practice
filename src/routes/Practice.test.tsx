@@ -462,6 +462,35 @@ describe("Practice", () => {
       expect(spy.mock.calls[1]?.[2]).toEqual({ slow: true });
     });
 
+    it("pressing a marked word plays that word alone, in lower case", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc({
+        report: {
+          pron_method: "gop",
+          pron_overall: 60,
+          pron: {
+            overall: 60,
+            words: [
+              { word: "GOOD", start_ms: 0, end_ms: 300, gop: 0, score: 100, verdict: "good" },
+              { word: "THROUGH", start_ms: 300, end_ms: 700, gop: -2, score: 3, verdict: "unclear" },
+            ],
+            target_logprob: -3,
+            free_logprob: -2,
+            normalized_conf: 0.5,
+          },
+        },
+      });
+      const spy = vi.spyOn(mock, "synthesizeSpeech");
+      const { container } = mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await recordOnce(user);
+      await screen.findByRole("button", { name: "Hear the word through" });
+      await expectNoA11yViolations(container);
+      await user.click(screen.getByRole("button", { name: "Hear the word through" }));
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      expect(spy.mock.calls[0]?.[0]).toBe("through");
+    });
+
     it("the S key plays the prompt slowly", async () => {
       const user = userEvent.setup();
       const mock = createMockIpc();

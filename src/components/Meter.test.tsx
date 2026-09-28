@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/preact";
+import { fireEvent, render, screen } from "@testing-library/preact";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -161,6 +161,24 @@ describe("WordScoreView", () => {
     expect(screen.getByTitle("THERE: worth another listen")).toBeInTheDocument();
     expect(screen.queryByText("96")).not.toBeInTheDocument();
     expect(screen.queryByText("7")).not.toBeInTheDocument();
+  });
+
+  it("turns only marked words into buttons that report the word, when asked to", () => {
+    const heard: string[] = [];
+    render(
+      <WordScoreView
+        words={[word({ word: "FINE" }), word({ word: "THROUGH", verdict: "unclear" })]}
+        onHear={(w) => heard.push(w)}
+      />,
+    );
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Hear the word through" }));
+    expect(heard).toEqual(["THROUGH"]);
+  });
+
+  it("leaves words as plain text without a listener", () => {
+    render(<WordScoreView words={[word({ word: "THERE", verdict: "unclear" })]} />);
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("explains what a flag is worth, or that there are none", () => {

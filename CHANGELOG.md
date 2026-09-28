@@ -57,6 +57,9 @@ Notable changes to this project. The format follows
   lengthens a sentence by about a third on the shipped voice (pauses do not
   stretch), and the recogniser still understands it.
 
+- **Hear a marked word.** A word flagged in the feedback is now a button that
+  says that word aloud, so the next attempt starts from how it should sound.
+
 ### Changed
 
 - **Accessibility.** Buttons and control borders in dark mode now meet WCAG

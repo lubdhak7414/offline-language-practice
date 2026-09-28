@@ -385,6 +385,17 @@ button.primary.recording {
 .word-gop {
   white-space: nowrap;
 }
+/* A marked word that plays when pressed: looks like the word, not a button. */
+.word-button {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.word-button:hover {
+  background: var(--bg-sunken);
+}
 .word-flag {
   font-size: var(--text-xs);
   margin-inline-start: 0.2em;

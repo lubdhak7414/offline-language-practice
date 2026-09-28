@@ -304,6 +304,20 @@ export function Practice(props: { announce: (msg: string) => void }) {
     }
   }, [prompt]);
 
+  // A marked word, spoken alone. Lower-cased: the voice's phonemizer spells an
+  // all-capitals word out letter by letter.
+  const hearWord = useCallback(async (word: string) => {
+    if (speakingRef.current) return;
+    speakingRef.current = true;
+    try {
+      await speak(word.toLowerCase(), player.current);
+    } catch (e) {
+      setError(friendlyTtsError(e));
+    } finally {
+      speakingRef.current = false;
+    }
+  }, []);
+
   const playRecording = useCallback(async () => {
     if (!lastPcm) return;
     try {
@@ -513,8 +527,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
           {report.pron && (
             <>
               <h2>How clearly you said it</h2>
-              <WordScoreView words={report.pron.words} />
-              <FlagNote words={report.pron.words} />
+              <WordScoreView words={report.pron.words} onHear={(w) => void hearWord(w)} />
+              <FlagNote words={report.pron.words} canHear />
             </>
           )}
 
