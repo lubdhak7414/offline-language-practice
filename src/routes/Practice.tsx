@@ -8,6 +8,7 @@ import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { categoryForGoal } from "../lib/goals";
 import { OwnPrompts } from "../components/OwnPrompts";
+import { answerLengthNote, targetSeconds } from "../lib/answerLength";
 import { describeChange } from "../lib/attemptDelta";
 import { describeDailyGoal } from "../lib/practiceGoal";
 import { tzOffsetMinutes } from "../lib/tz";
@@ -351,6 +352,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
     }
   }, [announce, prompt, savedPromptId]);
 
+  // An open interview question: no pronunciation score, but the length of
+  // the answer is worth a word of advice.
+  const isInterviewAnswer = prompt?.category === "interview" && !prompt.target_text;
+  const lengthNote =
+    report && prompt ? answerLengthNote(report.duration_ms, prompt.level, isInterviewAnswer) : null;
+
   return (
     <section class="route">
       <header class="route-head">
@@ -423,6 +430,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
           </div>
           <p class="prompt-framing">{prompt.prompt_text}</p>
           {prompt.target_text && <p class="prompt-target">{prompt.target_text}</p>}
+          {isInterviewAnswer && (
+            <p class="muted">Aim for about {targetSeconds(prompt.level)} seconds.</p>
+          )}
           <div class="row">
             <button type="button" onClick={() => void speakPrompt()}>
               Listen <kbd>P</kbd>
@@ -520,6 +530,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
           )}
 
           {change && <p class="muted try-change">{change}</p>}
+          {lengthNote && <p class="muted answer-length">{lengthNote}</p>}
           {summary && describeSession(summary) && (
             <p class="muted session-summary">{describeSession(summary)}</p>
           )}

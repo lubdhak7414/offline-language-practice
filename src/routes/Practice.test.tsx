@@ -226,6 +226,41 @@ describe("Practice", () => {
     expect(await screen.findByText("About the same as your last try (100).")).toBeInTheDocument();
   });
 
+  it("gives an open interview answer a target length and a length note", async () => {
+    const user = userEvent.setup();
+    mount(
+      createMockIpc({
+        preferences: { goal: "interview" },
+        prompts: [
+          makePrompt({
+            id: "i1",
+            category: "interview",
+            level: 2,
+            prompt_text: "Why this role?",
+            target_text: null,
+          }),
+        ],
+      }),
+    );
+    await screen.findByText("Why this role?");
+    expect(screen.getByText("Aim for about 60 seconds.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    // The mock's attempt lasts two seconds: well short of a minute.
+    expect(await screen.findByText(/^Short for this question \(2 s\)/)).toBeInTheDocument();
+  });
+
+  it("gives no length advice on a read-aloud prompt", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    expect(screen.queryByText(/^Aim for about/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    await screen.findByText(/^Overall/);
+    expect(screen.queryByText(/for this question/)).not.toBeInTheDocument();
+  });
+
   it("shows a session summary from the second attempt, not the first", async () => {
     const user = userEvent.setup();
     mount(createMockIpc());

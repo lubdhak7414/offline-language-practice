@@ -36,6 +36,11 @@ Notable changes to this project. The format follows
   produce digits and could never match them. Up to 200 are kept, in the
   database, so a backup carries them.
 
+- **Interview answers get a target length.** An open interview question says
+  how long to aim for (30, 60 or 90 seconds by level) and, after you answer,
+  whether yours was short, about right or long. It is advice about length
+  only; what you said is never scored.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides
