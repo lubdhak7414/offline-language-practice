@@ -608,9 +608,11 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     // session (a NOT IN over `attempts`); this cycles through the pool. No
     // route depends on the skip, so no test can be misled by it yet.
     nextPrompt(args: NextPromptArgs) {
-      const pool = args.category
-        ? prompts.filter((p) => p.category === args.category)
-        : prompts;
+      const pool = prompts.filter(
+        (p) =>
+          (args.category === undefined || p.category === args.category) &&
+          (args.level === undefined || p.level === args.level),
+      );
       const next = pool[promptCursor % Math.max(1, pool.length)];
       promptCursor += 1;
       return record("nextPrompt", [args], next ?? null);

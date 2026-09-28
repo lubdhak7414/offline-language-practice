@@ -14,8 +14,9 @@ feedback and spaced repetition, running entirely on-device.
 - **Practice loop.** Pick a prompt, record yourself, and get scored: a
   sentence-level pronunciation score from CTC forced alignment, fluency
   (speaking rate, pauses, fillers) and offline grammar feedback, marked in
-  place and listed with suggestions under the transcript. About 120 built-in prompts across everyday conversation and
-  job interviews.
+  place and listed with suggestions under the transcript. About 120
+  built-in prompts across everyday conversation and job interviews, at
+  three levels you can pick from.
 - **Hear yourself.** After an attempt, play your own recording next to the
   feedback and the voice's reading of the prompt. The recording stays in
   memory and is dropped with the prompt; it is never written to disk.

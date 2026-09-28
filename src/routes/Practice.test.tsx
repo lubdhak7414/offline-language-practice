@@ -213,6 +213,42 @@ describe("Practice", () => {
     expect(await screen.findByText(/db is gone/)).toBeInTheDocument();
   });
 
+  it("asks for prompts at the picked level, in the same session", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({
+      prompts: [
+        makePrompt({ id: "l1", level: 1, prompt_text: "Easy one" }),
+        makePrompt({ id: "l3", level: 3, prompt_text: "Hard one" }),
+      ],
+    });
+    mount(mock);
+    await screen.findByText("Easy one");
+    await user.click(screen.getByRole("button", { name: "Level 3" }));
+    expect(await screen.findByText("Hard one")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Level 3" })).toHaveAttribute("aria-pressed", "true");
+    const nexts = mock.calls.filter((c) => c.name === "nextPrompt");
+    expect(nexts[nexts.length - 1]?.args[0]).toMatchObject({ level: 3 });
+    expect(mock.calls.filter((c) => c.name === "startSession")).toHaveLength(1);
+
+    // Skip keeps the level.
+    await user.click(screen.getByRole("button", { name: "Skip" }));
+    const after = mock.calls.filter((c) => c.name === "nextPrompt");
+    expect(after[after.length - 1]?.args[0]).toMatchObject({ level: 3 });
+
+    await user.click(screen.getByRole("button", { name: "Any level" }));
+    const any = mock.calls.filter((c) => c.name === "nextPrompt");
+    expect(any[any.length - 1]?.args[0]).not.toHaveProperty("level");
+  });
+
+  it("says so when a level has no prompts instead of loading forever", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc({ prompts: [makePrompt({ level: 1 })] }));
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: "Level 2" }));
+    expect(await screen.findByText(/No prompts here at level 2/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading a prompt…")).not.toBeInTheDocument();
+  });
+
   describe("audio and saving", () => {
     let played: number;
     beforeEach(() => {

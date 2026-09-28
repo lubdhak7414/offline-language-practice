@@ -24,6 +24,14 @@ const CATEGORIES = [
   { id: "interview", label: "Job interview" },
 ] as const;
 
+/** `null` is every level; the built-in prompts use 1–3. */
+const LEVELS: ReadonlyArray<{ id: number | null; label: string }> = [
+  { id: null, label: "Any level" },
+  { id: 1, label: "Level 1" },
+  { id: 2, label: "Level 2" },
+  { id: 3, label: "Level 3" },
+];
+
 export function Practice(props: { announce: (msg: string) => void }) {
   const { announce } = props;
   const [category, setCategory] = useState<string>("conversation");
@@ -58,6 +66,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
   // Newest request wins: a double-click on Skip leaves two nextPrompt calls in
   // flight, and the slower one must not bring back a prompt already replaced.
   const promptSeq = useRef(0);
+  // Read through a ref by `loadPrompt`, so picking a level asks for a new
+  // prompt without reopening the session (which would forget what was done).
+  const [levelFilter, setLevelFilter] = useState<number | null>(null);
+  const levelRef = useRef<number | null>(null);
+  // The backend answered and had nothing to offer, as opposed to still loading.
+  const [noPrompt, setNoPrompt] = useState(false);
 
   const runCheck = useCallback(async () => {
     if (checkingRef.current || checkText.trim() === "") return;
@@ -82,12 +96,15 @@ export function Practice(props: { announce: (msg: string) => void }) {
       setLastPcm(null);
       setStage("prompt");
       try {
+        const lvl = levelRef.current;
         const next = await ipc().nextPrompt({
           ...(session === undefined ? {} : { sessionId: session }),
           category: cat,
+          ...(lvl === null ? {} : { level: lvl }),
         });
         if (seq !== promptSeq.current) return;
         setPrompt(next);
+        setNoPrompt(next === null);
         if (next) announce(next.prompt_text);
       } catch (e) {
         if (seq !== promptSeq.current) return;
@@ -268,6 +285,24 @@ export function Practice(props: { announce: (msg: string) => void }) {
             </button>
           ))}
         </div>
+        <div class="segmented" role="group" aria-label="Level">
+          {LEVELS.map((l) => (
+            <button
+              key={String(l.id)}
+              type="button"
+              aria-pressed={levelFilter === l.id}
+              disabled={stage === "recording" || stage === "scoring"}
+              onClick={() => {
+                if (levelRef.current === l.id) return;
+                levelRef.current = l.id;
+                setLevelFilter(l.id);
+                void loadPrompt(sessionId, category);
+              }}
+            >
+              {l.label}
+            </button>
+          ))}
+        </div>
       </header>
 
       {!asrReady && (
@@ -282,7 +317,13 @@ export function Practice(props: { announce: (msg: string) => void }) {
         </p>
       )}
 
-      {!prompt && !error && <p class="muted">Loading a prompt…</p>}
+      {!prompt && !error && !noPrompt && <p class="muted">Loading a prompt…</p>}
+      {noPrompt && (
+        <p class="muted">
+          No prompts here{levelFilter === null ? "" : ` at level ${levelFilter}`}. Pick another
+          level or category.
+        </p>
+      )}
 
       {prompt && (
         <article class="prompt-card">
