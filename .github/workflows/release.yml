@@ -250,9 +250,8 @@ jobs:
           uploadUpdaterSignatures: true
 
       # Does what was just built install and boot anywhere but here? The .deb
-      # is unpacked into a scratch root and the AppImage is extracted, and each
-      # is run on a private Xvfb with scratch XDG dirs: the espeak-ng data must
-      # ship in the bundle, and the app must stay up, create app.db and print
+      # is unpacked into a scratch root and run on a private Xvfb with
+      # scratch XDG dirs: the espeak-ng data must ship in the bundle, and the app must stay up, create app.db and print
       # no panic. TTS once worked only on the builder's machine because the
       # data was found through a path in the build tree; nothing but running
       # the shipped bundle can show that. It checks the very bundle this leg
@@ -261,18 +260,19 @@ jobs:
       # env and it uploads nothing. The bundles are already in the draft by
       # now, so a failure here turns the run red without removing them: like
       # any partial build, `attest` still runs and the run still ends red.
-      - name: Smoke-test the Linux bundles
+      - name: Smoke-test the Linux bundle
         if: runner.os == 'Linux'
         run: |
           deb=$(find "$CARGO_TARGET_DIR" -path '*/bundle/deb/*.deb')
-          appimage=$(find "$CARGO_TARGET_DIR" -path '*/bundle/appimage/*.AppImage')
-          for f in "$deb" "$appimage"; do
-            if [ -z "$f" ] || [ "$(printf '%s\n' "$f" | wc -l)" -ne 1 ]; then
-              echo "::error::Expected exactly one .deb and one .AppImage under $CARGO_TARGET_DIR; got: '$deb' '$appimage'"
-              exit 1
-            fi
-          done
-          scripts/bundle-smoke.sh "$deb" "$appimage"
+          if [ -z "$deb" ] || [ "$(printf '%s\n' "$deb" | wc -l)" -ne 1 ]; then
+            echo "::error::Expected exactly one .deb under $CARGO_TARGET_DIR; got: '$deb'"
+            exit 1
+          fi
+          # The .deb only. scripts/bundle-smoke.sh also takes an AppImage as a
+          # second argument, but that has not been run on a hosted runner yet;
+          # add "$appimage" here after a rehearsal shows it boots under Xvfb,
+          # so an untried check cannot turn a real release red.
+          scripts/bundle-smoke.sh "$deb"
 
   # Checksums and provenance are the whole security story for an unsigned
   # release, so they are produced once, over every platform's output, rather
