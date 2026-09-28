@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
 import { Practice } from "../routes/Practice";
+import { expectNoA11yViolations } from "../test/axe";
 
 vi.mock("../app/recorder", () => ({
   MAX_RECORDING_MS: 120_000,
@@ -91,5 +92,21 @@ describe("Your own prompts", () => {
     await user.click(screen.getByRole("button", { name: "Delete: Good morning everyone." }));
     await waitFor(() => expect(screen.queryByRole("list", { name: "Your prompts" })).not.toBeInTheDocument());
     expect(mock.calls.some((c) => c.name === "deletePrompt")).toBe(true);
+  });
+
+  it("has no accessibility violations, empty, filled and showing an error", async () => {
+    const user = userEvent.setup();
+    const view = mount(createMockIpc());
+    await open(user);
+    await expectNoA11yViolations(view.container);
+    await user.type(screen.getByLabelText("Sentence"), "Meet me at 5.");
+    await user.click(screen.getByRole("button", { name: "Add and practise" }));
+    await screen.findByRole("alert");
+    await expectNoA11yViolations(view.container);
+    await user.clear(screen.getByLabelText("Sentence"));
+    await user.type(screen.getByLabelText("Sentence"), "Good morning everyone.");
+    await user.click(screen.getByRole("button", { name: "Add and practise" }));
+    await screen.findByRole("list", { name: "Your prompts" });
+    await expectNoA11yViolations(view.container);
   });
 });

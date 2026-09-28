@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Settings } from "./Settings";
 
 const state = vi.hoisted(() => ({
@@ -42,8 +43,8 @@ afterEach(() => {
 
 function mount(mock = createMockIpc()) {
   restore = setIpc(mock);
-  render(<Settings announce={() => {}} />);
-  return mock;
+  const view = render(<Settings announce={() => {}} />);
+  return Object.assign(mock, { container: view.container });
 }
 
 describe("Settings microphone", () => {
@@ -85,5 +86,15 @@ describe("Settings microphone", () => {
     mount();
     fireEvent.click(await screen.findByRole("button", { name: "Test microphone" }));
     expect(await screen.findByText(/Microphone access was blocked/)).toBeInTheDocument();
+  });
+
+  it("has no accessibility violations with the microphone list and a test result", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    state.peak = 0.03;
+    const mock = mount(createMockIpc({ preferences: { mic_device_id: "gone" } }));
+    fireEvent.click(await screen.findByRole("button", { name: "Test microphone" }));
+    await vi.advanceTimersByTimeAsync(2100);
+    await screen.findByText(/That was quiet/);
+    await expectNoA11yViolations(mock.container);
   });
 });

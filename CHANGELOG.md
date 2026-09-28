@@ -50,6 +50,11 @@ Notable changes to this project. The format follows
 
 ### Changed
 
+- **Accessibility.** Buttons and control borders in dark mode now meet WCAG
+  contrast (primary buttons have dark text on the light accent; input outlines
+  are darker in both themes). The two text fields when editing a card are
+  labelled. Every screen is now checked with axe-core in the tests, and
+  `scripts/contrast.mjs` checks every colour pair in the theme.
 - **Prompts follow your history.** Read-aloud prompts you scored low on come
   round about eight times as often as ones you scored high on, judged against
   your own scores once you have ten or more. Nothing is ever removed, and
