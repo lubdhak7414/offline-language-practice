@@ -18,6 +18,12 @@ Notable changes to this project. The format follows
   changed, or set to 0 to hide it, in Settings. It only counts; nothing is
   locked and there are no reminders.
 
+- **Try again, with the change shown.** After a retry of the same read-aloud
+  prompt, Practice says whether the pronunciation score went up, down or is
+  about the same as your last try. Changes under five points count as the
+  same, because the score is a hint. Nothing is compared across a different
+  prompt or between different kinds of scoring.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides

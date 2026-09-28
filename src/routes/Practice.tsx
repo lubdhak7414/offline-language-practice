@@ -7,6 +7,7 @@ import { createClipPlayer, speak } from "../lib/audio/player";
 import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { categoryForGoal } from "../lib/goals";
+import { describeChange } from "../lib/attemptDelta";
 import { describeDailyGoal } from "../lib/practiceGoal";
 import { tzOffsetMinutes } from "../lib/tz";
 import { goPrefix } from "../lib/globalKeys";
@@ -51,6 +52,11 @@ export function Practice(props: { announce: (msg: string) => void }) {
   const [prompt, setPrompt] = useState<PromptView | null>(null);
   const [stage, setStage] = useState<Stage>("prompt");
   const [report, setReport] = useState<AttemptReport | null>(null);
+  // The report before the one on screen, for "up 8 points from your last try".
+  // Only kept while the prompt stays the same; a new prompt starts clean.
+  const reportRef = useRef<AttemptReport | null>(null);
+  reportRef.current = report;
+  const [change, setChange] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [level, setLevel] = useState(0);
@@ -217,6 +223,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
         ...(prompt ? { promptId: prompt.id } : {}),
         ...(prompt?.target_text ? { targetText: prompt.target_text } : {}),
       });
+      setChange(describeChange(reportRef.current, report));
       setReport(report);
       setStage("feedback");
       setAttemptsToday((n) => n + 1);
@@ -499,6 +506,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
             </p>
           )}
 
+          {change && <p class="muted try-change">{change}</p>}
           {summary && describeSession(summary) && (
             <p class="muted session-summary">{describeSession(summary)}</p>
           )}

@@ -212,6 +212,20 @@ describe("Practice", () => {
     expect(screen.queryByText(/of \d+ today/)).not.toBeInTheDocument();
   });
 
+  it("compares a retry with the last try on the same prompt, not the first try", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    await screen.findByText(/^Overall/);
+    expect(screen.queryByText(/your last try/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Try again/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    expect(await screen.findByText("About the same as your last try (100).")).toBeInTheDocument();
+  });
+
   it("shows a session summary from the second attempt, not the first", async () => {
     const user = userEvent.setup();
     mount(createMockIpc());
