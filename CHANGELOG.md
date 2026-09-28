@@ -57,6 +57,10 @@ Notable changes to this project. The format follows
   lengthens a sentence by about a third on the shipped voice (pauses do not
   stretch), and the recogniser still understands it.
 
+- **Longer practice history.** Recent practice keeps up to 200 attempts: the
+  first 20 show, "Show more" adds 20 at a time, and a day picker lists every
+  attempt from one chosen day (local calendar days).
+
 - **Weekly recap.** Progress opens with a sentence on the last 7 days of
   speaking (attempts, days practised) and, where read-aloud attempts were
   scored, their average against the week before. The average is weighted by

@@ -131,7 +131,38 @@ describe("Progress", () => {
       expect(rows[1]).toHaveTextContent("Free speaking: I would say my biggest strength is staying calm when things…");
       expect(rows[1]).toHaveTextContent("Not scored");
       expect(rows[2]).toHaveTextContent("100 (word matching)");
-      expect(mock.calls.find((c) => c.name === "listAttempts")?.args).toEqual([undefined, 20]);
+      expect(mock.calls.find((c) => c.name === "listAttempts")?.args).toEqual([undefined, 200]);
+    });
+
+    it("pages through a long history and can show one whole day", async () => {
+      const user = userEvent.setup();
+      const day = (n: number, h: number) => new Date(2026, 8, 28 - n, h).getTime();
+      // 25 attempts on the 28th and 3 on the 27th, newest first.
+      const many = [
+        ...Array.from({ length: 25 }, (_, i) => ({ ...row, id: `t${i}`, created_at: day(0, 23) - i * 60_000 })),
+        ...Array.from({ length: 3 }, (_, i) => ({ ...row, id: `y${i}`, created_at: day(1, 12) - i * 60_000 })),
+      ];
+      mount(createMockIpc({ attempts: many }));
+      const section = await screen.findByRole("region", { name: "Recent practice" });
+      const count = () => within(section).getAllByRole("row").length - 1;
+      await within(section).findByRole("table");
+      expect(count()).toBe(20);
+
+      await user.click(within(section).getByRole("button", { name: "Show 8 more" }));
+      expect(count()).toBe(28);
+      expect(within(section).queryByRole("button", { name: /more$/ })).not.toBeInTheDocument();
+
+      await user.selectOptions(within(section).getByRole("combobox", { name: "Show" }), "2026-9-27");
+      expect(count()).toBe(3);
+      await user.selectOptions(within(section).getByRole("combobox", { name: "Show" }), "");
+      expect(count()).toBe(28);
+    });
+
+    it("offers no day picker when all attempts fall on one day", async () => {
+      mount(createMockIpc({ attempts: [row, { ...row, id: "a2" }] }));
+      const section = await screen.findByRole("region", { name: "Recent practice" });
+      await within(section).findByRole("table");
+      expect(within(section).queryByRole("combobox")).not.toBeInTheDocument();
     });
 
     it("says there is no practice yet", async () => {
@@ -207,7 +238,12 @@ describe("Progress accessibility", () => {
     };
     const { container } = mount(
       createMockIpc({
-        attempts: [row, { ...row, id: "a2", prompt_id: null, target_text: null, pron_overall: null, pron_method: null }],
+        attempts: [
+          row,
+          { ...row, id: "a2", prompt_id: null, target_text: null, pron_overall: null, pron_method: null },
+          // A second day, so the day picker is on the page too.
+          { ...row, id: "a3", created_at: row.created_at - 2 * 86_400_000 },
+        ],
       }),
     );
     await screen.findByRole("region", { name: "Recent practice" });

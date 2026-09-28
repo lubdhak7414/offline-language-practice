@@ -6,6 +6,7 @@ import { ipc } from "../ipc/commands";
 import type { AttemptRow, DayCount, ForecastDay, Overview, PracticeDay, RetentionBucket } from "../ipc/types";
 import { BarChart, LineChart, type ChartPoint } from "../components/Chart";
 import { tzOffsetMinutes } from "../lib/tz";
+import { dayOptions, PAGE_SIZE, visibleRows } from "../lib/attemptDays";
 import { describeWeek } from "../lib/weeklyRecap";
 
 const STATS_DAYS = 30;
@@ -13,7 +14,8 @@ const FORECAST_DAYS = 14;
 const RETENTION_DAYS = 90;
 const RETENTION_BUCKET_DAYS = 7;
 /** Newest practice attempts listed; the backend caps the request at 200. */
-const RECENT_ATTEMPTS = 20;
+/** Fetched once; the list shows a page of it at a time, or one chosen day. */
+const HISTORY_ATTEMPTS = 200;
 /** Characters of a free-speaking transcript shown in the history table. */
 const SNIPPET_CHARS = 60;
 
@@ -87,7 +89,7 @@ export function Progress() {
     })();
     void (async () => {
       try {
-        const rows = await ipc().listAttempts(undefined, RECENT_ATTEMPTS);
+        const rows = await ipc().listAttempts(undefined, HISTORY_ATTEMPTS);
         if (live) setAttempts(rows);
       } catch (e) {
         if (live) setAttemptsError(String(e));
@@ -165,6 +167,10 @@ export function Progress() {
 
 function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | null }) {
   const { attempts, error } = props;
+  const [shown, setShown] = useState(PAGE_SIZE);
+  const [dayKey, setDayKey] = useState<string | null>(null);
+  const days = attempts ? dayOptions(attempts) : [];
+  const rowsToShow = attempts ? visibleRows(attempts, dayKey, shown) : [];
   return (
     <section class="recent-practice" aria-labelledby="recent-practice-title">
       <h2 id="recent-practice-title">Recent practice</h2>
@@ -176,6 +182,23 @@ function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | 
       {!error && attempts === null && <p class="muted">Loading…</p>}
       {attempts?.length === 0 && (
         <p class="muted">No practice yet. Record an attempt on the Practice screen and it shows up here.</p>
+      )}
+      {attempts && days.length > 1 && (
+        <div class="row">
+          <label for="history-day">Show</label>
+          <select
+            id="history-day"
+            value={dayKey ?? ""}
+            onChange={(e) => setDayKey((e.target as HTMLSelectElement).value || null)}
+          >
+            <option value="">Latest attempts</option>
+            {days.map((d) => (
+              <option key={d.key} value={d.key}>
+                {d.label} ({d.count})
+              </option>
+            ))}
+          </select>
+        </div>
       )}
       {attempts && attempts.length > 0 && (
         <table class="cards-table">
@@ -192,7 +215,7 @@ function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | 
             </tr>
           </thead>
           <tbody>
-            {attempts.map((a) => (
+            {rowsToShow.map((a) => (
               <tr key={a.id}>
                 <td>{whenLabel(a.created_at)}</td>
                 <td>
@@ -233,6 +256,11 @@ function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | 
             ))}
           </tbody>
         </table>
+      )}
+      {attempts && dayKey === null && attempts.length > shown && (
+        <button type="button" onClick={() => setShown(shown + PAGE_SIZE)}>
+          Show {Math.min(PAGE_SIZE, attempts.length - shown)} more
+        </button>
       )}
     </section>
   );
