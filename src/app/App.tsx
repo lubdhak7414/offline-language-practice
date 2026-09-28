@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { events } from "../ipc/events";
 import { ipc } from "../ipc/commands";
 import { globalKeyAction, goPrefix } from "../lib/globalKeys";
+import { applyTheme } from "../lib/theme";
 import { navigate, route, startRouter, type Route } from "./router";
 import { KeyboardHelp } from "../components/KeyboardHelp";
 import { Practice } from "../routes/Practice";
@@ -64,6 +65,7 @@ export function App() {
       .getPreferences()
       .then((p) => {
         setOnboarded(p.onboarded);
+        applyTheme(p.theme);
         // Once per launch, and only when the user opted in. The backend
         // refuses a "startup" check with the preference off regardless.
         if (!alive || !p.onboarded || !p.check_updates) return;

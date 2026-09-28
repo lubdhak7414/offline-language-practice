@@ -77,6 +77,12 @@ Notable changes to this project. The format follows
 - **Hear a marked word.** A word flagged in the feedback is now a button that
   says that word aloud, so the next attempt starts from how it should sound.
 
+### Fixed
+
+- **Chosen theme applies at launch.** A light or dark theme picked in Settings
+  was only applied once Settings was opened; after a restart the app followed
+  the system setting until then. The app shell now applies it on start.
+
 ### Changed
 
 - **Accessibility.** Buttons and control borders in dark mode now meet WCAG

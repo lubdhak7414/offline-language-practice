@@ -21,6 +21,23 @@ afterEach(() => {
   goPrefix.armed = false;
 });
 
+describe("App theme", () => {
+  afterEach(() => document.documentElement.removeAttribute("data-theme"));
+
+  it("applies the saved theme at launch, without visiting Settings", async () => {
+    restore?.();
+    restore = setIpc(createMockIpc({ preferences: { theme: "dark" } }));
+    render(<App />);
+    await waitFor(() => expect(document.documentElement.getAttribute("data-theme")).toBe("dark"));
+  });
+
+  it("leaves the system's choice alone when the theme is system", async () => {
+    render(<App />);
+    await screen.findByRole("navigation", { name: "Main" });
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+  });
+});
+
 describe("App", () => {
   it("opens on onboarding when the database says it has never been run", async () => {
     // The whole point of the flag: a fresh install must not land on

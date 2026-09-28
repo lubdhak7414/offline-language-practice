@@ -6,6 +6,7 @@ import { ipc } from "../ipc/commands";
 import { createClipPlayer, speak } from "../lib/audio/player";
 import { friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { describeMicLevel } from "../lib/micLevel";
+import { applyTheme } from "../lib/theme";
 import { ModelDownloads, formatBytes } from "../components/ModelDownloads";
 import type {
   AvailableUpdate,
@@ -710,15 +711,6 @@ function UpdateStatusView(props: {
       );
     case "error":
       return <p class="notice notice-error">{status.message}</p>;
-  }
-}
-
-function applyTheme(theme: string) {
-  if (typeof document === "undefined") return;
-  if (theme === "light" || theme === "dark") {
-    document.documentElement.setAttribute("data-theme", theme);
-  } else {
-    document.documentElement.removeAttribute("data-theme");
   }
 }
 
