@@ -502,6 +502,8 @@ export type Ipc = {
   startSession(kind: string): Promise<string>;
   endSession(sessionId: string): Promise<void>;
   nextPrompt(args: NextPromptArgs): Promise<PromptView | null>;
+  /** One prompt by id; null when it no longer exists (a deleted prompt of your own). */
+  getPrompt(promptId: string): Promise<PromptView | null>;
   addPrompt(args: AddPromptArgs): Promise<PromptView>;
   listCustomPrompts(): Promise<PromptView[]>;
   deletePrompt(promptId: string): Promise<void>;

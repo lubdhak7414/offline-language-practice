@@ -57,6 +57,10 @@ Notable changes to this project. The format follows
   lengthens a sentence by about a third on the shipped voice (pauses do not
   stretch), and the recogniser still understands it.
 
+- **Practise again.** Each row in Recent practice has a button that opens that
+  same prompt on the Practice screen (in its own category). A prompt of your
+  own that you have since deleted falls back to a random one.
+
 - **Hear a marked word.** A word flagged in the feedback is now a button that
   says that word aloud, so the next attempt starts from how it should sound.
 

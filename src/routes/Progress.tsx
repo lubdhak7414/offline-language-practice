@@ -1,5 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 
+import { requestPractice } from "../app/handoff";
+import { navigate } from "../app/router";
 import { ipc } from "../ipc/commands";
 import type { AttemptRow, DayCount, ForecastDay, Overview, PracticeDay, RetentionBucket } from "../ipc/types";
 import { BarChart, LineChart, type ChartPoint } from "../components/Chart";
@@ -180,6 +182,9 @@ function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | 
               <th scope="col">Overall</th>
               <th scope="col">Pronunciation</th>
               <th scope="col">Length</th>
+              <th scope="col">
+                <span class="visually-hidden">Practise again</span>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -207,6 +212,19 @@ function RecentPractice(props: { attempts: AttemptRow[] | null; error: string | 
                   )}
                 </td>
                 <td>{(a.duration_ms / 1000).toFixed(1)}s</td>
+                <td>
+                  {a.prompt_id !== null && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        requestPractice(a.prompt_id as string);
+                        navigate("practice");
+                      }}
+                    >
+                      Practise again
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>

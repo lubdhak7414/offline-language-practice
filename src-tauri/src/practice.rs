@@ -705,6 +705,30 @@ pub async fn add_prompt(pool: &sqlx::SqlitePool, p: NewPrompt) -> Result<PromptV
 }
 
 /// The user's own prompts, newest first.
+/// One prompt by id, or `None` when it is gone (a deleted prompt of the
+/// user's own, for instance).
+pub async fn get_prompt(
+    pool: &sqlx::SqlitePool,
+    prompt_id: &str,
+) -> Result<Option<PromptView>, AppError> {
+    let row = sqlx::query_as::<_, PromptRow>(
+        "SELECT id, category, topic, prompt_text, target_text, level FROM prompts WHERE id = ?",
+    )
+    .bind(prompt_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(id, category, topic, prompt_text, target_text, level)| PromptView {
+            id,
+            category,
+            topic,
+            prompt_text,
+            target_text,
+            level,
+        },
+    ))
+}
+
 pub async fn list_custom_prompts(pool: &sqlx::SqlitePool) -> Result<Vec<PromptView>, AppError> {
     let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
         "SELECT id, category, topic, prompt_text, target_text, level FROM prompts \
@@ -855,6 +879,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n as usize, BUILTIN_PROMPTS.len());
+    }
+
+    #[tokio::test]
+    async fn get_prompt_finds_one_by_id_and_none_when_gone() {
+        let pool = test_pool().await;
+        seed_prompts(&pool).await.unwrap();
+        let any = next_prompt(&pool, None, None, None)
+            .await
+            .unwrap()
+            .expect("a prompt");
+        let found = get_prompt(&pool, &any.id).await.unwrap().expect("found");
+        assert_eq!(
+            (found.id, found.prompt_text, found.target_text),
+            (any.id, any.prompt_text, any.target_text)
+        );
+        assert!(get_prompt(&pool, "custom-not-there")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

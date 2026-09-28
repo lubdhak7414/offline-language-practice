@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/preact";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { requestPractice } from "../app/handoff";
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makePrompt, type MockIpc } from "../ipc/mock";
 import { expectNoA11yViolations } from "../test/axe";
@@ -518,6 +519,24 @@ describe("Practice", () => {
       release();
       await waitFor(() => expect(played).toBe(1));
     });
+  });
+});
+
+describe("Practice asked for a particular prompt", () => {
+  it("opens that prompt, in its own category, instead of a random one", async () => {
+    const wanted = makePrompt({ id: "iv-1", category: "interview", prompt_text: "Why this job?", target_text: null });
+    const mock = createMockIpc({ prompts: [makePrompt(), wanted] });
+    requestPractice("iv-1");
+    mount(mock);
+    await screen.findByText("Why this job?");
+    expect(mock.calls.find((c) => c.name === "startSession")?.args).toEqual(["interview"]);
+    expect(mock.calls.some((c) => c.name === "nextPrompt")).toBe(false);
+  });
+
+  it("falls back to a random prompt when the requested one is gone", async () => {
+    requestPractice("custom-deleted");
+    mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
   });
 });
 

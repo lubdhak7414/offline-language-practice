@@ -161,6 +161,10 @@ export const tauriIpc: Ipc = {
     });
   },
 
+  getPrompt(promptId: string) {
+    return invoke<PromptView | null>("get_prompt", { promptId });
+  },
+
   seedPrompts() {
     return invoke<number>("seed_prompts");
   },

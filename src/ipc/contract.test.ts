@@ -63,6 +63,7 @@ describe("Ipc implementations", () => {
         "exportData",
         "getDailyLimits",
         "getPreferences",
+        "getPrompt",
         "getRetention",
         "getVoice",
         "gradeCard",

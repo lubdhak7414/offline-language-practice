@@ -559,6 +559,18 @@ async fn add_prompt(
     .map_err(String::from)
 }
 
+/// One prompt by id, so history can offer "practise this again".
+#[tauri::command]
+async fn get_prompt(
+    prompt_id: String,
+    db: State<'_, DbInstances>,
+) -> Result<Option<crate::practice::PromptView>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    crate::practice::get_prompt(&pool, &prompt_id)
+        .await
+        .map_err(String::from)
+}
+
 #[tauri::command]
 async fn list_custom_prompts(
     db: State<'_, DbInstances>,
@@ -2081,6 +2093,7 @@ pub fn run() {
             start_session,
             end_session,
             next_prompt,
+            get_prompt,
             list_attempts,
             session_summary,
             add_prompt,

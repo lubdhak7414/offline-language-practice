@@ -718,6 +718,10 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       return record("nextPrompt", [args], next ?? null);
     },
 
+    getPrompt(promptId: string) {
+      return record("getPrompt", [promptId], prompts.find((p) => p.id === promptId) ?? null);
+    },
+
     addPrompt(args: AddPromptArgs) {
       const v = validateCustomPrompt(args);
       if (!v.ok) return refuse("addPrompt", [args], `bad input: ${v.message}`);

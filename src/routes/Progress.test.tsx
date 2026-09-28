@@ -1,5 +1,8 @@
 import { render, screen, within } from "@testing-library/preact";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
+
+import { takePracticeRequest } from "../app/handoff";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
@@ -85,6 +88,17 @@ describe("Progress", () => {
       pron_method: "gop",
       overall: 88,
     };
+
+    it("offers Practise again for a prompt and hands its id to Practice", async () => {
+      const user = userEvent.setup();
+      mount(createMockIpc({ attempts: [row, { ...row, id: "a2", prompt_id: null }] }));
+      const section = await screen.findByRole("region", { name: "Recent practice" });
+      const buttons = await within(section).findAllByRole("button", { name: "Practise again" });
+      expect(buttons).toHaveLength(1);
+      await user.click(buttons[0] as HTMLElement);
+      expect(takePracticeRequest()).toBe("p1");
+      expect(takePracticeRequest()).toBeNull();
+    });
 
     it("lists attempts with their scores, newest first", async () => {
       const mock = createMockIpc({

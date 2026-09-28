@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
+import { takePracticeRequest } from "../app/handoff";
 import type { AttemptReport, LintReport, PromptView, SessionSummary } from "../ipc/types";
 import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
 import { createClipPlayer, speak } from "../lib/audio/player";
@@ -96,6 +97,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
   const levelRef = useRef<number | null>(null);
   // The backend answered and had nothing to offer, as opposed to still loading.
   const [noPrompt, setNoPrompt] = useState(false);
+  // A prompt another screen asked for; shown instead of the first random one.
+  const requested = useRef<PromptView | null>(null);
 
   const runCheck = useCallback(async () => {
     if (checkingRef.current || checkText.trim() === "") return;
@@ -163,6 +166,22 @@ export function Practice(props: { announce: (msg: string) => void }) {
       .catch(() => {
         // Unreadable preferences: keep the default category.
       })
+      .then(async () => {
+        // "Practise again" from history. The prompt's own category wins over
+        // the goal's, since the session is per category. A prompt that has
+        // gone (a deleted one of your own) falls back to a random one.
+        const wanted = takePracticeRequest();
+        if (wanted === null) return;
+        try {
+          const p = await ipc().getPrompt(wanted);
+          if (p && live) {
+            requested.current = p;
+            setCategory(p.category);
+          }
+        } catch {
+          // Fall back to a random prompt.
+        }
+      })
       .finally(() => {
         if (live) setGoalLoaded(true);
       });
@@ -204,7 +223,14 @@ export function Practice(props: { announce: (msg: string) => void }) {
         }
         currentSession.current = id;
         setSessionId(id);
-        await loadPrompt(id, category);
+        const first = requested.current;
+        requested.current = null;
+        if (first && first.category === category) {
+          showPrompt(first);
+          announce(first.prompt_text);
+        } else {
+          await loadPrompt(id, category);
+        }
       } catch (e) {
         if (live) setError(String(e));
       }
@@ -215,7 +241,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
       // Close the session it opened; best effort, the next launch is unaffected.
       if (startedId !== undefined) void ipc().endSession(startedId).catch(() => {});
     };
-  }, [category, goalLoaded, loadPrompt]);
+  }, [category, goalLoaded, loadPrompt, showPrompt, announce]);
 
   // Never leave the microphone open when the route unmounts.
   useEffect(() => {
