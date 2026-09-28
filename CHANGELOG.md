@@ -57,6 +57,9 @@ Notable changes to this project. The format follows
   lengthens a sentence by about a third on the shipped voice (pauses do not
   stretch), and the recogniser still understands it.
 
+- **Hear it, then me.** After scoring, one button plays the model voice saying
+  the sentence and then your own recording, to hear the difference back to back.
+
 - **Practise again.** Each row in Recent practice has a button that opens that
   same prompt on the Practice screen (in its own category). A prompt of your
   own that you have since deleted falls back to a random one.

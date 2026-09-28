@@ -353,6 +353,28 @@ export function Practice(props: { announce: (msg: string) => void }) {
     }
   }, [lastPcm]);
 
+  // The model voice, then the learner's own recording, back to back: the
+  // quickest way to hear the difference. Shares the speaking guard so a second
+  // press cannot start a second pair over the first.
+  const compareWithModel = useCallback(async () => {
+    const text = prompt?.target_text;
+    if (!text || !lastPcm || speakingRef.current) return;
+    speakingRef.current = true;
+    try {
+      try {
+        await speak(text, player.current);
+      } catch (e) {
+        setError(friendlyTtsError(e));
+        return;
+      }
+      await player.current.play([f32ToWav(lastPcm, 16000)]);
+    } catch (e) {
+      setError(`Could not play your recording: ${String(e)}`);
+    } finally {
+      speakingRef.current = false;
+    }
+  }, [prompt, lastPcm]);
+
   // Same pattern as the review keys: the rule is pure and tested, and the
   // listener reads current state through a ref so it never has to be
   // re-registered — a listener rebuilt on every render is stale for exactly
@@ -595,6 +617,11 @@ export function Practice(props: { announce: (msg: string) => void }) {
             {lastPcm && (
               <button type="button" onClick={() => void playRecording()}>
                 Play my recording
+              </button>
+            )}
+            {lastPcm && prompt?.target_text && (
+              <button type="button" onClick={() => void compareWithModel()}>
+                Hear it, then me
               </button>
             )}
             {prompt?.target_text &&

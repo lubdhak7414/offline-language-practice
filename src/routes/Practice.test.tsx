@@ -426,6 +426,31 @@ describe("Practice", () => {
       );
     });
 
+    it("plays the model voice and then the learner's recording", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      const spy = vi.spyOn(mock, "synthesizeSpeech");
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await recordOnce(user);
+      const before = played;
+      await user.click(screen.getByRole("button", { name: "Hear it, then me" }));
+      await waitFor(() => expect(played).toBe(before + 2));
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it("has no compare button for free speaking, which has no model sentence", async () => {
+      const user = userEvent.setup();
+      mount(
+        createMockIpc({
+          prompts: [makePrompt({ target_text: null, prompt_text: "Tell me about yourself." })],
+        }),
+      );
+      await screen.findByText("Free speaking");
+      await recordOnce(user);
+      expect(screen.queryByRole("button", { name: "Hear it, then me" })).not.toBeInTheDocument();
+    });
+
     it("stops playback when a new recording starts", async () => {
       const user = userEvent.setup();
       const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
