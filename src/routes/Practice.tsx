@@ -6,6 +6,7 @@ import { createRecorder, MAX_RECORDING_MS } from "../app/recorder";
 import { createClipPlayer, speak } from "../lib/audio/player";
 import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
+import { categoryForGoal } from "../lib/goals";
 import { goPrefix } from "../lib/globalKeys";
 import { practiceKeyAction } from "../lib/keyboard";
 import {
@@ -35,6 +36,9 @@ const LEVELS: ReadonlyArray<{ id: number | null; label: string }> = [
 export function Practice(props: { announce: (msg: string) => void }) {
   const { announce } = props;
   const [category, setCategory] = useState<string>("conversation");
+  // The session starts only once the saved goal has picked the category, so
+  // the first prompt is never the wrong kind.
+  const [goalLoaded, setGoalLoaded] = useState(false);
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [prompt, setPrompt] = useState<PromptView | null>(null);
   const [stage, setStage] = useState<Stage>("prompt");
@@ -114,9 +118,28 @@ export function Practice(props: { announce: (msg: string) => void }) {
     [announce],
   );
 
+  useEffect(() => {
+    let live = true;
+    void ipc()
+      .getPreferences()
+      .then((p) => {
+        if (live) setCategory(categoryForGoal(p.goal));
+      })
+      .catch(() => {
+        // Unreadable preferences: keep the default category.
+      })
+      .finally(() => {
+        if (live) setGoalLoaded(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
   // Open a session per category, so "skip what I already did" is scoped to
   // the thing actually being practised.
   useEffect(() => {
+    if (!goalLoaded) return;
     let live = true;
     void (async () => {
       try {
@@ -139,7 +162,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
     return () => {
       live = false;
     };
-  }, [category, loadPrompt]);
+  }, [category, goalLoaded, loadPrompt]);
 
   // Never leave the microphone open when the route unmounts.
   useEffect(() => {

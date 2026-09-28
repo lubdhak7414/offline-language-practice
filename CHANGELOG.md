@@ -8,6 +8,9 @@ Notable changes to this project. The format follows
 
 ### Changed
 
+- **Practice opens on your goal.** The goal chosen during setup now decides
+  whether Practice starts on everyday conversation or job interviews, and can
+  be changed in Settings. Before, it was saved and never used.
 - **Streak counts speaking practice.** A day counts if you reviewed a card or
   recorded a practice attempt. Before, only card reviews counted, so someone
   who practised speaking every day had no streak.

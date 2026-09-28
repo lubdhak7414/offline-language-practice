@@ -55,6 +55,28 @@ describe("Practice", () => {
     expect(mock.calls.some((c) => c.name === "startSession")).toBe(true);
   });
 
+  it("opens on interview prompts when the saved goal is interview", async () => {
+    const mock = createMockIpc({
+      preferences: { goal: "interview" },
+      prompts: [
+        makePrompt({ id: "i1", category: "interview", prompt_text: "Why this role?", target_text: null }),
+      ],
+    });
+    mount(mock);
+    await screen.findByText("Why this role?");
+    const start = mock.calls.filter((c) => c.name === "startSession");
+    expect(start.map((c) => c.args[0])).toEqual(["interview"]);
+    expect(screen.getByRole("button", { name: "Job interview" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("opens on conversation for the default goal, with one session", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    await screen.findByText("Reply to a greeting:");
+    const start = mock.calls.filter((c) => c.name === "startSession");
+    expect(start.map((c) => c.args[0])).toEqual(["conversation"]);
+  });
+
   it("labels a read-aloud prompt as scoreable", async () => {
     mount(createMockIpc());
     expect(await screen.findByText("Read aloud")).toBeInTheDocument();

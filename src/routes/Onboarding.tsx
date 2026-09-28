@@ -4,6 +4,7 @@ import { ipc } from "../ipc/commands";
 import { createRecorder } from "../app/recorder";
 import { ModelDownloads } from "../components/ModelDownloads";
 import type { Preferences } from "../ipc/types";
+import { GOALS } from "../lib/goals";
 
 /**
  * First run.
@@ -16,24 +17,6 @@ import type { Preferences } from "../ipc/types";
  * that does has to be this, not a README telling a GUI user to run a shell
  * script.
  */
-
-const GOALS = [
-  {
-    id: "everyday",
-    label: "Everyday conversation",
-    detail: "Small talk, phone calls, ordering, disagreeing politely.",
-  },
-  {
-    id: "interview",
-    label: "Job interviews",
-    detail: "Tell me about yourself, behavioural answers, salary questions.",
-  },
-  {
-    id: "both",
-    label: "Both",
-    detail: "Mix prompts from everyday life and interviews.",
-  },
-] as const;
 
 const STEP_TITLES = [
   "Welcome",

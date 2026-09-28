@@ -34,6 +34,17 @@ describe("Settings", () => {
     await waitFor(() => expect(input.value).toBe("9999"));
   });
 
+  it("saves the practice goal", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    const select = (await screen.findByLabelText("Practice goal")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "interview" } });
+    await waitFor(() => expect(select.value).toBe("interview"));
+    const saves = mock.calls.filter((c) => c.name === "setPreferences");
+    const saved = saves[saves.length - 1];
+    expect((saved?.args[0] as { goal: string }).goal).toBe("interview");
+  });
+
   it("sends a retention value inside the allowed range", async () => {
     const mock = createMockIpc({ retention: 0.9 });
     mount(mock);

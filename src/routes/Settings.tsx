@@ -13,6 +13,7 @@ import type {
   UpdateInfo,
   VoiceInfo,
 } from "../ipc/types";
+import { GOALS } from "../lib/goals";
 
 const DIALECTS = ["american", "british", "canadian", "australian"] as const;
 const THEMES = ["system", "light", "dark"] as const;
@@ -327,6 +328,20 @@ export function Settings(props: { announce: (msg: string) => void }) {
 
       <section class="settings-section">
         <h2>Practice</h2>
+        <div class="row">
+          <label for="setting-goal">Practice goal</label>
+          <select
+            id="setting-goal"
+            value={prefs.goal}
+            onChange={(e) => void savePrefs({ ...prefs, goal: (e.target as HTMLSelectElement).value })}
+          >
+            {GOALS.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <div class="row">
           <label for="setting-dialect">Dialect</label>
           <select
