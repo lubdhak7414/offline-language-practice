@@ -96,7 +96,32 @@ describe("LintedText", () => {
       />,
     );
     expect(container.querySelectorAll("mark")).toHaveLength(1);
-    expect(container.textContent).toBe("one two three");
+    expect(container.querySelector(".transcript")?.textContent).toBe("one two three");
+  });
+
+  it("lists every issue and its suggestions as text, not only in a tooltip", () => {
+    render(
+      <LintedText
+        text="I has teh cat"
+        diags={[
+          { start: 6, end: 9, message: "Possible spelling mistake.", suggestions: ["the", "tea"], severity: "error", rule_id: "S" },
+          { start: 2, end: 5, message: "Use the right verb form.", suggestions: ["have"], severity: "error", rule_id: "V" },
+          { start: 10, end: 13, message: "Style note.", suggestions: [], severity: "hint", rule_id: "X" },
+        ]}
+      />,
+    );
+    const items = screen.getAllByRole("listitem").map((li) => li.textContent);
+    expect(items).toEqual([
+      "has — Use the right verb form. Try: have",
+      "teh — Possible spelling mistake. Try: the, tea",
+      "cat — Style note.",
+    ]);
+    expect(screen.getByRole("list", { name: "Grammar suggestions" })).toBeInTheDocument();
+  });
+
+  it("has no suggestion list when nothing is flagged", () => {
+    render(<LintedText text="all good here" diags={[]} />);
+    expect(screen.queryByRole("list")).not.toBeInTheDocument();
   });
 });
 

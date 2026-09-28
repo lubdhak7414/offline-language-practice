@@ -182,7 +182,10 @@ function plural(n: number, word: string): string {
 }
 
 /**
- * Grammar issues, underlined in place in the transcript.
+ * Grammar issues, underlined in place in the transcript and listed in words
+ * underneath. The list is the accessible copy: a `title` tooltip never
+ * reaches a keyboard or screen-reader user, and a mouse user would have to
+ * hover every mark to find the suggestion.
  *
  * Spans arrive as UTF-8 byte offsets, so every slice goes through
  * `byteSlice` — see the note there for why.
@@ -209,5 +212,22 @@ export function LintedText(props: { text: string; diags: LintDiagnostic[] }) {
     cursor = d.end;
   });
   parts.push(byteSlice(text, cursor, Number.MAX_SAFE_INTEGER));
-  return <p class="transcript">{parts}</p>;
+  return (
+    <>
+      <p class="transcript">{parts}</p>
+      <ul class="lint-list" aria-label="Grammar suggestions">
+        {sorted.map((d, i) => (
+          <li key={i}>
+            <q>{byteSlice(text, d.start, d.end)}</q> — {d.message}
+            {d.suggestions.length > 0 && (
+              <>
+                {" "}
+                Try: <strong>{d.suggestions.join(", ")}</strong>
+              </>
+            )}
+          </li>
+        ))}
+      </ul>
+    </>
+  );
 }

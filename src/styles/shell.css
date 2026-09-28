@@ -327,6 +327,16 @@ button.primary.recording {
   color: inherit;
 }
 
+.lint-list {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-6);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.lint-list strong {
+  color: var(--fg);
+}
+
 /* Word verdicts carry an underline style as well as a colour, so they are
    still distinguishable without colour vision. */
 .alignment {
