@@ -159,6 +159,16 @@ label {
   flex-wrap: wrap;
 }
 
+.route-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+.route-title .daily-goal {
+  margin: 0;
+}
+
 .practice-filters {
   margin: 0 0 var(--space-4);
 }
@@ -578,6 +588,10 @@ kbd {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-sunken);
+  /* Not inherited: inside a primary button the text colour is the on-accent
+     one, which is unreadable on this sunken background. --fg on --bg-sunken
+     is checked by scripts/contrast.mjs. */
+  color: var(--fg);
   padding: 1px var(--space-1);
   white-space: nowrap;
 }

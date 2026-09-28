@@ -368,10 +368,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
   return (
     <section class="route">
       <header class="route-head">
-        <h1 tabIndex={-1}>Practice</h1>
-        {describeDailyGoal(attemptsToday, dailyGoal) && (
-          <span class="muted daily-goal">{describeDailyGoal(attemptsToday, dailyGoal)}</span>
-        )}
+        <div class="route-title">
+          <h1 tabIndex={-1}>Practice</h1>
+          {describeDailyGoal(attemptsToday, dailyGoal) && (
+            <span class="muted daily-goal">{describeDailyGoal(attemptsToday, dailyGoal)}</span>
+          )}
+        </div>
         <div class="segmented" role="group" aria-label="What to practise">
           {CATEGORIES.map((c) => (
             <button
