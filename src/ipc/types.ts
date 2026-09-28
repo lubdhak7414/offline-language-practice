@@ -264,6 +264,8 @@ export type Preferences = {
   goal: string;
   /** Opt-in once-per-launch update check. Off by default. */
   check_updates: boolean;
+  /** Practice attempts per day to aim for; 0 = no daily goal. */
+  practice_goal_attempts: number;
 };
 
 export type DailyLimits = {
@@ -280,6 +282,8 @@ export type Overview = {
   total_reviews: number;
   reviews_today: number;
   streak_days: number;
+  /** Speaking attempts recorded today. */
+  attempts_today: number;
   cards_total: number;
   cards_new: number;
   cards_learning: number;

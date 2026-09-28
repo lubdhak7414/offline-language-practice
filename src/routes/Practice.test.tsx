@@ -194,6 +194,24 @@ describe("Practice", () => {
     expect(screen.queryByText(/word-by-word matching/)).not.toBeInTheDocument();
   });
 
+  it("counts today's attempts toward the daily goal, and hides it when off", async () => {
+    const user = userEvent.setup();
+    mount(createMockIpc({ preferences: { practice_goal_attempts: 2 } }));
+    expect(await screen.findByText("0 of 2 today")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    expect(await screen.findByText("1 of 2 today")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Try again/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    expect(await screen.findByText("Daily goal reached: 2 of 2 today")).toBeInTheDocument();
+  });
+
+  it("shows no daily goal when it is set to 0", async () => {
+    mount(createMockIpc({ preferences: { practice_goal_attempts: 0 } }));
+    await screen.findByText("Reply to a greeting:");
+    expect(screen.queryByText(/of \d+ today/)).not.toBeInTheDocument();
+  });
+
   it("shows a session summary from the second attempt, not the first", async () => {
     const user = userEvent.setup();
     mount(createMockIpc());

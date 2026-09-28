@@ -21,6 +21,8 @@ pub struct Overview {
     pub total_reviews: i64,
     pub reviews_today: i64,
     pub streak_days: i64,
+    /// Speaking attempts recorded today (the same day boundary as `reviews_today`).
+    pub attempts_today: i64,
     pub cards_total: i64,
     pub cards_new: i64,
     pub cards_learning: i64,
@@ -179,12 +181,21 @@ pub async fn overview(pool: &sqlx::SqlitePool, tz: i64, cutoff: i64) -> Result<O
         .fetch_one(pool)
         .await?;
 
+    let attempts_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attempts WHERE created_at >= ? AND created_at < ?",
+    )
+    .bind(today_start)
+    .bind(today_end)
+    .fetch_one(pool)
+    .await?;
+
     let streak_days = compute_streak(pool, tz, cutoff).await?;
 
     Ok(Overview {
         total_reviews,
         reviews_today,
         streak_days,
+        attempts_today,
         cards_total,
         cards_new,
         cards_learning,
@@ -350,6 +361,7 @@ mod tests {
         assert_eq!(ov.total_reviews, 0);
         assert_eq!(ov.reviews_today, 0);
         assert_eq!(ov.streak_days, 0);
+        assert_eq!(ov.attempts_today, 0);
         assert_eq!(ov.cards_total, 0);
         assert_eq!(ov.retention_30d, None, "must be None, never 0.0");
         assert_eq!(ov.practice_ms_30d, 0);
@@ -406,6 +418,18 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempts_today_counts_only_today() {
+        let pool = pool().await;
+        let cutoff = 4;
+        let today = day_index(now_unix(), 0, cutoff);
+        attempt_at(&pool, "t1", day_start_unix(today, 0, cutoff) + 10).await;
+        attempt_at(&pool, "t2", day_start_unix(today, 0, cutoff) + 20).await;
+        attempt_at(&pool, "y1", day_start_unix(today - 1, 0, cutoff) + 10).await;
+        let ov = overview(&pool, 0, cutoff).await.unwrap();
+        assert_eq!(ov.attempts_today, 2);
     }
 
     #[tokio::test]

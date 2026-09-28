@@ -108,6 +108,7 @@ export function Progress() {
         <div class="tiles">
           <Tile label="Streak" value={`${overview.streak_days} ${overview.streak_days === 1 ? "day" : "days"}`} />
           <Tile label="Reviews today" value={String(overview.reviews_today)} />
+          <Tile label="Speaking today" value={String(overview.attempts_today)} />
           <Tile label="Total reviews" value={String(overview.total_reviews)} />
           <Tile label="Mature cards" value={String(overview.cards_mature)} />
           <Tile

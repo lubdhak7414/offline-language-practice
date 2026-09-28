@@ -34,6 +34,20 @@ describe("Settings", () => {
     await waitFor(() => expect(input.value).toBe("9999"));
   });
 
+  it("saves the daily speaking goal on commit", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    const input = (await screen.findByLabelText(/Daily speaking goal/)) as HTMLInputElement;
+    expect(input.value).toBe("5");
+    fireEvent.input(input, { target: { value: "8" } });
+    fireEvent.change(input, { target: { value: "8" } });
+    await waitFor(() => {
+      const saves = mock.calls.filter((c) => c.name === "setPreferences");
+      const last = saves[saves.length - 1];
+      expect((last?.args[0] as { practice_goal_attempts: number }).practice_goal_attempts).toBe(8);
+    });
+  });
+
   it("saves the practice goal", async () => {
     const mock = createMockIpc();
     mount(mock);

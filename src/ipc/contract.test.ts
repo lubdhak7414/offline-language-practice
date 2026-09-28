@@ -186,6 +186,13 @@ describe("mock fidelity", () => {
     expect(sanitizePrefs({ ...prefs, check_updates: true }).check_updates).toBe(true);
   });
 
+  it("sanitizePrefs clamps the daily speaking goal to 0..100 (prefs.rs sanitize)", async () => {
+    const prefs = await createMockIpc().getPreferences();
+    expect(prefs.practice_goal_attempts).toBe(5);
+    expect(sanitizePrefs({ ...prefs, practice_goal_attempts: 9999 }).practice_goal_attempts).toBe(100);
+    expect(sanitizePrefs({ ...prefs, practice_goal_attempts: -3 }).practice_goal_attempts).toBe(0);
+  });
+
   it("sanitizePrefs leaves valid values alone", async () => {
     const prefs = await createMockIpc().getPreferences();
     expect(sanitizePrefs(prefs)).toEqual(prefs);

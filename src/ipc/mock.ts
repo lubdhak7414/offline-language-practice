@@ -170,7 +170,14 @@ export function sanitizePrefs(p: Preferences): Preferences {
     // serde would refuse a non-boolean outright; anything but `true` is off,
     // so a malformed save can never turn update checks on.
     check_updates: p.check_updates === true,
+    practice_goal_attempts: clamp(p.practice_goal_attempts, 0, 100),
   };
+}
+
+function startOfToday(): number {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
 }
 
 /** Same rule the backend documents: trim, collapse whitespace, lowercase. */
@@ -233,6 +240,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   goal: "both",
   // Mirrors the backend default: update checks are opt-in.
   check_updates: false,
+  practice_goal_attempts: 5,
 };
 
 /** ~30 days of daily counts with a couple of gaps, so charts have to cope. */
@@ -614,6 +622,7 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
         total_reviews: 214,
         reviews_today: 12,
         streak_days: 6,
+        attempts_today: attempts.filter((a) => a.created_at >= startOfToday()).length,
         cards_total: cards.length,
         cards_new: 2,
         cards_learning: 1,

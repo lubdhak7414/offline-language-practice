@@ -37,6 +37,18 @@ pub struct Preferences {
     /// webview that predates the field saves "off" instead of failing.
     #[serde(default)]
     pub check_updates: bool,
+    /// Practice attempts per day to aim for; 0 turns the daily goal off. Only
+    /// ever shown as "3 of 5 today" — no reminders, nothing is withheld.
+    /// `serde(default)` for the same reason as `check_updates`.
+    #[serde(default = "default_practice_goal_attempts")]
+    pub practice_goal_attempts: i64,
+}
+
+/// Five recordings is a few minutes: enough to matter, short enough to keep.
+pub const DEFAULT_PRACTICE_GOAL_ATTEMPTS: i64 = 5;
+
+fn default_practice_goal_attempts() -> i64 {
+    DEFAULT_PRACTICE_GOAL_ATTEMPTS
 }
 
 impl Default for Preferences {
@@ -52,6 +64,7 @@ impl Default for Preferences {
             onboarded: false,
             goal: "both".to_string(),
             check_updates: false,
+            practice_goal_attempts: DEFAULT_PRACTICE_GOAL_ATTEMPTS,
         }
     }
 }
@@ -84,13 +97,14 @@ pub fn sanitize(p: Preferences) -> Preferences {
         onboarded: p.onboarded,
         goal,
         check_updates: p.check_updates,
+        practice_goal_attempts: p.practice_goal_attempts.clamp(0, 100),
     }
 }
 
 /// The `app_settings` keys this module owns, paired with the
 /// `Preferences` field each fills. Kept in one place so `load`/`save` cannot
 /// drift apart on which keys exist.
-const KEYS: [&str; 10] = [
+const KEYS: [&str; 11] = [
     "dialect",
     "theme",
     "day_cutoff_hour",
@@ -101,6 +115,7 @@ const KEYS: [&str; 10] = [
     "onboarded",
     "goal",
     "check_updates",
+    "practice_goal_attempts",
 ];
 
 /// Load every preference from `app_settings`, falling back field-by-field to
@@ -149,6 +164,10 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
         // "1"/"0" like `onboarded`. Anything unreadable is off: the safe
         // failure for a setting that makes a network request.
         check_updates: raw.get("check_updates").map(|v| v == "1").unwrap_or(false),
+        practice_goal_attempts: raw
+            .get("practice_goal_attempts")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.practice_goal_attempts),
     };
     Ok(sanitize(parsed))
 }
@@ -157,7 +176,7 @@ pub async fn load(pool: &sqlx::SqlitePool) -> Result<Preferences, AppError> {
 /// save never reaches storage. Returns the sanitized value actually saved.
 pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preferences, AppError> {
     let p = sanitize(p.clone());
-    let pairs: [(&str, String); 10] = [
+    let pairs: [(&str, String); 11] = [
         ("dialect", p.dialect.clone()),
         ("theme", p.theme.clone()),
         ("day_cutoff_hour", p.day_cutoff_hour.to_string()),
@@ -170,6 +189,10 @@ pub async fn save(pool: &sqlx::SqlitePool, p: &Preferences) -> Result<Preference
         (
             "check_updates",
             if p.check_updates { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "practice_goal_attempts",
+            p.practice_goal_attempts.to_string(),
         ),
     ];
     let mut tx = pool.begin().await?;
@@ -229,6 +252,40 @@ mod tests {
         let back = load(&pool).await.unwrap();
         assert!(back.onboarded, "onboarded must survive a round trip");
         assert_eq!(back.goal, "interview");
+    }
+
+    #[tokio::test]
+    async fn the_daily_practice_goal_defaults_clamps_and_round_trips() {
+        let pool = pool().await;
+        assert_eq!(load(&pool).await.unwrap().practice_goal_attempts, 5);
+        let saved = save(
+            &pool,
+            &Preferences {
+                practice_goal_attempts: 9999,
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.practice_goal_attempts, 100);
+        let off = save(
+            &pool,
+            &Preferences {
+                practice_goal_attempts: -3,
+                ..Preferences::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(off.practice_goal_attempts, 0, "0 means the goal is off");
+        assert_eq!(load(&pool).await.unwrap().practice_goal_attempts, 0);
+    }
+
+    #[test]
+    fn a_webview_that_predates_the_goal_field_still_saves() {
+        let json = r#"{"dialect":"american","theme":"system","day_cutoff_hour":4,"tts_voice":"","new_per_day":20,"review_per_day":200,"bury_hours":20,"onboarded":true,"goal":"both"}"#;
+        let p: Preferences = serde_json::from_str(json).unwrap();
+        assert_eq!(p.practice_goal_attempts, 5);
     }
 
     #[tokio::test]
@@ -323,6 +380,7 @@ mod tests {
             onboarded: true,
             goal: "everyday".to_string(),
             check_updates: true,
+            practice_goal_attempts: 8,
         };
         assert_eq!(sanitize(p.clone()), p);
     }
@@ -356,6 +414,7 @@ mod tests {
                 onboarded: true,
                 goal: "interview".to_string(),
                 check_updates: false,
+                practice_goal_attempts: 12,
             },
         )
         .await

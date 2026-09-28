@@ -7,6 +7,8 @@ import { createClipPlayer, speak } from "../lib/audio/player";
 import { f32ToWav } from "../lib/audio/wav";
 import { friendlyAsrError, friendlyMicError, friendlyTtsError } from "../lib/errors";
 import { categoryForGoal } from "../lib/goals";
+import { describeDailyGoal } from "../lib/practiceGoal";
+import { tzOffsetMinutes } from "../lib/tz";
 import { goPrefix } from "../lib/globalKeys";
 import { practiceKeyAction } from "../lib/keyboard";
 import { describeSession } from "../lib/sessionSummary";
@@ -40,6 +42,8 @@ export function Practice(props: { announce: (msg: string) => void }) {
   // The session starts only once the saved goal has picked the category, so
   // the first prompt is never the wrong kind.
   const [goalLoaded, setGoalLoaded] = useState(false);
+  const [dailyGoal, setDailyGoal] = useState(0);
+  const [attemptsToday, setAttemptsToday] = useState(0);
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [summary, setSummary] = useState<SessionSummary | null>(null);
   // The session a late summary reply belongs to; a reply for an older one is dropped.
@@ -127,13 +131,23 @@ export function Practice(props: { announce: (msg: string) => void }) {
     void ipc()
       .getPreferences()
       .then((p) => {
-        if (live) setCategory(categoryForGoal(p.goal));
+        if (!live) return;
+        setCategory(categoryForGoal(p.goal));
+        setDailyGoal(p.practice_goal_attempts);
       })
       .catch(() => {
         // Unreadable preferences: keep the default category.
       })
       .finally(() => {
         if (live) setGoalLoaded(true);
+      });
+    void ipc()
+      .statsOverview(tzOffsetMinutes())
+      .then((o) => {
+        if (live) setAttemptsToday(o.attempts_today);
+      })
+      .catch(() => {
+        // Only the daily counter is lost.
       });
     return () => {
       live = false;
@@ -205,6 +219,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
       });
       setReport(report);
       setStage("feedback");
+      setAttemptsToday((n) => n + 1);
       if (sessionId !== undefined) {
         void ipc()
           .sessionSummary(sessionId)
@@ -320,6 +335,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
     <section class="route">
       <header class="route-head">
         <h1 tabIndex={-1}>Practice</h1>
+        {describeDailyGoal(attemptsToday, dailyGoal) && (
+          <span class="muted daily-goal">{describeDailyGoal(attemptsToday, dailyGoal)}</span>
+        )}
         <div class="segmented" role="group" aria-label="What to practise">
           {CATEGORIES.map((c) => (
             <button

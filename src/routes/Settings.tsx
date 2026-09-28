@@ -359,6 +359,16 @@ export function Settings(props: { announce: (msg: string) => void }) {
           </select>
         </div>
         <div class="row">
+          <label for="setting-practice-goal">Daily speaking goal (attempts, 0 for none)</label>
+          <NumberSetting
+            id="setting-practice-goal"
+            min={0}
+            max={100}
+            value={prefs.practice_goal_attempts}
+            onCommit={(n) => void savePrefs({ ...prefs, practice_goal_attempts: n })}
+          />
+        </div>
+        <div class="row">
           <label for="setting-cutoff">Day cutoff hour</label>
           <NumberSetting
             id="setting-cutoff"

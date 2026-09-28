@@ -13,6 +13,11 @@ Notable changes to this project. The format follows
   where they were measured, and the words worth another listen most often.
   Sessions now end when you switch topic or leave the screen.
 
+- **Daily speaking goal.** Practice shows "3 of 5 today" and Progress shows
+  a "Speaking today" tile. The goal is five attempts by default and can be
+  changed, or set to 0 to hide it, in Settings. It only counts; nothing is
+  locked and there are no reminders.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides
