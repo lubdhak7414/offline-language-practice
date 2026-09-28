@@ -127,13 +127,69 @@ pub async fn end_session(pool: &sqlx::SqlitePool, session_id: &str) -> Result<()
     Ok(())
 }
 
+/// Prompts you scored low on come up about eight times as often as ones you
+/// scored high on; the middle and anything never scored are in between.
+const WEIGHT_LOW: f64 = 2.0;
+const WEIGHT_HIGH: f64 = 0.25;
+/// Percentile cut-offs of the user's own latest per-prompt scores.
+const LOW_PERCENTILE: f64 = 0.4;
+const HIGH_PERCENTILE: f64 = 0.8;
+/// Fewer scored prompts than this and "low" and "high" mean nothing: draw
+/// uniformly instead of chasing noise.
+const MIN_SCORED_FOR_WEIGHTING: usize = 10;
+
+/// `latest` maps a prompt id to its most recent acoustic pronunciation score.
+/// Returns one weight per candidate id, in order. Never 0, so a prompt you
+/// have mastered can still come round; never scored counts as neutral.
+fn prompt_weights(ids: &[&str], latest: &std::collections::HashMap<String, i64>) -> Vec<f64> {
+    if latest.len() < MIN_SCORED_FOR_WEIGHTING {
+        return vec![1.0; ids.len()];
+    }
+    let mut scores: Vec<i64> = latest.values().copied().collect();
+    scores.sort_unstable();
+    let at = |q: f64| scores[((scores.len() - 1) as f64 * q).floor() as usize];
+    let (low, high) = (at(LOW_PERCENTILE), at(HIGH_PERCENTILE));
+    ids.iter()
+        .map(|id| match latest.get(*id) {
+            Some(&s) if s < low => WEIGHT_LOW,
+            Some(&s) if s >= high => WEIGHT_HIGH,
+            _ => 1.0,
+        })
+        .collect()
+}
+
+/// Index chosen by `roll` in `[0, 1)` from weights that need not sum to 1.
+fn pick_weighted(weights: &[f64], roll: f64) -> Option<usize> {
+    let total: f64 = weights.iter().sum();
+    if weights.is_empty() || total <= 0.0 {
+        return None;
+    }
+    let mut target = roll.clamp(0.0, 1.0 - f64::EPSILON) * total;
+    for (i, w) in weights.iter().enumerate() {
+        if target < *w {
+            return Some(i);
+        }
+        target -= w;
+    }
+    Some(weights.len() - 1)
+}
+
+/// A number in `[0, 1)`; a v4 uuid is already 122 random bits, so no RNG crate.
+fn random_unit() -> f64 {
+    (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u128 << 53) as f64
+}
+
+type PromptRow = (String, String, String, String, Option<String>, i64);
+
 /// Pick the next prompt for a session.
 ///
 /// Prompts already attempted in this session are excluded, so a sitting does
 /// not hand back the same sentence twice; when the pool runs dry the filter
 /// is dropped rather than returning nothing. Selection is random within the
 /// filter — a fixed order would mean everyone practises the same eight
-/// prompts and never reaches the rest.
+/// prompts and never reaches the rest — but weighted by your own history:
+/// read-aloud prompts you scored low on come round more often, ones you
+/// scored high on less (see [`prompt_weights`]).
 pub async fn next_prompt(
     pool: &sqlx::SqlitePool,
     session_id: Option<&str>,
@@ -145,39 +201,50 @@ pub async fn next_prompt(
                  AND (?2 IS NULL OR level = ?2) \
                  AND (?3 IS NULL OR id NOT IN \
                       (SELECT prompt_id FROM attempts \
-                       WHERE session_id = ?3 AND prompt_id IS NOT NULL)) \
-               ORDER BY RANDOM() LIMIT 1";
-    let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(sql)
+                       WHERE session_id = ?3 AND prompt_id IS NOT NULL))";
+    let mut rows = sqlx::query_as::<_, PromptRow>(sql)
         .bind(category)
         .bind(level)
         .bind(session_id)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await?;
+    // Exhausted: repeat rather than end the session on an empty screen.
+    if rows.is_empty() && session_id.is_some() {
+        rows = sqlx::query_as::<_, PromptRow>(sql)
+            .bind(category)
+            .bind(level)
+            .bind(Option::<&str>::None)
+            .fetch_all(pool)
+            .await?;
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
 
-    let row = match row {
-        Some(r) => Some(r),
-        // Exhausted: repeat rather than end the session on an empty screen.
-        None if session_id.is_some() => {
-            sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(sql)
-                .bind(category)
-                .bind(level)
-                .bind(Option::<&str>::None)
-                .fetch_optional(pool)
-                .await?
-        }
-        None => None,
-    };
+    // Oldest first, so the newest attempt of a prompt wins in the map. Only
+    // acoustic scores count: a text-fallback number is a different measurement.
+    let history = sqlx::query_as::<_, (String, i64)>(
+        "SELECT a.prompt_id, s.pron_overall FROM attempts a \
+         JOIN attempt_scores s ON s.attempt_id = a.id \
+         WHERE a.prompt_id IS NOT NULL AND s.pron_method = 'gop' AND s.pron_overall IS NOT NULL \
+         ORDER BY a.created_at, a.rowid",
+    )
+    .fetch_all(pool)
+    .await?;
+    let latest: std::collections::HashMap<String, i64> = history.into_iter().collect();
 
-    Ok(row.map(
-        |(id, category, topic, prompt_text, target_text, level)| PromptView {
-            id,
-            category,
-            topic,
-            prompt_text,
-            target_text,
-            level,
-        },
-    ))
+    let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    let weights = prompt_weights(&ids, &latest);
+    let pick = pick_weighted(&weights, random_unit()).unwrap_or(0);
+    let (id, category, topic, prompt_text, target_text, level) = rows.swap_remove(pick);
+    Ok(Some(PromptView {
+        id,
+        category,
+        topic,
+        prompt_text,
+        target_text,
+        level,
+    }))
 }
 
 /// Everything one finished recording carries into the database.
@@ -1369,5 +1436,106 @@ mod tests {
         assert!(add_prompt(&pool, new_prompt(Some("Good morning."), ""))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn weights_are_uniform_until_there_is_enough_history() {
+        let latest: std::collections::HashMap<String, i64> =
+            (0..9).map(|i| (format!("p{i}"), i * 10)).collect();
+        assert_eq!(prompt_weights(&["p0", "p8", "new"], &latest), vec![1.0; 3]);
+    }
+
+    #[test]
+    fn weights_favour_low_scores_and_keep_everything_reachable() {
+        let latest: std::collections::HashMap<String, i64> =
+            (0..20).map(|i| (format!("p{i}"), i * 5)).collect();
+        let w = prompt_weights(&["p0", "p10", "p19", "new"], &latest);
+        assert_eq!(w, vec![WEIGHT_LOW, 1.0, WEIGHT_HIGH, 1.0]);
+        assert!(w.iter().all(|x| *x > 0.0), "nothing may become unreachable");
+    }
+
+    #[test]
+    fn pick_weighted_follows_the_weights_at_the_edges() {
+        assert_eq!(pick_weighted(&[], 0.5), None);
+        assert_eq!(pick_weighted(&[0.0, 0.0], 0.5), None);
+        // Weights 1 and 3: the first quarter of the range is index 0.
+        assert_eq!(pick_weighted(&[1.0, 3.0], 0.0), Some(0));
+        assert_eq!(pick_weighted(&[1.0, 3.0], 0.2499), Some(0));
+        assert_eq!(pick_weighted(&[1.0, 3.0], 0.25), Some(1));
+        assert_eq!(pick_weighted(&[1.0, 3.0], 0.9999), Some(1));
+        assert_eq!(
+            pick_weighted(&[1.0, 3.0], 1.0),
+            Some(1),
+            "1.0 must not run off the end"
+        );
+    }
+
+    #[test]
+    fn random_unit_stays_in_range() {
+        for _ in 0..1000 {
+            let r = random_unit();
+            assert!((0.0..1.0).contains(&r));
+        }
+    }
+
+    #[tokio::test]
+    async fn weak_prompts_come_up_more_often_than_strong_ones() {
+        let pool = test_pool().await;
+        seed_prompts(&pool).await.unwrap();
+        // Every level-1 read-aloud conversation prompt, scored evenly from low to 100.
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM prompts WHERE category = 'conversation' AND level = 1 \
+             AND target_text IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let n = ids.len();
+        assert!(
+            n >= MIN_SCORED_FOR_WEIGHTING + 2,
+            "need enough level-1 read-aloud prompts, got {n}"
+        );
+        for (i, (pid,)) in ids.iter().enumerate() {
+            let aid = format!("a{i}");
+            sqlx::query("INSERT INTO attempts (id, prompt_id, transcript, duration_ms, created_at) VALUES (?, ?, 't', 1000, ?)")
+                .bind(&aid).bind(pid).bind(now_unix()).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO attempt_scores (attempt_id, pron_overall, pron_method, overall) VALUES (?, ?, 'gop', 50)")
+                .bind(&aid).bind(100 * (i as i64 + 1) / n as i64).execute(&pool).await.unwrap();
+        }
+        let weakest = &ids[0].0;
+        let strongest = &ids[n - 1].0;
+        let (mut weak_hits, mut strong_hits) = (0, 0);
+        for _ in 0..3000 {
+            let p = next_prompt(&pool, None, Some("conversation"), Some(1))
+                .await
+                .unwrap()
+                .unwrap();
+            if &p.id == weakest {
+                weak_hits += 1;
+            }
+            if &p.id == strongest {
+                strong_hits += 1;
+            }
+        }
+        // Expected ratio is 8:1; a factor of three is far outside random noise.
+        assert!(
+            weak_hits > strong_hits * 3,
+            "weakest {weak_hits} vs strongest {strong_hits}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_fallback_score_does_not_move_a_prompts_weight() {
+        let pool = test_pool().await;
+        seed_prompts(&pool).await.unwrap();
+        sqlx::query("INSERT INTO attempts (id, prompt_id, transcript, duration_ms, created_at) VALUES ('t', 'builtin-conversation-1', 't', 1000, ?)")
+            .bind(now_unix()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO attempt_scores (attempt_id, pron_overall, pron_method, overall) VALUES ('t', 1, 'text', 50)")
+            .execute(&pool).await.unwrap();
+        // One text score is not "history": still uniform, and it must not panic.
+        assert!(next_prompt(&pool, None, None, None)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

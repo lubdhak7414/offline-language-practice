@@ -50,6 +50,11 @@ Notable changes to this project. The format follows
 
 ### Changed
 
+- **Prompts follow your history.** Read-aloud prompts you scored low on come
+  round about eight times as often as ones you scored high on, judged against
+  your own scores once you have ten or more. Nothing is ever removed, and
+  anything you have not tried counts as neutral. Only acoustic scores are
+  used, never the word-matching fallback.
 - **Recording runs in an AudioWorklet.** The deprecated main-thread capture
   node is now only a fallback, used if the worklet cannot load or delivers
   no audio within 1.5 seconds. Tested against a faked Web Audio; not yet
