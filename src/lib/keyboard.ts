@@ -72,7 +72,8 @@ export type PracticeKeyContext = {
 export type PracticeKeyAction =
   | { kind: "record" }
   | { kind: "stop" }
-  | { kind: "listen" };
+  | { kind: "listen" }
+  | { kind: "listen-slow" };
 
 export function practiceKeyAction(
   key: string,
@@ -91,6 +92,8 @@ export function practiceKeyAction(
       return ctx.canRecord ? { kind: "record" } : null;
     case "p":
       return ctx.recording ? null : { kind: "listen" };
+    case "s":
+      return ctx.recording ? null : { kind: "listen-slow" };
     default:
       return null;
   }

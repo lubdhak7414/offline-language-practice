@@ -70,10 +70,10 @@ export const tauriIpc: Ipc = {
     });
   },
 
-  async synthesizeSpeech(text, onChunk) {
+  async synthesizeSpeech(text, onChunk, opts) {
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = onChunk;
-    return invoke<number>("synthesize_speech", { text, channel });
+    return invoke<number>("synthesize_speech", { text, slow: opts?.slow ?? false, channel });
   },
 
   listVoices() {

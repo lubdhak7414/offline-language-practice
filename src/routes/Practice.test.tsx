@@ -443,9 +443,34 @@ describe("Practice", () => {
       vi.spyOn(mock, "synthesizeSpeech").mockRejectedValue("TTS_BUSY: queue full");
       mount(mock);
       await screen.findByText("Reply to a greeting:");
-      await user.click(screen.getByRole("button", { name: /^Listen/ }));
+      await user.click(screen.getByRole("button", { name: /^Listen \S*P/ }));
       expect(await screen.findByRole("alert")).toHaveTextContent(/Still speaking/);
       expect(screen.queryByText(/TTS_BUSY/)).not.toBeInTheDocument();
+    });
+
+    it("Listen slowly asks for slow speech, and plain Listen does not", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      const spy = vi.spyOn(mock, "synthesizeSpeech");
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await user.click(screen.getByRole("button", { name: /^Listen \S*P/ }));
+      await waitFor(() => expect(played).toBe(1));
+      expect(spy.mock.calls[0]?.[2]).toBeUndefined();
+      await user.click(screen.getByRole("button", { name: /^Listen slowly/ }));
+      await waitFor(() => expect(played).toBe(2));
+      expect(spy.mock.calls[1]?.[2]).toEqual({ slow: true });
+    });
+
+    it("the S key plays the prompt slowly", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      const spy = vi.spyOn(mock, "synthesizeSpeech");
+      mount(mock);
+      await screen.findByText("Reply to a greeting:");
+      await user.keyboard("s");
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      expect(spy.mock.calls[0]?.[2]).toEqual({ slow: true });
     });
 
     it("ignores a second Listen while the first is still being synthesized", async () => {
@@ -457,7 +482,7 @@ describe("Practice", () => {
       );
       mount(mock);
       await screen.findByText("Reply to a greeting:");
-      const listen = screen.getByRole("button", { name: /^Listen/ });
+      const listen = screen.getByRole("button", { name: /^Listen \S*P/ });
       await user.click(listen);
       await user.click(listen);
       expect(spy).toHaveBeenCalledTimes(1);

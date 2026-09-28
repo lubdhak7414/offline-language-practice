@@ -91,6 +91,7 @@ export const KEY_HELP: Array<{ keys: string; what: string }> = [
   { keys: "U", what: "Undo the last grade" },
   { keys: "R", what: "Start or stop recording" },
   { keys: "P", what: "Play the prompt aloud" },
+  { keys: "S", what: "Play the prompt slowly" },
   { keys: "G then P", what: "Go to Practice" },
   { keys: "G then R", what: "Go to Review" },
   { keys: "G then D", what: "Go to Decks" },

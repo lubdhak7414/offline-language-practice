@@ -93,6 +93,8 @@ pub enum NeuralReq {
         /// comes straight from the frontend by way of `set_voice`/the
         /// `audiostream://` `?voice=` query param.
         voice_id: Option<String>,
+        /// Speak at a reduced rate (a learner listening closely).
+        slow: bool,
         reply: oneshot::Sender<Result<(Vec<u8>, u32), String>>,
     },
 }
@@ -253,6 +255,7 @@ fn spawn_tts_worker(rx: mpsc::Receiver<NeuralReq>) {
                     NeuralReq::Synth {
                         text,
                         voice_id,
+                        slow,
                         reply,
                     } => {
                         let key = voice_id.unwrap_or_default();
@@ -280,7 +283,7 @@ fn spawn_tts_worker(rx: mpsc::Receiver<NeuralReq>) {
                             // `stale` guarantees the arm above ran when needed,
                             // so the cache is always populated here.
                             let (_, eng) = cache.as_ref().expect("cache populated above");
-                            let wav = eng.synthesize_wav(&text).map_err(|e| e.to_string())?;
+                            let wav = eng.synthesize_wav(&text, slow).map_err(|e| e.to_string())?;
                             Ok((wav, eng.sample_rate()))
                         })();
                         let _ = reply.send(res);
@@ -419,6 +422,7 @@ async fn lint_text(text: String, dialect: Option<String>) -> Result<LintOutput, 
 #[tauri::command]
 async fn synthesize_speech(
     text: String,
+    slow: Option<bool>,
     channel: Channel<Response>,
     state: State<'_, AppState>,
 ) -> Result<u32, String> {
@@ -456,6 +460,7 @@ async fn synthesize_speech(
             .try_send(NeuralReq::Synth {
                 text: chunk.clone(),
                 voice_id: voice_id.clone(),
+                slow: slow.unwrap_or(false),
                 reply: tx,
             })
             .map_err(tts_busy_message)?;
@@ -1990,6 +1995,7 @@ pub fn run() {
                             .try_send(NeuralReq::Synth {
                                 text: chunk,
                                 voice_id: voice_id.clone(),
+                                slow: false,
                                 reply: tx,
                             })
                             .map_err(|_| "TTS_BUSY: engine busy, retry shortly".to_string())?;
@@ -2149,6 +2155,7 @@ mod tests {
         tx.try_send(NeuralReq::Synth {
             text: "hello".to_string(),
             voice_id: None,
+            slow: false,
             reply: reply_tx,
         })
         .expect("send");
@@ -2205,6 +2212,7 @@ mod tests {
         tx.try_send(NeuralReq::Synth {
             text: "x".to_string(),
             voice_id: None,
+            slow: false,
             reply: dtx,
         })
         .unwrap();
@@ -2213,6 +2221,7 @@ mod tests {
             .try_send(NeuralReq::Synth {
                 text: "y".to_string(),
                 voice_id: None,
+                slow: false,
                 reply: dtx2,
             })
             .expect_err("second send must be full");

@@ -173,6 +173,40 @@ fn sample_rate_from_config(config_path: &Path) -> u32 {
         .unwrap_or(FALLBACK_SAMPLE_RATE)
 }
 
+/// Piper's `length_scale` when the voice config does not say (1.0 is natural speed).
+const FALLBACK_LENGTH_SCALE: f32 = 1.0;
+
+/// How much slower "slow" is. Piper stretches each phoneme by `length_scale`,
+/// so 1.8 is measured (see the real_models test) to lengthen a sentence by
+/// about a third: clearly slower, still one voice. At 1.4 the clip grew only
+/// 17%, because pauses and padding do not stretch.
+pub const SLOW_LENGTH_FACTOR: f32 = 1.8;
+
+/// The voice's natural `inference.length_scale`, or 1.0 when absent or silly.
+fn length_scale_from_config(config_path: &Path) -> f32 {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return FALLBACK_LENGTH_SCALE;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return FALLBACK_LENGTH_SCALE;
+    };
+    v.get("inference")
+        .and_then(|i| i.get("length_scale"))
+        .and_then(|s| s.as_f64())
+        .map(|s| s as f32)
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 3.0)
+        .unwrap_or(FALLBACK_LENGTH_SCALE)
+}
+
+/// The `length_scale` to synthesize with: the voice's own, stretched when slow.
+pub fn effective_length_scale(natural: f32, slow: bool) -> f32 {
+    if slow {
+        natural * SLOW_LENGTH_FACTOR
+    } else {
+        natural
+    }
+}
+
 /// Resolve a frontend-supplied voice id to its `(model, config)` paths.
 ///
 /// `id` crosses the IPC boundary from JS and is concatenated straight into
@@ -199,17 +233,21 @@ pub fn resolve_voice(id: &str) -> Option<(PathBuf, PathBuf)> {
 pub struct TtsEngine {
     inner: std::sync::Mutex<piper_rs::Piper>,
     sample_rate: u32,
+    /// The voice's natural speaking-rate scale (larger is slower).
+    length_scale: f32,
 }
 
 impl TtsEngine {
     /// Load a voice from `(model, config)` onnx + json pair.
     pub fn load(model: &Path, config: &Path) -> Result<Self, String> {
         let sample_rate = sample_rate_from_config(config);
+        let length_scale = length_scale_from_config(config);
         let piper =
             piper_rs::Piper::new(model, config).map_err(|e| format!("TTS load failed: {e}"))?;
         Ok(Self {
             inner: std::sync::Mutex::new(piper),
             sample_rate,
+            length_scale,
         })
     }
 
@@ -221,9 +259,10 @@ impl TtsEngine {
     /// Synthesize `text` to `(f32 mono samples, sample_rate)`.
     ///
     /// piper-rs 0.2.0 signature:
-    /// `create(&mut self, &str, bool, Option<i64>, Option<f32> x3)`
-    /// `-> PiperResult<(Vec<f32>, u32)>`.
-    pub fn synthesize(&self, text: &str) -> Result<(Vec<f32>, u32), String> {
+    /// `create(&mut self, text, is_phonemes, speaker_id, length_scale,
+    /// noise_scale, noise_w) -> PiperResult<(Vec<f32>, u32)>`; only
+    /// `length_scale` is overridden here, and only when `slow`.
+    pub fn synthesize(&self, text: &str, slow: bool) -> Result<(Vec<f32>, u32), String> {
         if text.trim().is_empty() {
             return Err("TTS: empty text".to_string());
         }
@@ -235,13 +274,20 @@ impl TtsEngine {
         // the phonemizer takes the same lock (see `phonemize`).
         let _espeak = crate::phonemize::espeak_lock();
         piper
-            .create(text, false, None, None, None, None)
+            .create(
+                text,
+                false,
+                None,
+                slow.then(|| effective_length_scale(self.length_scale, true)),
+                None,
+                None,
+            )
             .map_err(|e| format!("TTS synthesize failed: {e}"))
     }
 
     /// Synthesize `text` directly to a RIFF/WAVE (PCM 16-bit mono) blob.
-    pub fn synthesize_wav(&self, text: &str) -> Result<Vec<u8>, String> {
-        let (samples, rate) = self.synthesize(text)?;
+    pub fn synthesize_wav(&self, text: &str, slow: bool) -> Result<Vec<u8>, String> {
+        let (samples, rate) = self.synthesize(text, slow)?;
         Ok(audio::encode_wav_mono_16bit(&samples, rate))
     }
 }
@@ -249,6 +295,44 @@ impl TtsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_speech_stretches_the_voices_own_scale_and_natural_is_untouched() {
+        assert_eq!(effective_length_scale(1.0, false), 1.0);
+        assert_eq!(effective_length_scale(0.9, false), 0.9);
+        assert!((effective_length_scale(1.0, true) - 1.8).abs() < 1e-6);
+        assert!((effective_length_scale(0.9, true) - 1.62).abs() < 1e-6);
+    }
+
+    #[test]
+    fn length_scale_comes_from_the_config_with_a_safe_fallback() {
+        let dir = std::env::temp_dir().join(format!("olp-ls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        assert_eq!(
+            length_scale_from_config(&write("a.json", r#"{"inference":{"length_scale":0.9}}"#)),
+            0.9
+        );
+        for bad in [
+            r#"{"inference":{"length_scale":0}}"#,
+            r#"{"inference":{"length_scale":-1}}"#,
+            r#"{"inference":{"length_scale":99}}"#,
+            r#"{"inference":{}}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                length_scale_from_config(&write("b.json", bad)),
+                1.0,
+                "{bad}"
+            );
+        }
+        assert_eq!(length_scale_from_config(&dir.join("missing.json")), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn voice_id_from_config_name() {

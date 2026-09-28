@@ -291,12 +291,12 @@ export function Practice(props: { announce: (msg: string) => void }) {
     }
   }, [announce, stopAndScore]);
 
-  const speakPrompt = useCallback(async () => {
+  const speakPrompt = useCallback(async (slow = false) => {
     const text = prompt?.target_text ?? prompt?.prompt_text;
     if (!text || speakingRef.current) return;
     speakingRef.current = true;
     try {
-      await speak(text, player.current);
+      await speak(text, player.current, slow ? { slow: true } : undefined);
     } catch (e) {
       setError(friendlyTtsError(e));
     } finally {
@@ -339,7 +339,7 @@ export function Practice(props: { announce: (msg: string) => void }) {
       e.preventDefault();
       if (action.kind === "record") void now.startRecording();
       else if (action.kind === "stop") void now.stopAndScore();
-      else void now.speakPrompt();
+      else void now.speakPrompt(action.kind === "listen-slow");
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -445,6 +445,9 @@ export function Practice(props: { announce: (msg: string) => void }) {
           <div class="row">
             <button type="button" onClick={() => void speakPrompt()}>
               Listen <kbd>P</kbd>
+            </button>
+            <button type="button" onClick={() => void speakPrompt(true)}>
+              Listen slowly <kbd>S</kbd>
             </button>
             <button
               type="button"

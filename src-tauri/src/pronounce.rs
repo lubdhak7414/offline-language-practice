@@ -1605,8 +1605,36 @@ mod real_models {
 
     /// Speak `text` with the installed voice, at 16 kHz mono.
     fn speak(e: &Engines, text: &str) -> Vec<f32> {
-        let (pcm, rate) = e.tts.synthesize(text).expect("synthesize");
+        let (pcm, rate) = e.tts.synthesize(text, false).expect("synthesize");
         to_16k(&pcm, rate)
+    }
+
+    #[test]
+    #[ignore = "models"]
+    fn slow_speech_is_slower_and_still_understood() {
+        let e = engines();
+        let text = "Could you tell me how to get to the train station please";
+        let (natural, rate) = e.tts.synthesize(text, false).expect("natural");
+        let (slow, slow_rate) = e.tts.synthesize(text, true).expect("slow");
+        assert_eq!(rate, slow_rate);
+        let ratio = slow.len() as f64 / natural.len() as f64;
+        // Silences and pauses do not stretch, so the whole clip grows a little
+        // less than the per-phoneme factor; anything from 1.25x to 1.6x is right.
+        assert!(
+            (1.25..1.6).contains(&ratio),
+            "slow/natural duration ratio {ratio:.2}"
+        );
+        let heard = e
+            .asr
+            .transcribe_pcm_detailed(&to_16k(&slow, slow_rate))
+            .expect("transcribe")
+            .text;
+        // Word-for-word equality is too strict (this recogniser hears "TRAINED"
+        // for "TRAIN" at natural speed too); the sentence must be recognisable.
+        assert!(
+            heard.contains("TELL ME HOW TO GET TO THE") && heard.contains("STATION"),
+            "slow speech should still be intelligible, heard {heard:?}"
+        );
     }
 
     #[test]

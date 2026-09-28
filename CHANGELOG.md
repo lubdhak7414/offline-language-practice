@@ -52,6 +52,11 @@ Notable changes to this project. The format follows
   model status, settings, counts) for a bug report. No recordings,
   transcripts, card text or microphone name are included.
 
+- **Listen slowly.** A second button (and the S key) reads the prompt at a
+  reduced pace. The voice's own speaking rate is stretched by 1.8, which
+  lengthens a sentence by about a third on the shipped voice (pauses do not
+  stretch), and the recogniser still understands it.
+
 ### Changed
 
 - **Accessibility.** Buttons and control borders in dark mode now meet WCAG

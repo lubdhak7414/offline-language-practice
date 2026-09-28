@@ -47,8 +47,12 @@ export function createClipPlayer(): ClipPlayer {
 }
 
 /** Synthesize `text` with the selected voice and play it through `player`. */
-export async function speak(text: string, player: ClipPlayer): Promise<void> {
+export async function speak(
+  text: string,
+  player: ClipPlayer,
+  opts?: { slow?: boolean },
+): Promise<void> {
   const chunks: BlobPart[] = [];
-  await ipc().synthesizeSpeech(text, (buf) => chunks.push(new Uint8Array(buf)));
+  await ipc().synthesizeSpeech(text, (buf) => chunks.push(new Uint8Array(buf)), opts);
   await player.play(chunks);
 }

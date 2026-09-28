@@ -154,6 +154,13 @@ describe("practiceKeyAction", () => {
     expect(practiceKeyAction("p", practising({ recording: true }))).toBeNull();
   });
 
+  it("plays the prompt slowly on S, but never over a live recording", () => {
+    expect(practiceKeyAction("s", practising())).toEqual({ kind: "listen-slow" });
+    expect(practiceKeyAction("S", practising())).toEqual({ kind: "listen-slow" });
+    expect(practiceKeyAction("s", practising({ recording: true }))).toBeNull();
+    expect(practiceKeyAction("s", practising({ goPending: true }))).toBeNull();
+  });
+
   it("keeps out of text entry and leaves other keys alone", () => {
     expect(practiceKeyAction("r", practising({ targetTag: "INPUT" }))).toBeNull();
     expect(practiceKeyAction("r", practising({ isComposing: true }))).toBeNull();

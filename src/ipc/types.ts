@@ -427,6 +427,7 @@ export type Ipc = {
   synthesizeSpeech(
     text: string,
     onChunk: (wav: ArrayBuffer) => void,
+    opts?: { slow?: boolean },
   ): Promise<number>;
   listVoices(): Promise<VoiceInfo[]>;
 

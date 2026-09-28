@@ -442,9 +442,9 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
       return record("transcribePcm", [pcm.byteLength, sampleRate], text);
     },
 
-    synthesizeSpeech(text, onChunk) {
+    synthesizeSpeech(text, onChunk, opts) {
       onChunk(new ArrayBuffer(8));
-      return record("synthesizeSpeech", [text], 22050);
+      return record("synthesizeSpeech", opts?.slow ? [text, opts] : [text], 22050);
     },
 
     listVoices() {
