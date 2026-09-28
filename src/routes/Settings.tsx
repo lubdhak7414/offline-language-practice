@@ -272,18 +272,12 @@ export function Settings(props: { announce: (msg: string) => void }) {
         </div>
         <div class="row">
           <label for="setting-cutoff">Day cutoff hour</label>
-          <input
+          <NumberSetting
             id="setting-cutoff"
-            type="number"
             min={0}
             max={23}
             value={prefs.day_cutoff_hour}
-            onInput={(e) =>
-              void savePrefs({
-                ...prefs,
-                day_cutoff_hour: Number((e.target as HTMLInputElement).value),
-              })
-            }
+            onCommit={(n) => void savePrefs({ ...prefs, day_cutoff_hour: n })}
           />
         </div>
       </section>
@@ -299,32 +293,26 @@ export function Settings(props: { announce: (msg: string) => void }) {
             max={0.98}
             step={0.01}
             value={retention}
-            onInput={(e) => void changeRetention(Number((e.target as HTMLInputElement).value))}
+            // Dragging previews the label; letting go saves. Saving on every
+            // step sent a backend call per pixel.
+            onInput={(e) => setRetentionState(Number((e.target as HTMLInputElement).value))}
+            onChange={(e) => void changeRetention(Number((e.target as HTMLInputElement).value))}
           />
         </div>
         <div class="row">
           <label for="setting-new-per-day">New cards per day</label>
-          <input
+          <NumberSetting
             id="setting-new-per-day"
-            type="number"
             min={0}
             value={prefs.new_per_day}
-            onInput={(e) =>
-              void savePrefs({ ...prefs, new_per_day: Number((e.target as HTMLInputElement).value) })
-            }
+            onCommit={(n) => void savePrefs({ ...prefs, new_per_day: n })}
           />
           <label for="setting-review-per-day">Reviews per day</label>
-          <input
+          <NumberSetting
             id="setting-review-per-day"
-            type="number"
             min={0}
             value={prefs.review_per_day}
-            onInput={(e) =>
-              void savePrefs({
-                ...prefs,
-                review_per_day: Number((e.target as HTMLInputElement).value),
-              })
-            }
+            onCommit={(n) => void savePrefs({ ...prefs, review_per_day: n })}
           />
         </div>
         <div class="row">
@@ -409,4 +397,49 @@ function applyTheme(theme: string) {
   } else {
     document.documentElement.removeAttribute("data-theme");
   }
+}
+
+/**
+ * A whole-number preference saved when the edit is committed (blur, Enter,
+ * the spinner), not on every keystroke: typing "25" used to save 2 and then
+ * 25, and clearing the field saved 0 because `Number("")` is 0. Anything that
+ * is not a whole number goes back to the stored value. Range clamping stays
+ * the backend's job; the stored value comes back through `value`.
+ */
+function NumberSetting(props: {
+  id: string;
+  min: number;
+  max?: number;
+  value: number;
+  onCommit: (n: number) => void;
+}) {
+  const { id, min, max, value, onCommit } = props;
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  return (
+    <input
+      id={id}
+      type="number"
+      inputMode="numeric"
+      min={min}
+      max={max}
+      value={draft}
+      onInput={(e) => setDraft((e.target as HTMLInputElement).value)}
+      onChange={(e) => {
+        const el = e.target as HTMLInputElement;
+        const raw = el.value.trim();
+        if (!/^\d+$/.test(raw)) {
+          // Also on the element: if the typing and this revert render
+          // together, the draft never visibly changed and Preact leaves
+          // the stale text in the box.
+          el.value = String(value);
+          setDraft(String(value));
+          return;
+        }
+        const n = Number(raw);
+        if (n === value) return;
+        onCommit(n);
+      }}
+    />
+  );
 }

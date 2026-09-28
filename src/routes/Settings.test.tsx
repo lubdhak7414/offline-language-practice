@@ -27,6 +27,7 @@ describe("Settings", () => {
     mount(mock);
     const input = (await screen.findByLabelText("New cards per day")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "99999" } });
+    fireEvent.change(input, { target: { value: "99999" } });
     await waitFor(() =>
       expect(mock.calls.some((c) => c.name === "setPreferences")).toBe(true),
     );
@@ -38,12 +39,51 @@ describe("Settings", () => {
     mount(mock);
     const slider = await screen.findByLabelText(/Remember about/);
     fireEvent.input(slider, { target: { value: "0.95" } });
+    fireEvent.change(slider, { target: { value: "0.95" } });
     await waitFor(() =>
       expect(mock.calls.find((c) => c.name === "setRetention")?.args).toEqual([0.95]),
     );
     const [sent] = mock.calls.find((c) => c.name === "setRetention")!.args as [number];
     expect(sent).toBeGreaterThanOrEqual(0.7);
     expect(sent).toBeLessThanOrEqual(0.98);
+  });
+
+  it("saves a number only when the edit is committed", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    const input = (await screen.findByLabelText("Reviews per day")) as HTMLInputElement;
+    const saves = () => mock.calls.filter((c) => c.name === "setPreferences");
+    fireEvent.input(input, { target: { value: "1" } });
+    fireEvent.input(input, { target: { value: "15" } });
+    fireEvent.input(input, { target: { value: "150" } });
+    expect(saves()).toHaveLength(0);
+    fireEvent.change(input, { target: { value: "150" } });
+    await waitFor(() => expect(saves()).toHaveLength(1));
+    expect(saves()[0]?.args[0]).toMatchObject({ review_per_day: 150 });
+  });
+
+  it("puts back the stored value when a number field is cleared", async () => {
+    const mock = createMockIpc();
+    mount(mock);
+    const input = (await screen.findByLabelText("New cards per day")) as HTMLInputElement;
+    const before = input.value;
+    fireEvent.input(input, { target: { value: "" } });
+    fireEvent.change(input, { target: { value: "" } });
+    await waitFor(() => expect(input.value).toBe(before));
+    expect(mock.calls.some((c) => c.name === "setPreferences")).toBe(false);
+  });
+
+  it("saves retention once, when the slider is let go", async () => {
+    const mock = createMockIpc({ retention: 0.9 });
+    mount(mock);
+    const slider = await screen.findByLabelText(/Remember about/);
+    for (const v of ["0.91", "0.92", "0.93"]) fireEvent.input(slider, { target: { value: v } });
+    expect(mock.calls.some((c) => c.name === "setRetention")).toBe(false);
+    expect(await screen.findByLabelText(/Remember about 93 out of 100/)).toBeInTheDocument();
+    fireEvent.change(slider, { target: { value: "0.93" } });
+    await waitFor(() =>
+      expect(mock.calls.filter((c) => c.name === "setRetention").map((c) => c.args)).toEqual([[0.93]]),
+    );
   });
 
   it("sets data-theme when a theme radio is picked", async () => {
