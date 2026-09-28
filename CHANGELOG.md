@@ -32,8 +32,9 @@ feedback and spaced repetition, running entirely on-device.
   grade. Review one deck or all of them, with optional per-deck daily
   limits, and hear any card read aloud.
 - **Decks, Progress and Settings.** Deck and card management with search
-  and tag filters, reviews-per-day and retention charts, streaks, a recent-practice history with each
-  attempt's scores, voice selection, and a diagnostics panel.
+  and tag filters, reviews-per-day and retention charts, streaks, a
+  recent-practice history with each attempt's scores, voice selection, and
+  a diagnostics panel.
 - **Data portability.** JSON export that round-trips FSRS memory state and
   full review history, CSV/TSV for interchange with Anki, and whole-database
   backup and restore. A restore keeps the database it replaces as
