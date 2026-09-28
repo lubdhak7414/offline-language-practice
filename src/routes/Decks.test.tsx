@@ -131,4 +131,52 @@ describe("Decks", () => {
       ]),
     );
   });
+
+  describe("daily limits", () => {
+    it("shows and saves one deck's limits", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      mount(mock);
+      await user.click(await screen.findByRole("button", { name: /^Travel/ }));
+      const form = await screen.findByRole("form", { name: "Daily limits for this deck" });
+      const newCards = within(form).getByRole("spinbutton", { name: /New cards per day/ });
+      const reviews = within(form).getByRole("spinbutton", { name: /Reviews per day/ });
+      expect(mock.calls.find((c) => c.name === "getDailyLimits")?.args).toEqual(["travel"]);
+
+      await user.clear(newCards);
+      await user.type(newCards, "5");
+      await user.clear(reviews);
+      await user.type(reviews, "80");
+      await user.click(within(form).getByRole("button", { name: "Save limits" }));
+      await waitFor(() =>
+        expect(mock.calls.find((c) => c.name === "setDailyLimits")?.args[0]).toEqual({
+          deckId: "travel",
+          newPerDay: 5,
+          reviewPerDay: 80,
+        }),
+      );
+    });
+
+    it("never saves a cleared or out-of-range field", async () => {
+      const user = userEvent.setup();
+      const mock = createMockIpc();
+      mount(mock);
+      await user.click(await screen.findByRole("button", { name: /^Travel/ }));
+      const form = await screen.findByRole("form", { name: "Daily limits for this deck" });
+      const newCards = within(form).getByRole("spinbutton", { name: /New cards per day/ });
+      await user.clear(newCards);
+      expect(within(form).getByRole("button", { name: "Save limits" })).toBeDisabled();
+      expect(within(form).getByText(/whole numbers from 0 to 9999/)).toBeInTheDocument();
+      await user.type(newCards, "10000");
+      expect(within(form).getByRole("button", { name: "Save limits" })).toBeDisabled();
+      await user.keyboard("{Enter}");
+      expect(mock.calls.some((c) => c.name === "setDailyLimits")).toBe(false);
+    });
+
+    it("has no per-deck limits for the all-cards view", async () => {
+      mount(createMockIpc());
+      await screen.findByRole("button", { name: /^Travel/ });
+      expect(screen.queryByRole("form", { name: "Daily limits for this deck" })).not.toBeInTheDocument();
+    });
+  });
 });

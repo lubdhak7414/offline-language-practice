@@ -394,6 +394,8 @@ export function Decks(props: { announce: (msg: string) => void }) {
         </article>
       )}
 
+      {selected && <DeckLimits key={selected} deckId={selected} announce={announce} />}
+
       <h2>Cards{selected && ` in ${decks.find((d) => d.id === selected)?.name ?? ""}`}</h2>
 
       {loading && <p class="muted">Loading cards…</p>}
@@ -537,5 +539,122 @@ export function Decks(props: { announce: (msg: string) => void }) {
         <p class="muted">No cards {selected ? "in this deck" : "yet"}.</p>
       )}
     </section>
+  );
+}
+
+/** Largest cap the backend stores; it clamps to `0..=9999`. */
+const MAX_DAILY_CAP = 9999;
+
+function parseCap(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n <= MAX_DAILY_CAP ? n : null;
+}
+
+/**
+ * Daily caps for one deck. Saved on request rather than per keystroke, so a
+ * half-typed or cleared field never lands as 0. Mounted per deck (`key`), so
+ * switching decks cannot show one deck's numbers under another's name.
+ */
+function DeckLimits(props: { deckId: string; announce: (msg: string) => void }) {
+  const { deckId, announce } = props;
+  const [newDraft, setNewDraft] = useState<string | null>(null);
+  const [reviewDraft, setReviewDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const saving = useRef(false);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const limits = await ipc().getDailyLimits(deckId);
+        if (!live) return;
+        setNewDraft(String(limits.new_per_day));
+        setReviewDraft(String(limits.review_per_day));
+      } catch (e) {
+        if (live) setError(String(e));
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [deckId]);
+
+  const newCap = newDraft === null ? null : parseCap(newDraft);
+  const reviewCap = reviewDraft === null ? null : parseCap(reviewDraft);
+  const valid = newCap !== null && reviewCap !== null;
+
+  const save = async () => {
+    if (!valid || saving.current) return;
+    saving.current = true;
+    setError(null);
+    try {
+      const stored = await ipc().setDailyLimits({ deckId, newPerDay: newCap, reviewPerDay: reviewCap });
+      setNewDraft(String(stored.new_per_day));
+      setReviewDraft(String(stored.review_per_day));
+      announce("Daily limits saved.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      saving.current = false;
+    }
+  };
+
+  if (newDraft === null || reviewDraft === null) {
+    return error ? (
+      <p class="notice notice-error" role="alert">
+        {error}
+      </p>
+    ) : null;
+  }
+
+  return (
+    <form
+      class="deck-limits"
+      aria-label="Daily limits for this deck"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save();
+      }}
+    >
+      <label>
+        New cards per day{" "}
+        <input
+          type="number"
+          inputMode="numeric"
+          min={0}
+          max={MAX_DAILY_CAP}
+          value={newDraft}
+          aria-invalid={newCap === null}
+          onInput={(e) => setNewDraft((e.target as HTMLInputElement).value)}
+        />
+      </label>
+      <label>
+        Reviews per day{" "}
+        <input
+          type="number"
+          inputMode="numeric"
+          min={0}
+          max={MAX_DAILY_CAP}
+          value={reviewDraft}
+          aria-invalid={reviewCap === null}
+          onInput={(e) => setReviewDraft((e.target as HTMLInputElement).value)}
+        />
+      </label>
+      <button type="submit" disabled={!valid}>
+        Save limits
+      </button>
+      <p class="muted">
+        {valid
+          ? "Used when you review this deck on its own. Reviewing all decks uses the limits in Settings."
+          : `Enter whole numbers from 0 to ${MAX_DAILY_CAP}.`}
+      </p>
+      {error && (
+        <p class="notice notice-error" role="alert">
+          {error}
+        </p>
+      )}
+    </form>
   );
 }
