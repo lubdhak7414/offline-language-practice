@@ -1221,9 +1221,14 @@ async fn check_for_update(
     let Some(_busy) = state.updates.begin() else {
         return Err("UPDATE_BUSY: an update check or install is already running".into());
     };
+    // `timeout` is reqwest's whole-request limit, right for a small JSON
+    // file. The `Update` this returns inherits it for the download too, so
+    // `install_update` clears it; the per-read limit set here is what then
+    // ends a stalled download.
     let mut builder = app
         .updater_builder()
-        .timeout(std::time::Duration::from_secs(30));
+        .timeout(std::time::Duration::from_secs(30))
+        .configure_client(|c| c.read_timeout(std::time::Duration::from_secs(60)));
     let env = std::env::var("OLP_UPDATE_ENDPOINT").ok();
     if let Some(url) = crate::updates::endpoint_override(env.as_deref())? {
         let url: tauri::Url = url.parse().map_err(|e| format!("bad endpoint: {e}"))?;
@@ -1281,9 +1286,12 @@ async fn install_update(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let Some(update) = pending else {
+    let Some(mut update) = pending else {
         return Err("UPDATE_NONE: check for an update first".into());
     };
+    // The check's 30 s total limit would cut off a ~120 MB AppImage on any
+    // link slower than ~4 MB/s. The 60 s read timeout still applies.
+    update.timeout = None;
     let progress = channel.clone();
     let mut received = 0u64;
     let mut started = false;
