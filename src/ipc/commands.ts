@@ -11,6 +11,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AttemptReport,
   AttemptRow,
+  PracticeDay,
   SessionSummary,
   BackupInfo,
   BackupResult,
@@ -324,6 +325,13 @@ export const tauriIpc: Ipc = {
       "stats_overview",
       tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {},
     );
+  },
+
+  statsPractice(days: number, tzOffsetMinutes?: number) {
+    return invoke<PracticeDay[]>("stats_practice", {
+      days,
+      ...(tzOffsetMinutes !== undefined ? { tzOffsetMinutes } : {}),
+    });
   },
 
   statsDaily(days: number, tzOffsetMinutes?: number) {

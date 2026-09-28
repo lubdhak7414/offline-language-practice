@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
-import type { AttemptRow, DayCount, ForecastDay, Overview, RetentionBucket } from "../ipc/types";
+import type { AttemptRow, DayCount, ForecastDay, Overview, PracticeDay, RetentionBucket } from "../ipc/types";
 import { BarChart, LineChart, type ChartPoint } from "../components/Chart";
 import { tzOffsetMinutes } from "../lib/tz";
 
@@ -43,6 +43,7 @@ function snippet(text: string): string {
 export function Progress() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [daily, setDaily] = useState<DayCount[]>([]);
+  const [practice, setPractice] = useState<PracticeDay[]>([]);
   const [forecast, setForecast] = useState<ForecastDay[]>([]);
   const [retention, setRetention] = useState<RetentionBucket[]>([]);
   const [attempts, setAttempts] = useState<AttemptRow[] | null>(null);
@@ -75,6 +76,14 @@ export function Progress() {
     // Separate from the stats above, so a failure here does not blank the charts.
     void (async () => {
       try {
+        const rows = await ipc().statsPractice(STATS_DAYS, tzOffsetMinutes());
+        if (live) setPractice(rows);
+      } catch {
+        // Only the speaking charts are lost; the rest of the screen stands.
+      }
+    })();
+    void (async () => {
+      try {
         const rows = await ipc().listAttempts(undefined, RECENT_ATTEMPTS);
         if (live) setAttempts(rows);
       } catch (e) {
@@ -87,6 +96,12 @@ export function Progress() {
   }, []);
 
   const dailyPoints: ChartPoint[] = daily.map((d) => ({ label: dayLabel(d.day), value: d.reviews }));
+  const practicePoints: ChartPoint[] = practice.map((p) => ({ label: dayLabel(p.day), value: p.attempts }));
+  // Only days with an acoustic score: a day without one is a gap, not a zero,
+  // so it is left off rather than drawn as a drop.
+  const pronPoints: ChartPoint[] = practice.flatMap((p) =>
+    p.avg_pron === null ? [] : [{ label: dayLabel(p.day), value: Math.round(p.avg_pron) }],
+  );
   const forecastPoints: ChartPoint[] = forecast.map((f) => ({ label: dayLabel(f.day), value: f.due }));
   const retentionPoints: ChartPoint[] = retention.map((r) => ({
     label: dayLabel(r.day),
@@ -126,6 +141,12 @@ export function Progress() {
       {!loading && (
         <div class="charts">
           <BarChart title="Reviews per day (last 30 days)" unit="Reviews" data={dailyPoints} />
+          <BarChart title="Speaking attempts per day (last 30 days)" unit="Attempts" data={practicePoints} />
+          <LineChart title="Pronunciation on days you read aloud" unit="Average score" data={pronPoints} />
+          <p class="muted chart-note">
+            Days without a read-aloud attempt are left out. The score is measured against expert ratings of
+            speakers whose first language is Mandarin, so treat it as a hint.
+          </p>
           <BarChart title="Due forecast (next 14 days)" unit="Cards due" data={forecastPoints} />
           <LineChart title="Retention by week" unit="Retention %" data={retentionPoints} />
         </div>

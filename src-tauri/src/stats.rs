@@ -255,6 +255,81 @@ pub async fn daily(
     Ok(out)
 }
 
+/// One day of speaking practice.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct PracticeDay {
+    /// The day's start, unix seconds (same bucketing as [`DayCount`]).
+    pub day: i64,
+    pub attempts: i64,
+    /// Mean acoustic pronunciation that day, `None` when no attempt had one.
+    /// Text-fallback scores are a different measurement and are left out.
+    pub avg_pron: Option<f64>,
+    /// Mean speaking rate that day, `None` when none was measured.
+    pub avg_wpm: Option<f64>,
+}
+
+/// Speaking-practice series over the last `days` days (today inclusive), one
+/// entry per day including days with no practice.
+pub async fn practice_daily(
+    pool: &sqlx::SqlitePool,
+    days: i64,
+    tz: i64,
+    cutoff: i64,
+) -> Result<Vec<PracticeDay>, AppError> {
+    let days = days.max(0);
+    let today = day_index(now_unix(), tz, cutoff);
+    let start_day = today - (days - 1).max(0);
+    let window_start = day_start_unix(start_day, tz, cutoff);
+    let window_end = day_start_unix(today + 1, tz, cutoff);
+
+    let rows = sqlx::query(
+        "SELECT a.created_at, s.pron_overall, s.pron_method, s.wpm \
+         FROM attempts a LEFT JOIN attempt_scores s ON s.attempt_id = a.id \
+         WHERE a.created_at >= ? AND a.created_at < ?",
+    )
+    .bind(window_start)
+    .bind(window_end)
+    .fetch_all(pool)
+    .await?;
+
+    #[derive(Default)]
+    struct Acc {
+        attempts: i64,
+        pron: (f64, i64),
+        wpm: (f64, i64),
+    }
+    let mut by_day: std::collections::HashMap<i64, Acc> = std::collections::HashMap::new();
+    for row in rows {
+        let at: i64 = row.get("created_at");
+        let acc = by_day.entry(day_index(at, tz, cutoff)).or_default();
+        acc.attempts += 1;
+        let method: Option<String> = row.get("pron_method");
+        let pron: Option<i64> = row.get("pron_overall");
+        if let (Some("gop"), Some(p)) = (method.as_deref(), pron) {
+            acc.pron.0 += p as f64;
+            acc.pron.1 += 1;
+        }
+        if let Some(w) = row.get::<Option<f64>, _>("wpm") {
+            acc.wpm.0 += w;
+            acc.wpm.1 += 1;
+        }
+    }
+
+    let mut out = Vec::new();
+    if days > 0 {
+        for day in start_day..=today {
+            let acc = by_day.remove(&day).unwrap_or_default();
+            out.push(PracticeDay {
+                day: day_start_unix(day, tz, cutoff),
+                attempts: acc.attempts,
+                avg_pron: (acc.pron.1 > 0).then(|| acc.pron.0 / acc.pron.1 as f64),
+                avg_wpm: (acc.wpm.1 > 0).then(|| acc.wpm.0 / acc.wpm.1 as f64),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Due-card forecast for the next `days` days, one entry per day including
 /// empty ones. Anything already overdue (`next_due_date` before today's
 /// bucket start) is folded into the first (today's) bucket rather than
@@ -406,6 +481,58 @@ mod tests {
             streak, 1,
             "today not being over yet must not break the streak"
         );
+    }
+
+    async fn score_at(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        pron: Option<(i64, &str)>,
+        wpm: Option<f64>,
+    ) {
+        sqlx::query("INSERT INTO attempt_scores (attempt_id, pron_overall, pron_method, wpm, overall) VALUES (?, ?, ?, ?, 50)")
+            .bind(id)
+            .bind(pron.map(|p| p.0))
+            .bind(pron.map(|p| p.1))
+            .bind(wpm)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn practice_daily_is_contiguous_and_never_invents_a_score() {
+        let pool = pool().await;
+        let cutoff = 4;
+        let today = day_index(now_unix(), 0, cutoff);
+        let d = |n: i64| day_start_unix(today - n, 0, cutoff) + 100;
+        // Two days ago: one acoustic 80 and one acoustic 60, plus a text-fallback 5.
+        for (id, at) in [("p1", d(2)), ("p2", d(2)), ("p3", d(2))] {
+            attempt_at(&pool, id, at).await;
+        }
+        score_at(&pool, "p1", Some((80, "gop")), Some(100.0)).await;
+        score_at(&pool, "p2", Some((60, "gop")), None).await;
+        score_at(&pool, "p3", Some((5, "text")), Some(140.0)).await;
+        // Today: free speaking, so an attempt with no pronunciation.
+        attempt_at(&pool, "f1", d(0)).await;
+        score_at(&pool, "f1", None, Some(90.0)).await;
+
+        let out = practice_daily(&pool, 4, 0, cutoff).await.unwrap();
+        assert_eq!(out.len(), 4, "one entry per day, gaps included");
+        assert_eq!(out[0].attempts, 0);
+        assert_eq!(out[0].avg_pron, None, "no practice is None, not 0");
+        assert_eq!(out[1].attempts, 3);
+        assert_eq!(out[1].avg_pron, Some(70.0), "text fallback left out");
+        assert_eq!(out[1].avg_wpm, Some(120.0));
+        assert_eq!(out[2].attempts, 0);
+        assert_eq!(out[3].attempts, 1);
+        assert_eq!(out[3].avg_pron, None);
+        assert_eq!(out[3].avg_wpm, Some(90.0));
+    }
+
+    #[tokio::test]
+    async fn practice_daily_with_zero_days_is_empty() {
+        let pool = pool().await;
+        assert!(practice_daily(&pool, 0, 0, 4).await.unwrap().is_empty());
     }
 
     /// Insert a bare attempt row; the streak only looks at `created_at`.

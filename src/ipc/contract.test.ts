@@ -98,6 +98,7 @@ describe("Ipc implementations", () => {
         "statsDaily",
         "statsForecast",
         "statsOverview",
+        "statsPractice",
         "statsRetention",
         "suspendCard",
         "synthesizeSpeech",

@@ -129,4 +129,25 @@ describe("Progress", () => {
       expect(screen.getAllByText("Reviews per day (last 30 days)").length).toBeGreaterThan(0);
     });
   });
+
+  it("draws pronunciation only for days that had a score, and says why others are missing", async () => {
+    const day = (n: number) => 1_700_000_000 + n * 86_400;
+    mount(
+      createMockIpc({
+        practice: [
+          { day: day(0), attempts: 2, avg_pron: 70, avg_wpm: 120 },
+          { day: day(1), attempts: 0, avg_pron: null, avg_wpm: null },
+          { day: day(2), attempts: 1, avg_pron: null, avg_wpm: 100 },
+          { day: day(3), attempts: 3, avg_pron: 82.4, avg_wpm: 130 },
+        ],
+      }),
+    );
+    const [caption] = await screen.findAllByText("Pronunciation on days you read aloud");
+    const chart = caption?.closest("figure") as HTMLElement;
+    const rows = within(chart).getAllByRole("row");
+    // header + the two scored days; the free-speaking day and the empty day are gaps.
+    expect(rows).toHaveLength(3);
+    expect(within(chart).getByText("82")).toBeInTheDocument();
+    expect(screen.getByText(/Days without a read-aloud attempt are left out/)).toBeInTheDocument();
+  });
 });

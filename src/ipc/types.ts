@@ -294,6 +294,15 @@ export type Overview = {
   attempts_total: number;
 };
 
+/** One day of speaking practice. `day` is the bucket's start, unix **seconds**. */
+export type PracticeDay = {
+  day: number;
+  attempts: number;
+  /** Mean acoustic pronunciation; null when none was scored that day, never 0. */
+  avg_pron: number | null;
+  avg_wpm: number | null;
+};
+
 /** `day` is the bucket's start, unix **seconds**. */
 export type DayCount = { day: number; reviews: number; again: number };
 
@@ -457,6 +466,7 @@ export type Ipc = {
   // --- stats ---
   statsOverview(tzOffsetMinutes?: number): Promise<Overview>;
   statsDaily(days: number, tzOffsetMinutes?: number): Promise<DayCount[]>;
+  statsPractice(days: number, tzOffsetMinutes?: number): Promise<PracticeDay[]>;
   statsForecast(days: number, tzOffsetMinutes?: number): Promise<ForecastDay[]>;
   statsRetention(
     days: number,

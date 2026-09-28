@@ -38,6 +38,7 @@ import type {
   PronScore,
   Rating,
   RetentionBucket,
+  PracticeDay,
   ScoreAttemptArgs,
   SessionSummary,
   SetDailyLimitsArgs,
@@ -79,6 +80,8 @@ export type MockOptions = {
   preferences?: Partial<Preferences>;
   overview?: Partial<Overview>;
   daily?: DayCount[];
+  /** Speaking-practice days `statsPractice` returns; default is a short sample with gaps. */
+  practice?: PracticeDay[];
   forecast?: ForecastDay[];
   retentionBuckets?: RetentionBucket[];
   /** Practice history `listAttempts` starts with, newest first. */
@@ -256,6 +259,20 @@ function defaultDaily(): DayCount[] {
     out.push({ day, reviews, again });
   }
   return out;
+}
+
+function defaultPractice(): PracticeDay[] {
+  const start = Math.floor(Date.now() / 1000 / 86_400) * 86_400 - 29 * 86_400;
+  return Array.from({ length: 30 }, (_, i) => {
+    const attempts = i % 3 === 0 ? 0 : 1 + (i % 4);
+    return {
+      day: start + i * 86_400,
+      attempts,
+      // Days with only free speaking, or none, have no pronunciation average.
+      avg_pron: attempts === 0 || i % 5 === 0 ? null : 55 + ((i * 3) % 30),
+      avg_wpm: attempts === 0 ? null : 110 + (i % 20),
+    };
+  });
 }
 
 function defaultForecast(): ForecastDay[] {
@@ -638,6 +655,11 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     statsDaily(days: number, tzOffsetMinutes?: number) {
       const rows = options.daily ?? defaultDaily();
       return record("statsDaily", [days, tzOffsetMinutes], rows.slice(-days));
+    },
+
+    statsPractice(days: number, tzOffsetMinutes?: number) {
+      const rows = options.practice ?? defaultPractice();
+      return record("statsPractice", [days, tzOffsetMinutes], rows.slice(-days));
     },
 
     statsForecast(days: number, tzOffsetMinutes?: number) {

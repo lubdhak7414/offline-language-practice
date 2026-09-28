@@ -1479,6 +1479,20 @@ async fn stats_daily(
         .map_err(String::from)
 }
 
+/// Speaking-practice series over the last `days` days.
+#[tauri::command]
+async fn stats_practice(
+    days: i64,
+    tz_offset_minutes: Option<i64>,
+    db: State<'_, DbInstances>,
+) -> Result<Vec<crate::stats::PracticeDay>, String> {
+    let pool = crate::db::sqlite_pool(&db).await.map_err(String::from)?;
+    let cutoff = crate::prefs::cutoff_hour(&pool).await;
+    crate::stats::practice_daily(&pool, days, tz_offset_minutes.unwrap_or(0), cutoff)
+        .await
+        .map_err(String::from)
+}
+
 /// Due-card forecast for the next `days` days.
 #[tauri::command]
 async fn stats_forecast(
@@ -2015,6 +2029,7 @@ pub fn run() {
             restore_database,
             stats_overview,
             stats_daily,
+            stats_practice,
             stats_forecast,
             stats_retention,
             get_voice,

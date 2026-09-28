@@ -24,6 +24,10 @@ Notable changes to this project. The format follows
   same, because the score is a hint. Nothing is compared across a different
   prompt or between different kinds of scoring.
 
+- **Speaking trends on Progress.** Attempts per day and average pronunciation
+  over the last 30 days. Days without a read-aloud attempt are left out of the
+  pronunciation line rather than drawn as zero.
+
 ### Changed
 
 - **Practice opens on your goal.** The goal chosen during setup now decides
