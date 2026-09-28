@@ -198,6 +198,9 @@ describe("Practice", () => {
     const user = userEvent.setup();
     mount(createMockIpc({ preferences: { practice_goal_attempts: 2 } }));
     expect(await screen.findByText("0 of 2 today")).toBeInTheDocument();
+    // Record stays disabled until the prompt has loaded; the goal can win
+    // that race, and a click on a disabled button does nothing.
+    await screen.findByText("Reply to a greeting:");
     await user.click(screen.getByRole("button", { name: /^Record/ }));
     await user.click(await screen.findByRole("button", { name: /^Stop/ }));
     expect(await screen.findByText("1 of 2 today")).toBeInTheDocument();
