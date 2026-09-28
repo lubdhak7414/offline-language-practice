@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
 import { ipc } from "../ipc/commands";
-import type { DueCard, Rating } from "../ipc/types";
+import type { DeckRow, DueCard, Rating } from "../ipc/types";
+import { createClipPlayer, speak } from "../lib/audio/player";
+import { friendlyTtsError } from "../lib/errors";
 import { formatInterval } from "../lib/interval";
 import { goPrefix } from "../lib/globalKeys";
 import { reviewKeyAction } from "../lib/keyboard";
@@ -44,31 +46,70 @@ export function Review(props: { announce: (msg: string) => void }) {
   // Same reasoning, separate guard: undo and grade are different backend
   // calls, so one busy flag cannot cover both without one blocking the other.
   const undoing = useRef(false);
+  // "" is every deck. Only offered when there is more than one to pick from.
+  const [decks, setDecks] = useState<DeckRow[]>([]);
+  const [deckId, setDeckId] = useState("");
+  // Newest load wins: switching decks quickly leaves two queues in flight.
+  const loadSeq = useRef(0);
+  const player = useRef(createClipPlayer());
+  const speaking = useRef(false);
 
   const card = queue[index];
   const finished = !loading && !card;
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true);
     setError(null);
     try {
       const cards = await ipc().dueCards({
         limit: REVIEW_QUEUE_SIZE,
+        ...(deckId ? { deckId } : {}),
         tzOffsetMinutes: tzOffsetMinutes(),
       });
+      if (seq !== loadSeq.current) return;
       setQueue(cards);
       setIndex(0);
       setRevealed(false);
     } catch (e) {
-      setError(String(e));
+      if (seq === loadSeq.current) setError(String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
-  }, []);
+  }, [deckId]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const rows = await ipc().listDecks();
+        if (live) setDecks(rows);
+      } catch {
+        // Without the list there is nothing to pick from; "all decks" still works.
+      }
+    })();
+    const clips = player.current;
+    return () => {
+      live = false;
+      clips.stop();
+    };
+  }, []);
+
+  const listen = useCallback(async (text: string) => {
+    if (speaking.current) return;
+    speaking.current = true;
+    try {
+      await speak(text, player.current);
+    } catch (e) {
+      setError(friendlyTtsError(e));
+    } finally {
+      speaking.current = false;
+    }
+  }, []);
 
   const reveal = useCallback(() => {
     setRevealed(true);
@@ -175,6 +216,22 @@ export function Review(props: { announce: (msg: string) => void }) {
       <div class="route-head">
         <h1 tabIndex={-1}>Review</h1>
         <div class="row">
+          {decks.length > 1 && (
+            <label class="deck-picker">
+              Deck{" "}
+              <select
+                value={deckId}
+                onChange={(e) => setDeckId((e.target as HTMLSelectElement).value)}
+              >
+                <option value="">All decks</option>
+                {decks.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.name} ({d.due_count} due)
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {card && (
             <p class="muted" aria-live="off">
               {index + 1} of {queue.length}
@@ -200,6 +257,9 @@ export function Review(props: { announce: (msg: string) => void }) {
         <article class="review-card">
           {card.deck_name && <p class="chip">{card.deck_name}</p>}
           <p class="review-front">{card.front}</p>
+          <button type="button" class="listen" onClick={() => void listen(card.front)}>
+            Listen
+          </button>
           {revealed ? (
             <p class="review-back">{card.back}</p>
           ) : (

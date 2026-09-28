@@ -362,7 +362,7 @@ export function createMockIpc(options: MockOptions = {}): MockIpc {
     },
 
     dueCards(args) {
-      const pool = args.deckId ? due.filter((c) => c.id.startsWith(args.deckId!)) : due;
+      const pool = args.deckId ? due.filter((c) => c.deck_id === args.deckId) : due;
       return record("dueCards", [args], pool.slice(0, args.limit));
     },
 

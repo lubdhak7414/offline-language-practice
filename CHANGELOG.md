@@ -28,7 +28,7 @@ feedback and spaced repetition, running entirely on-device.
   otherwise pauses are measured from the audio itself.
 - **Review.** FSRS-6 spaced repetition with daily caps, tags, suspend, bury
   and undo. Keyboard-first, with the predicted interval shown under each
-  grade.
+  grade. Review one deck or all of them, and hear any card read aloud.
 - **Decks, Progress and Settings.** Deck and card management, reviews-per-day
   and retention charts, streaks, a recent-practice history with each
   attempt's scores, voice selection, and a diagnostics panel.

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/preact";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makeDueCard, type MockIpc } from "../ipc/mock";
@@ -153,5 +153,53 @@ describe("Review", () => {
     mount(twoCards());
     await screen.findByText("first front");
     expect(screen.queryByRole("button", { name: /Undo/ })).not.toBeInTheDocument();
+  });
+
+  it("reviews one deck when one is picked", async () => {
+    const user = userEvent.setup();
+    const mock = createMockIpc({
+      due: [
+        makeDueCard({ id: "c1", front: "default front", deck_id: "default" }),
+        makeDueCard({ id: "c2", front: "travel front", deck_id: "travel", deck_name: "Travel" }),
+      ],
+    });
+    mount(mock);
+    expect(await screen.findByText("default front")).toBeInTheDocument();
+    await user.selectOptions(await screen.findByRole("combobox", { name: /Deck/ }), "travel");
+    expect(await screen.findByText("travel front")).toBeInTheDocument();
+    expect(screen.getByText("1 of 1")).toBeInTheDocument();
+    const last = mock.calls.filter((c) => c.name === "dueCards").at(-1)?.args[0];
+    expect(last).toMatchObject({ deckId: "travel" });
+
+    await user.selectOptions(screen.getByRole("combobox", { name: /Deck/ }), "");
+    await waitFor(() => expect(screen.getByText("1 of 2")).toBeInTheDocument());
+    expect(mock.calls.filter((c) => c.name === "dueCards").at(-1)?.args[0]).not.toHaveProperty("deckId");
+  });
+
+  it("offers no deck picker with only one deck", async () => {
+    mount(createMockIpc({ decks: [{ id: "default", name: "Default" }], due: [makeDueCard()] }));
+    await screen.findByText("the front");
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  });
+
+  it("reads the card aloud, and explains a busy voice", async () => {
+    vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:t", revokeObjectURL: () => {} });
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    try {
+      const mock = twoCards();
+      mount(mock);
+      await screen.findByText("first front");
+      fireEvent.click(screen.getByRole("button", { name: "Listen" }));
+      await waitFor(() => expect(play).toHaveBeenCalledTimes(1));
+      expect(mock.calls.find((c) => c.name === "synthesizeSpeech")?.args).toEqual(["first front"]);
+
+      vi.spyOn(mock, "synthesizeSpeech").mockRejectedValue("TTS_BUSY: queue full");
+      fireEvent.click(screen.getByRole("button", { name: "Listen" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent(/Still speaking/);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
   });
 });
