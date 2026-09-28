@@ -1,9 +1,8 @@
 //! Word-level comparison of what was said against what should have been said.
 //!
 //! Pure: no IO, no `ort`, no database. That is deliberate — it is the part of
-//! scoring that can be tested exhaustively, and it is the whole product in
-//! Phase 2 (acoustic scoring arrives later and degrades back to this on any
-//! error).
+//! scoring that can be tested exhaustively, and it is what the practice loop
+//! falls back to whenever acoustic scoring (below) refuses a recording.
 //!
 //! The comparison is a word-level Levenshtein alignment. Both sides are
 //! normalized first, because a wav2vec2 CTC transcript is upper-case and
