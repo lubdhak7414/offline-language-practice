@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/preact";
 import { describe, expect, it } from "vitest";
 
+import { expectNoA11yViolations } from "../test/axe";
 import { KeyboardHelp } from "./KeyboardHelp";
 
 describe("KeyboardHelp", () => {
@@ -29,5 +30,12 @@ describe("KeyboardHelp", () => {
     expect(close).toHaveFocus();
     expect(fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true })).toBe(false);
     expect(close).toHaveFocus();
+  });
+});
+
+describe("KeyboardHelp accessibility", () => {
+  it("has no violations", async () => {
+    const { container } = render(<KeyboardHelp onClose={() => {}} />);
+    await expectNoA11yViolations(container);
   });
 });

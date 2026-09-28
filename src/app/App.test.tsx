@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makeUpdate } from "../ipc/mock";
 import { goPrefix } from "../lib/globalKeys";
+import { expectNoA11yViolations } from "../test/axe";
 import { App } from "./App";
 
 let restore: (() => void) | undefined;
@@ -122,4 +123,43 @@ describe("App", () => {
     await screen.findByRole("heading", { level: 1, name: "Practice" });
     expect(screen.getAllByRole("status")).toHaveLength(1);
   });
+});
+
+describe("App accessibility", () => {
+  it("has no violations in the shell and nav", async () => {
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Practice" });
+    // axe reports these page-level rules as "needs review" inside jsdom, so
+    // assert the landmarks directly.
+    expect(screen.getAllByRole("main")).toHaveLength(1);
+    expect(screen.getAllByRole("navigation")).toHaveLength(1);
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with the shortcut sheet open", async () => {
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Practice" });
+    fireEvent.keyDown(document, { key: "?" });
+    await screen.findByRole("dialog", { name: "Keyboard shortcuts" });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations on onboarding", async () => {
+    restore?.();
+    restore = setIpc(createMockIpc({ preferences: { onboarded: false } }));
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "Welcome" });
+    await expectNoA11yViolations(container);
+  });
+
+  it.each(["review", "decks", "progress", "settings"])(
+    "has no violations on the %s route inside the shell",
+    async (route) => {
+      window.location.hash = `#/${route}`;
+      const { container } = render(<App />);
+      await screen.findByRole("navigation", { name: "Main" });
+      await screen.findByRole("heading", { level: 1 });
+      await expectNoA11yViolations(container);
+    },
+  );
 });

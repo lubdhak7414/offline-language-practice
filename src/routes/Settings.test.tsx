@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makeUpdate, type MockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Settings } from "./Settings";
 
 let restore: (() => void) | undefined;
@@ -226,5 +227,35 @@ describe("Settings", () => {
     await screen.findByText(/Voice/);
     fireEvent.click(screen.getByRole("button", { name: "Restore database" }));
     expect(await screen.findByText(/[Rr]estart required/)).toBeInTheDocument();
+  });
+});
+
+describe("Settings accessibility", () => {
+  it("has no violations with the default settings", async () => {
+    const { container } = mount(createMockIpc());
+    await screen.findByLabelText("New cards per day");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with an update available", async () => {
+    const { container } = mount(createMockIpc({ update: { available: makeUpdate() } }));
+    await screen.findByLabelText("New cards per day");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations when the app cannot update itself", async () => {
+    const { container } = mount(
+      createMockIpc({
+        update: { mode: "notify", available: makeUpdate({ can_install: false }) },
+      }),
+    );
+    await screen.findByLabelText("New cards per day");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with the dark theme chosen", async () => {
+    const { container } = mount(createMockIpc({ preferences: { theme: "dark" } }));
+    await screen.findByLabelText("New cards per day");
+    await expectNoA11yViolations(container);
   });
 });

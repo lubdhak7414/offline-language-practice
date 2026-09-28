@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
 import type { CardRow } from "../ipc/types";
+import { expectNoA11yViolations } from "../test/axe";
 import { Decks } from "./Decks";
 
 let restore: (() => void) | undefined;
@@ -218,5 +219,59 @@ describe("Decks", () => {
       await screen.findByRole("button", { name: /^Travel/ });
       expect(screen.queryByRole("form", { name: "Daily limits for this deck" })).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("Decks accessibility", () => {
+  const cards = [
+    { id: "a", deck_id: "default", front: "Good morning", back: "Greeting", tags: ["greetings"] },
+    { id: "b", deck_id: "travel", front: "Where is the station?", back: "Directions", tags: ["travel"] },
+  ];
+
+  it("has no violations with cards listed", async () => {
+    const { container } = mount(createMockIpc({ cards }));
+    await screen.findByText("Good morning");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with one deck selected and its limits showing", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc({ cards }));
+    await user.click(await screen.findByRole("button", { name: /^Travel/ }));
+    await screen.findByRole("form", { name: "Daily limits for this deck" });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with no cards", async () => {
+    const { container } = mount(createMockIpc({ cards: [] }));
+    await screen.findByText(/Default/);
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations while a delete is being confirmed", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc({ cards }));
+    await screen.findByText("Good morning");
+    await user.click(screen.getAllByRole("button", { name: "Delete" })[0]!);
+    await screen.findByRole("alertdialog");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations while a card is being edited", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc({ cards }));
+    await screen.findByText("Good morning");
+    await user.click(screen.getAllByRole("button", { name: "Edit" })[0]!);
+    await screen.findByRole("button", { name: "Save" });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with a filter that matches nothing", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc({ cards }));
+    await screen.findByText("Good morning");
+    await user.type(screen.getByRole("searchbox", { name: "Search cards" }), "zzz");
+    await screen.findByText("No cards match.");
+    await expectNoA11yViolations(container);
   });
 });

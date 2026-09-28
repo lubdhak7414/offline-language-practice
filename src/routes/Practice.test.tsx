@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makePrompt, type MockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Practice } from "./Practice";
 
 // jsdom has no microphone. A recorder that hands back one second of silence
@@ -463,5 +464,106 @@ describe("Practice", () => {
       release();
       await waitFor(() => expect(played).toBe(1));
     });
+  });
+});
+
+describe("Practice accessibility", () => {
+  it("has no violations on the prompt view", async () => {
+    const { container } = mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations on the feedback view", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    await screen.findByRole("button", { name: "Next prompt" });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations on a free-speaking prompt", async () => {
+    const { container } = mount(
+      createMockIpc({
+        prompts: [makePrompt({ target_text: null, prompt_text: "Tell me about yourself." })],
+      }),
+    );
+    await screen.findByText("Free speaking");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations while recording", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc());
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await screen.findByRole("button", { name: /^Stop/ });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations on feedback with grammar and pronunciation marks", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(
+      createMockIpc({
+        report: {
+          transcript: "hi good too see you",
+          lint: {
+            diags: [{ start: 8, end: 11, message: "Did you mean to?", suggestions: ["to"] }],
+            truncated: false,
+          },
+          grammar_score: 80,
+          pron: {
+            overall: 60,
+            words: [
+              { word: "HI", start_ms: 0, end_ms: 200, gop: -0.1, score: 95, verdict: "good" },
+              { word: "GOOD", start_ms: 200, end_ms: 500, gop: -1.5, score: 55, verdict: "unclear" },
+              { word: "SEE", start_ms: 500, end_ms: 800, gop: -3, score: 20, verdict: "poor" },
+            ],
+            target_logprob: -2.5,
+            free_logprob: -1.5,
+            normalized_conf: 0.9,
+          },
+        },
+      }),
+    );
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByRole("button", { name: /^Record/ }));
+    await user.click(await screen.findByRole("button", { name: /^Stop/ }));
+    await screen.findByRole("button", { name: "Next prompt" });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with the speech model missing", async () => {
+    const { container } = mount(
+      createMockIpc({ modelStatus: { asr_model: false, asr_vocab: false, tts_voice: true } }),
+    );
+    await screen.findByText(/speech model is not installed yet/i);
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with an error notice showing", async () => {
+    const { container } = mount(createMockIpc({ fail: { nextPrompt: new Error("db is gone") } }));
+    await screen.findByRole("alert");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with the writing check open and answered", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(
+      createMockIpc({
+        lint: {
+          diags: [{ start: 2, end: 6, message: "Use a singular noun.", suggestions: ["cat"] }],
+          truncated: false,
+        },
+      }),
+    );
+    await screen.findByText("Reply to a greeting:");
+    await user.click(screen.getByText("Check writing"));
+    await user.type(screen.getByPlaceholderText(/Paste or type/), "a cats sat");
+    await user.click(screen.getByRole("button", { name: "Check" }));
+    await screen.findByRole("list", { name: "Grammar suggestions" });
+    await expectNoA11yViolations(container);
   });
 });

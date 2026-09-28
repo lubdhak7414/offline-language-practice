@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, makeDueCard, type MockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Review } from "./Review";
 
 let restore: (() => void) | undefined;
@@ -222,5 +223,49 @@ describe("Review", () => {
       vi.unstubAllGlobals();
       vi.restoreAllMocks();
     }
+  });
+});
+
+describe("Review accessibility", () => {
+  it("has no violations on the front of a card", async () => {
+    const { container } = mount(twoCards());
+    await screen.findByText("first front");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations once the answer is revealed", async () => {
+    const { container } = mount(twoCards());
+    await screen.findByText("first front");
+    fireEvent.keyDown(document, { key: " " });
+    await screen.findByRole("button", { name: /Good/ });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with the session history and undo showing", async () => {
+    const { container } = mount(twoCards());
+    await screen.findByText("first front");
+    fireEvent.keyDown(document, { key: " " });
+    fireEvent.click(await screen.findByRole("button", { name: /Good/ }));
+    const log = await screen.findByRole("log");
+    await waitFor(() => expect(log).toHaveTextContent("Good: first front"));
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations when nothing is due", async () => {
+    const { container } = mount(createMockIpc({ due: [] }));
+    await screen.findByText("Nothing due");
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations on the round-finished summary", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(
+      createMockIpc({ due: [makeDueCard({ id: "only", front: "only front" })] }),
+    );
+    await screen.findByText("only front");
+    fireEvent.keyDown(document, { key: " " });
+    await user.click(await screen.findByRole("button", { name: /Good/ }));
+    await screen.findByText("Round finished");
+    await expectNoA11yViolations(container);
   });
 });

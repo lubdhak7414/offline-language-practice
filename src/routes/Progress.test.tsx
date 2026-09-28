@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Progress } from "./Progress";
 
 let restore: (() => void) | undefined;
@@ -149,5 +150,35 @@ describe("Progress", () => {
     expect(rows).toHaveLength(3);
     expect(within(chart).getByText("82")).toBeInTheDocument();
     expect(screen.getByText(/Days without a read-aloud attempt are left out/)).toBeInTheDocument();
+  });
+});
+
+describe("Progress accessibility", () => {
+  it("has no violations with charts and no practice yet", async () => {
+    const { container } = mount(createMockIpc());
+    await screen.findByRole("img", { name: /Reviews per day \(last 30 days\)/ });
+    await expectNoA11yViolations(container);
+  });
+
+  it("has no violations with recent practice listed", async () => {
+    const row = {
+      id: "a1",
+      prompt_id: "p1",
+      target_text: "Hi, good to see you again.",
+      transcript: "hi good to see you again",
+      duration_ms: 2400,
+      created_at: Date.UTC(2026, 8, 27, 14, 5),
+      pron_overall: 82,
+      pron_method: "gop",
+      overall: 88,
+    };
+    const { container } = mount(
+      createMockIpc({
+        attempts: [row, { ...row, id: "a2", prompt_id: null, target_text: null, pron_overall: null, pron_method: null }],
+      }),
+    );
+    await screen.findByRole("region", { name: "Recent practice" });
+    await within(screen.getByRole("region", { name: "Recent practice" })).findByRole("table");
+    await expectNoA11yViolations(container);
   });
 });

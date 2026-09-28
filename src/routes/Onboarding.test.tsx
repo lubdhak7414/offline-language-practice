@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setIpc } from "../ipc/commands";
 import { createMockIpc, type MockIpc } from "../ipc/mock";
+import { expectNoA11yViolations } from "../test/axe";
 import { Onboarding } from "./Onboarding";
 
 let restore: (() => void) | undefined;
@@ -157,5 +158,27 @@ describe("Onboarding", () => {
     await toModelStep(user);
     await user.click(await screen.findByRole("button", { name: /^Download / }));
     expect(await screen.findByRole("alert")).toHaveTextContent("network unreachable");
+  });
+});
+
+describe("Onboarding accessibility", () => {
+  it("has no violations on any step", async () => {
+    const user = userEvent.setup();
+    const { container } = mount(createMockIpc());
+
+    await screen.findByRole("heading", { name: "Welcome" });
+    await expectNoA11yViolations(container);
+
+    await user.click(screen.getByRole("button", { name: "Get started" }));
+    await screen.findByRole("heading", { name: "What do you want to practise?" });
+    await expectNoA11yViolations(container);
+
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByRole("heading", { name: "Set up your voice" });
+    await expectNoA11yViolations(container);
+
+    await user.click(await screen.findByRole("button", { name: "Skip for now" }));
+    await screen.findByRole("heading", { name: "Check your microphone" });
+    await expectNoA11yViolations(container);
   });
 });
