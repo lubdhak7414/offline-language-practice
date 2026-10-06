@@ -37,7 +37,7 @@ tauri-plugin-dialog = "2"
 # `system-proxy`, like reqwest below. No `zip`: that only unpacks v1-style
 # .zip/.tar.gz updater bundles, which this app never produces (macOS's
 # .app.tar.gz is unpacked with flate2/tar regardless of the feature).
-tauri-plugin-updater = { version = "~2.12.0", default-features = false, features = [
+tauri-plugin-updater = { version = "~2.13.1", default-features = false, features = [
   "native-tls",
 ] }
 
